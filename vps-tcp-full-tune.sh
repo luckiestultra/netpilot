@@ -37,14 +37,23 @@ if command -v readlink >/dev/null 2>&1; then
 fi
 if [[ -n "$RESOLVED_SOURCE" && -f "$RESOLVED_SOURCE" ]]; then
   SCRIPT_PATH="$RESOLVED_SOURCE"
-elif [[ -f "$SOURCE_PATH" ]]; then
+elif [[ -f "$SOURCE_PATH" && -s "$SOURCE_PATH" ]]; then
   SCRIPT_PATH="$SOURCE_PATH"
 else
+  # When launched with bash <(curl ...), Bash has already consumed the fd.
+  # Re-fetch the canonical GitHub copy, just like the original script did.
   SOURCE_SNAPSHOT="$(mktemp /tmp/vps-tcp-full-tune.XXXXXX)"
-  cat "$SOURCE_PATH" > "$SOURCE_SNAPSHOT" || {
+  if ! command -v curl >/dev/null 2>&1 || ! curl --fail --silent --show-error \
+    --location --proto '=https' --tlsv1.2 --output "$SOURCE_SNAPSHOT" "$UPDATE_URL"; then
     rm -f -- "$SOURCE_SNAPSHOT"
+    printf '%s\n' '[vps-tcp-full-tune] 错误：无法重新下载 GitHub 脚本。' >&2
     exit 1
-  }
+  fi
+  if [[ ! -s "$SOURCE_SNAPSHOT" ]]; then
+    rm -f -- "$SOURCE_SNAPSHOT"
+    printf '%s\n' '[vps-tcp-full-tune] 错误：下载的 GitHub 脚本为空。' >&2
+    exit 1
+  fi
   SCRIPT_PATH="$SOURCE_SNAPSHOT"
 fi
 
@@ -782,23 +791,36 @@ uninstall_own_script() {
   exit 0
 }
 
+status_badge() {
+  if [[ "$1" == 1 ]]; then
+    printf '%b[已激活]%b' "$GREEN" "$NC"
+  else
+    printf '%b[未开启]%b' "$RED" "$NC"
+  fi
+}
+
 show_menu() {
-  local algorithm handles
+  local algorithm handles ipv4_active=0 bbr_active=0 full_active=0 nic_active=0
   algorithm="$(sysctl_value net.ipv4.tcp_congestion_control || echo unknown)"
   handles="$(ulimit -n 2>/dev/null || echo unknown)"
+  if [[ -f "$GAI_FILE" ]] && grep -Eq '^[[:space:]]*precedence[[:space:]]+::ffff:0:0/96[[:space:]]+100([[:space:]]|$)' "$GAI_FILE"; then
+    ipv4_active=1
+  fi
+  [[ "$algorithm" == bbr ]] && bbr_active=1
+  [[ -f "$SYSCTL_FILE" ]] && full_active=1
+  [[ "$(sysctl_value net.core.rps_sock_flow_entries || true)" == 32768 ]] && nic_active=1
   printf '\n%b==================================================%b\n' "$YELLOW" "$NC"
   printf '%b            TCP/UDP 网络深度调优与性能看板            %b\n' "$YELLOW" "$NC"
   printf '%b            bash <(curl -fsSL GitHub Raw)%b\n' "$GREEN" "$NC"
   printf '%b                    快捷命令: tcp                    %b\n' "$GREEN" "$NC"
   printf '%b==================================================%b\n' "$YELLOW" "$NC"
-  printf '  1. 设置 IPv4 优先解析\n'
-  printf '  2. 开启 BBR + FQ\n'
-  printf '  3. 生产级内核调优（一次性完整应用）\n'
-  printf '  4. 网卡多队列均衡（ring / RPS）\n'
+  printf '  1. 设置 IPv4 优先解析 -> %s : [解决 IPv6 绕路导致的握手卡顿]\n' "$(status_badge "$ipv4_active")"
+  printf '  2. 开启 BBR + FQ       -> %s : [降低跨境丢包，提升单线程速度]\n' "$(status_badge "$bbr_active")"
+  printf '  3. 生产级内核调优     -> %s : [支撑 6w+ 并发连接，防止队列溢出]\n' "$(status_badge "$full_active")"
+  printf '  4. 网卡多队列均衡     -> %s : [消除单核 CPU 瓶颈，平摊全核负载]\n' "$(status_badge "$nic_active")"
   printf '  5. 一键回退本脚本全部修改\n'
   printf '  6. 检查并同步更新脚本\n'
-  printf '  7. 查看当前状态\n'
-  printf '  8. 彻底卸载本调优脚本（不卸载 3x-ui）\n'
+  printf '  7. 彻底卸载本调优脚本（不卸载 3x-ui）\n'
   printf '  0. 退出脚本\n'
   draw_line
   printf '当前状态：算法：%b%s%b | 句柄：%b%s%b\n' "$GREEN" "$algorithm" "$NC" "$GREEN" "$handles" "$NC"
@@ -809,7 +831,7 @@ menu() {
   local choice
   while true; do
     show_menu
-    read -r -p '请选择数字 [0-8]: ' choice || return 0
+    read -r -p '请选择数字 [0-7]: ' choice || return 0
     case "$choice" in
       1) apply_ipv4_preference_only || true ;;
       2) apply_bbr_only || true ;;
@@ -817,8 +839,7 @@ menu() {
       4) apply_nic_only || true ;;
       5) rollback_tuning || true ;;
       6) check_update ;;
-      7) show_status || true ;;
-      8) uninstall_own_script ;;
+      7) uninstall_own_script ;;
       0) return 0 ;;
       *) printf '无效选项。\n' ;;
     esac
