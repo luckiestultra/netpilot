@@ -23,9 +23,24 @@ readonly LEGACY_SHORTCUT_PATH="/usr/local/bin/t"
 readonly UPDATE_URL="${VPS_TUNE_UPDATE_URL:-}"
 readonly UPDATE_SHA256="${VPS_TUNE_UPDATE_SHA256:-}"
 
-SCRIPT_PATH="${BASH_SOURCE[0]}"
+SOURCE_PATH="${BASH_SOURCE[0]}"
+SOURCE_SNAPSHOT=""
+SCRIPT_PATH=""
+RESOLVED_SOURCE=""
 if command -v readlink >/dev/null 2>&1; then
-  SCRIPT_PATH="$(readlink -f "$SCRIPT_PATH" 2>/dev/null || printf '%s' "${BASH_SOURCE[0]}")"
+  RESOLVED_SOURCE="$(readlink -f "$SOURCE_PATH" 2>/dev/null || true)"
+fi
+if [[ -n "$RESOLVED_SOURCE" && -f "$RESOLVED_SOURCE" ]]; then
+  SCRIPT_PATH="$RESOLVED_SOURCE"
+elif [[ -f "$SOURCE_PATH" ]]; then
+  SCRIPT_PATH="$SOURCE_PATH"
+else
+  SOURCE_SNAPSHOT="$(mktemp /tmp/vps-tcp-full-tune.XXXXXX)"
+  cat "$SOURCE_PATH" > "$SOURCE_SNAPSHOT" || {
+    rm -f -- "$SOURCE_SNAPSHOT"
+    exit 1
+  }
+  SCRIPT_PATH="$SOURCE_SNAPSHOT"
 fi
 
 declare -a SYSCTL_KEYS=()
@@ -610,6 +625,7 @@ install_local_copy() {
     rm -f -- "$LEGACY_SHORTCUT_PATH"
     log '已移除旧快捷命令：t'
   fi
+  [[ -z "$SOURCE_SNAPSHOT" ]] || rm -f -- "$SOURCE_SNAPSHOT"
   exec bash "$INSTALL_PATH" "$@"
 }
 
