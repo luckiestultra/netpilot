@@ -19,6 +19,7 @@ readonly LIMITS_FILE="/etc/security/limits.d/99-network-performance.conf"
 readonly GAI_FILE="/etc/gai.conf"
 readonly MSS_COMMENT="vps-tcp-full-tune"
 readonly SHORTCUT_PATH="/usr/local/bin/tcp"
+readonly LEGACY_SHORTCUT_PATH="/usr/local/bin/t"
 readonly UPDATE_URL="${VPS_TUNE_UPDATE_URL:-}"
 readonly UPDATE_SHA256="${VPS_TUNE_UPDATE_SHA256:-}"
 
@@ -605,6 +606,10 @@ install_local_copy() {
   else
     warn "$SHORTCUT_PATH 已被其他文件占用，未覆盖。"
   fi
+  if [[ -L "$LEGACY_SHORTCUT_PATH" && "$(readlink "$LEGACY_SHORTCUT_PATH")" == "$INSTALL_PATH" ]]; then
+    rm -f -- "$LEGACY_SHORTCUT_PATH"
+    log '已移除旧快捷命令：t'
+  fi
   exec bash "$INSTALL_PATH" "$@"
 }
 
@@ -648,6 +653,9 @@ uninstall_own_script() {
   fi
   if [[ -L "$SHORTCUT_PATH" && "$(readlink "$SHORTCUT_PATH")" == "$INSTALL_PATH" ]]; then
     rm -f -- "$SHORTCUT_PATH"
+  fi
+  if [[ -L "$LEGACY_SHORTCUT_PATH" && "$(readlink "$LEGACY_SHORTCUT_PATH")" == "$INSTALL_PATH" ]]; then
+    rm -f -- "$LEGACY_SHORTCUT_PATH"
   fi
   rm -f -- "$SCRIPT_PATH"
   log '本调优脚本及其快捷命令已移除；3x-ui/Xray 未修改。'
