@@ -4,9 +4,8 @@ set -Eeuo pipefail
 
 # One-shot TCP/network tuning with an exact, script-owned rollback.
 #
-# It never downloads or updates itself on startup. Option 4 may install
-# ethtool when it is missing; option 6 only updates from a configured,
-# HTTPS-pinned GitHub URL after SHA-256 and bash syntax checks.
+# Option 4 may install ethtool when it is missing. The script never downloads
+# or updates itself automatically.
 # It applies a broad profile similar in scope to common VPS tuning scripts,
 # but every file/value/rule it owns is backed up before it is changed.
 
@@ -20,9 +19,6 @@ readonly GAI_FILE="/etc/gai.conf"
 readonly MSS_COMMENT="vps-tcp-full-tune"
 readonly SHORTCUT_PATH="/usr/local/bin/tcp"
 readonly LEGACY_SHORTCUT_PATH="/usr/local/bin/t"
-readonly UPDATE_URL="${VPS_TUNE_UPDATE_URL:-}"
-readonly UPDATE_SHA256="${VPS_TUNE_UPDATE_SHA256:-}"
-
 SOURCE_PATH="${BASH_SOURCE[0]}"
 SOURCE_SNAPSHOT=""
 SCRIPT_PATH=""
@@ -629,33 +625,6 @@ install_local_copy() {
   exec bash "$INSTALL_PATH" "$@"
 }
 
-check_update() {
-  local tmp actual
-  if [[ -z "$UPDATE_URL" || -z "$UPDATE_SHA256" ]]; then
-    warn '尚未配置 GitHub 固定提交地址和 SHA-256；当前不会联网更新。'
-    return 0
-  fi
-  [[ "$UPDATE_URL" == https://raw.githubusercontent.com/* ]] || die '更新地址必须是 raw.githubusercontent.com 的 HTTPS 地址。'
-  command -v curl >/dev/null 2>&1 || die '找不到 curl，未执行更新。'
-  command -v sha256sum >/dev/null 2>&1 || die '找不到 sha256sum，未执行更新。'
-
-  tmp="$(mktemp)"
-  if ! curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 --output "$tmp" "$UPDATE_URL"; then
-    rm -f -- "$tmp"
-    die 'GitHub 下载失败，未替换当前脚本。'
-  fi
-  actual="$(sha256sum "$tmp" | awk '{print $1}')"
-  if [[ "$actual" != "$UPDATE_SHA256" ]]; then
-    rm -f -- "$tmp"
-    die 'SHA-256 校验失败，未替换当前脚本。'
-  fi
-  bash -n "$tmp"
-  install -m 0755 "$tmp" "$INSTALL_PATH"
-  rm -f -- "$tmp"
-  log 'GitHub 固定版本更新成功，正在重新载入。'
-  exec bash "$INSTALL_PATH" "$@"
-}
-
 uninstall_own_script() {
   local answer
   printf '\n这只会回退本脚本的配置，并删除本脚本和快捷命令：\n'
@@ -708,7 +677,7 @@ menu() {
       3) apply_tuning || true ;;
       4) apply_nic_only || true ;;
       5) rollback_tuning || true ;;
-      6) check_update ;;
+      6) show_status || true ;;
       7) uninstall_own_script ;;
       0) return 0 ;;
       *) printf '无效选项。\n' ;;
@@ -724,7 +693,6 @@ usage() {
   bash vps-tcp-full-tune.sh status    查看当前值和目标值，不修改
   bash vps-tcp-full-tune.sh apply     一次性应用完整配置并备份原值
   bash vps-tcp-full-tune.sh rollback  精确恢复本脚本应用前的状态
-  bash vps-tcp-full-tune.sh update    从配置的 GitHub 固定版本更新并校验
   bash vps-tcp-full-tune.sh uninstall 回退并删除本调优脚本，不删除 3x-ui
 EOF
 }
@@ -750,9 +718,6 @@ case "${1:-menu}" in
     ;;
   rollback)
     rollback_tuning
-    ;;
-  update)
-    check_update "$@"
     ;;
   uninstall)
     uninstall_own_script

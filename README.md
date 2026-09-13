@@ -25,11 +25,3 @@ bash vps-tcp-full-tune.sh
 脚本会把原值保存在 `/var/lib/vps-tcp-full-tune/`，不会删除 3x-ui 或 Xray。
 
 选项 `4` 在系统缺少 `ethtool` 时会使用系统包管理器安装它；这是原调优功能的依赖。
-
-更新功能默认关闭。启用更新时，必须提供固定的 GitHub Raw HTTPS 地址和对应 SHA-256：
-
-```bash
-VPS_TUNE_UPDATE_URL='https://raw.githubusercontent.com/OWNER/REPO/COMMIT/vps-tcp-full-tune.sh' \\
-VPS_TUNE_UPDATE_SHA256='填入已审核脚本的 SHA-256' \\
-bash vps-tcp-full-tune.sh update
-```
