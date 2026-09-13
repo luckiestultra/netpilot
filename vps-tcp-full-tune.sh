@@ -634,7 +634,7 @@ apply_tuning() {
   old_file="$(ulimit -n 2>/dev/null || echo unknown)"
   old_rmem="$(sysctl_value net.core.rmem_max || echo unknown)"
   log "将一次性应用完整网络参数配置；缓冲区上限目标：${mem_target} bytes。"
-  log '会修改 sysctl、limits、gai.conf 和 MSS；不会修改网卡 ring/RPS，也不会重启 Xray。'
+  log '会修改 sysctl、limits、MSS 和文件句柄；不会修改 IPv4 优先、网卡 ring/RPS，也不会重启 Xray。'
   read -r -p '继续应用并持久化？[y/N] ' answer
   [[ "$answer" =~ ^[Yy]$ ]] || { log '已取消，未执行任何改动。'; return 0; }
 
@@ -644,7 +644,6 @@ apply_tuning() {
   install -d -m 0755 /etc/sysctl.d /etc/security/limits.d
   write_sysctl_file
   write_limits_file
-  apply_gai_preference
   apply_mss_rule
 
   if ! apply_sysctl_values; then
