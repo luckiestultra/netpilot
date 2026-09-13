@@ -316,15 +316,22 @@ mss_rule_args() {
   printf '%s\n' '-p' 'tcp' '--tcp-flags' 'SYN,RST' 'SYN' '-m' 'comment' '--comment' "$MSS_COMMENT" '-j' 'TCPMSS' '--clamp-mss-to-pmtu'
 }
 
+legacy_mss_rule_args() {
+  printf '%s\n' '-p' 'tcp' '--tcp-flags' 'SYN,RST' 'SYN' '-j' 'TCPMSS' '--clamp-mss-to-pmtu'
+}
+
 apply_mss_rule() {
-  local rule_args=()
+  local rule_args=() legacy_args=()
   mapfile -t rule_args < <(mss_rule_args)
+  mapfile -t legacy_args < <(legacy_mss_rule_args)
   if ! command -v iptables >/dev/null 2>&1; then
     log '没有 iptables，跳过 MSS 规则。'
     return 0
   fi
   if iptables -t mangle -C POSTROUTING "${rule_args[@]}" >/dev/null 2>&1; then
     log '已有相同 MSS 规则，未重复添加。'
+  elif iptables -t mangle -C POSTROUTING "${legacy_args[@]}" >/dev/null 2>&1; then
+    log '已有旧版 MSS 规则，未重复添加。'
   elif iptables -t mangle -A POSTROUTING "${rule_args[@]}" >/dev/null 2>&1; then
     : > "$STATE_DIR/iptables4-added"
     log '已添加 IPv4 POSTROUTING MSS 自适应规则。'
@@ -646,7 +653,7 @@ check_update() {
   install -m 0755 "$tmp" "$INSTALL_PATH"
   rm -f -- "$tmp"
   log '已从 GitHub 更新脚本，正在重新载入。'
-  exec bash "$INSTALL_PATH" "$@"
+  exec bash "$INSTALL_PATH"
 }
 
 uninstall_own_script() {
