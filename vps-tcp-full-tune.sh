@@ -18,7 +18,7 @@ readonly SYSCTL_FILE="/etc/sysctl.d/99-network-performance.conf"
 readonly LIMITS_FILE="/etc/security/limits.d/99-network-performance.conf"
 readonly GAI_FILE="/etc/gai.conf"
 readonly MSS_COMMENT="vps-tcp-full-tune"
-readonly SHORTCUT_PATH="/usr/local/bin/t"
+readonly SHORTCUT_PATH="/usr/local/bin/tcp"
 readonly UPDATE_URL="${VPS_TUNE_UPDATE_URL:-}"
 readonly UPDATE_SHA256="${VPS_TUNE_UPDATE_SHA256:-}"
 
@@ -599,7 +599,7 @@ install_local_copy() {
   install -m 0755 "$SCRIPT_PATH" "$INSTALL_PATH"
   if [[ ! -e "$SHORTCUT_PATH" && ! -L "$SHORTCUT_PATH" ]]; then
     ln -s "$INSTALL_PATH" "$SHORTCUT_PATH"
-    log "已创建快捷命令：t"
+    log "已创建快捷命令：tcp"
   elif [[ -L "$SHORTCUT_PATH" && "$(readlink "$SHORTCUT_PATH")" == "$INSTALL_PATH" ]]; then
     :
   else
