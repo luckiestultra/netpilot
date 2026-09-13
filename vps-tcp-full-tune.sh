@@ -607,7 +607,11 @@ install_local_copy() {
   [[ -f "$SCRIPT_PATH" ]] || return 0
 
   if [[ -e "$INSTALL_PATH" ]] && ! cmp -s "$SCRIPT_PATH" "$INSTALL_PATH"; then
-    die "$INSTALL_PATH 已存在且内容不同，请先人工备份或删除后再安装。"
+    if [[ -n "$SOURCE_SNAPSHOT" ]]; then
+      log '检测到旧版本，正在用当前脚本覆盖安装。'
+    else
+      die "$INSTALL_PATH 已存在且内容不同，请先人工备份或删除后再安装。"
+    fi
   fi
   install -m 0755 "$SCRIPT_PATH" "$INSTALL_PATH"
   if [[ ! -e "$SHORTCUT_PATH" && ! -L "$SHORTCUT_PATH" ]]; then
