@@ -25,3 +25,11 @@ bash vps-tcp-full-tune.sh
 脚本会把原值保存在 `/var/lib/vps-tcp-full-tune/`，不会删除 3x-ui 或 Xray。
 
 选项 `4` 在系统缺少 `ethtool` 时会使用系统包管理器安装它；这是原调优功能的依赖。
+
+更新脚本：
+
+```bash
+tcp update
+```
+
+它会从本仓库 `main` 分支下载最新版并先做 Bash 语法检查。

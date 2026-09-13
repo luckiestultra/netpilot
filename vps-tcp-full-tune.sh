@@ -19,6 +19,7 @@ readonly GAI_FILE="/etc/gai.conf"
 readonly MSS_COMMENT="vps-tcp-full-tune"
 readonly SHORTCUT_PATH="/usr/local/bin/tcp"
 readonly LEGACY_SHORTCUT_PATH="/usr/local/bin/t"
+readonly UPDATE_URL="https://raw.githubusercontent.com/liuxr0814/vps-tcp-tune/main/vps-tcp-full-tune.sh"
 SOURCE_PATH="${BASH_SOURCE[0]}"
 SOURCE_SNAPSHOT=""
 SCRIPT_PATH=""
@@ -625,6 +626,25 @@ install_local_copy() {
   exec bash "$INSTALL_PATH" "$@"
 }
 
+check_update() {
+  local tmp
+  command -v curl >/dev/null 2>&1 || die '找不到 curl，无法更新。'
+
+  tmp="$(mktemp)"
+  if ! curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 --output "$tmp" "$UPDATE_URL"; then
+    rm -f -- "$tmp"
+    die 'GitHub 下载失败，未替换当前脚本。'
+  fi
+  if ! bash -n "$tmp"; then
+    rm -f -- "$tmp"
+    die '下载的脚本语法检查失败，未替换当前脚本。'
+  fi
+  install -m 0755 "$tmp" "$INSTALL_PATH"
+  rm -f -- "$tmp"
+  log '已从 GitHub 更新脚本，正在重新载入。'
+  exec bash "$INSTALL_PATH" "$@"
+}
+
 uninstall_own_script() {
   local answer
   printf '\n这只会回退本脚本的配置，并删除本脚本和快捷命令：\n'
@@ -659,8 +679,9 @@ show_menu() {
   printf '3. 全方位内核调优（一次性完整应用）\n'
   printf '4. 网卡级队列均衡（ring / RPS）\n'
   printf '5. 一键回退本脚本全部修改\n'
-  printf '6. 查看当前状态\n'
-  printf '7. 卸载本调优脚本（不卸载 3x-ui）\n'
+  printf '6. 从 GitHub 更新脚本\n'
+  printf '7. 查看当前状态\n'
+  printf '8. 卸载本调优脚本（不卸载 3x-ui）\n'
   printf '0. 退出脚本\n'
   printf '%s\n' '------------------------------------------------------------'
   printf '当前状态：算法：%s | 当前会话句柄：%s\n' "$algorithm" "$handles"
@@ -670,15 +691,16 @@ menu() {
   local choice
   while true; do
     show_menu
-    read -r -p '请选择数字 [0-7]: ' choice || return 0
+    read -r -p '请选择数字 [0-8]: ' choice || return 0
     case "$choice" in
       1) apply_ipv4_preference_only || true ;;
       2) apply_bbr_only || true ;;
       3) apply_tuning || true ;;
       4) apply_nic_only || true ;;
       5) rollback_tuning || true ;;
-      6) show_status || true ;;
-      7) uninstall_own_script ;;
+      6) check_update ;;
+      7) show_status || true ;;
+      8) uninstall_own_script ;;
       0) return 0 ;;
       *) printf '无效选项。\n' ;;
     esac
@@ -693,6 +715,7 @@ usage() {
   bash vps-tcp-full-tune.sh status    查看当前值和目标值，不修改
   bash vps-tcp-full-tune.sh apply     一次性应用完整配置并备份原值
   bash vps-tcp-full-tune.sh rollback  精确恢复本脚本应用前的状态
+  bash vps-tcp-full-tune.sh update    从自有 GitHub 仓库更新脚本
   bash vps-tcp-full-tune.sh uninstall 回退并删除本调优脚本，不删除 3x-ui
 EOF
 }
@@ -718,6 +741,9 @@ case "${1:-menu}" in
     ;;
   rollback)
     rollback_tuning
+    ;;
+  update)
+    check_update "$@"
     ;;
   uninstall)
     uninstall_own_script
