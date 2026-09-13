@@ -21,6 +21,8 @@ Linux VPS TCP、BBR/FQ、内核队列和网卡队列调优脚本。脚本会在�
 bash <(curl -fsSL https://raw.githubusercontent.com/liuxr0814/vps-tcp-tune/main/vps-tcp-full-tune.sh)
 ```
 
+这条命令会直接下载并运行脚本；需要先检查时，使用下面的“下载后检查再安装”流程。
+
 ### 下载后检查再安装
 
 ```bash
@@ -59,8 +61,6 @@ tcp
 | `6` | 从本仓库下载并检查更新 |
 | `7` | 回退并卸载本调优脚本 |
 | `0` | 退出菜单 |
-
-选项 `3` 和 `4` 独立执行：选 `3` 不会自动执行网卡 ring/RPS；选 `4` 也不会修改完整 TCP 配置。
 
 ## 命令行用法
 
@@ -171,9 +171,3 @@ tcp uninstall
 ```
 
 卸载会先回退脚本修改，再删除调优脚本和 `tcp` 快捷命令，不会删除 3x-ui、Xray 或入站配置。
-
-## 安全说明
-
-在线命令会直接执行从 GitHub 下载的脚本。生产 VPS 可以先下载到临时文件，使用 `bash -n` 检查语法，再安装到 `/usr/local/bin/tcp.sh`。
-
-更新来源固定为本仓库。选项 `4` 仅在系统缺少 `ethtool` 时调用系统包管理器安装依赖。
