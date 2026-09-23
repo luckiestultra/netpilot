@@ -62,6 +62,10 @@ tcp
 | `7` | 回退并卸载本调优脚本 |
 | `0` | 退出菜单 |
 
+选项 `2` 会先尝试加载 `tcp_bbr` 内核模块，再应用 `bbr` 和 `fq`；并通过
+`/etc/modules-load.d/vps-tcp-full-tune.conf` 在重启后继续加载模块。如果 VPS 宿主机不允许加载
+`tcp_bbr`，脚本会明确报错，不能仅靠用户态脚本强行开启 BBR。
+
 ## 命令行用法
 
 ```bash

@@ -13,6 +13,7 @@ readonly STATE_DIR="/var/lib/vps-tcp-full-tune"
 readonly BACKUP_DIR="$STATE_DIR/backup"
 readonly INSTALL_PATH="/usr/local/bin/tcp.sh"
 readonly BBR_FILE="/etc/sysctl.d/10-bbr.conf"
+readonly BBR_MODULE_FILE="/etc/modules-load.d/vps-tcp-full-tune.conf"
 readonly SYSCTL_FILE="/etc/sysctl.d/99-network-performance.conf"
 readonly LIMITS_FILE="/etc/security/limits.d/99-network-performance.conf"
 readonly GAI_FILE="/etc/gai.conf"
@@ -254,6 +255,33 @@ bbr_available() {
   [[ " $available_cc " == *' bbr '* ]]
 }
 
+load_bbr_module() {
+  local module_error
+
+  bbr_available && return 0
+
+  if ! command -v modprobe >/dev/null 2>&1; then
+    warn '系统没有 modprobe，无法加载 tcp_bbr 内核模块。'
+    return 1
+  fi
+
+  if ! module_error="$(modprobe tcp_bbr 2>&1)"; then
+    warn '无法加载 tcp_bbr 内核模块；当前 VPS 内核可能不支持 BBR。'
+    [[ -n "$module_error" ]] && warn "$module_error"
+    return 1
+  fi
+
+  if ! bbr_available; then
+    warn 'tcp_bbr 已尝试加载，但内核仍未提供 BBR。'
+    return 1
+  fi
+}
+
+bbr_fq_active() {
+  [[ "$(sysctl_value net.ipv4.tcp_congestion_control || true)" == bbr ]] &&
+    [[ "$(sysctl_value net.core.default_qdisc || true)" == fq ]]
+}
+
 show_status() {
   local key current target
   build_targets
@@ -283,6 +311,14 @@ backup_file() {
   else
     : > "$BACKUP_DIR/$name.missing"
   fi
+}
+
+backup_file_once() {
+  local name="$2"
+  if [[ -e "$BACKUP_DIR/$name" || -e "$BACKUP_DIR/$name.missing" ]]; then
+    return 0
+  fi
+  backup_file "$1" "$name"
 }
 
 restore_file() {
@@ -331,6 +367,13 @@ write_bbr_file() {
     'net.ipv4.tcp_congestion_control = bbr'
 }
 
+write_bbr_module_file() {
+  install -d -m 0755 "$(dirname "$BBR_MODULE_FILE")"
+  write_lines "$BBR_MODULE_FILE" 0644 \
+    '# Managed by vps-tcp-full-tune.sh.' \
+    'tcp_bbr'
+}
+
 save_original_values() {
   local key value
   : > "$STATE_DIR/original-values"
@@ -345,11 +388,18 @@ save_original_values() {
 prepare_state() {
   if [[ -e "$STATE_DIR" ]]; then
     [[ -f "$STATE_DIR/original-values" ]] || die '状态目录不完整，请先检查后再继续。'
+    install -d -m 0700 "$STATE_DIR" "$BACKUP_DIR"
+    backup_file_once "$BBR_FILE" bbr-file
+    backup_file_once "$BBR_MODULE_FILE" bbr-module-file
+    backup_file_once "$SYSCTL_FILE" sysctl-file
+    backup_file_once "$LIMITS_FILE" limits-file
+    backup_file_once "$GAI_FILE" gai-file
     return 0
   fi
 
   install -d -m 0700 "$STATE_DIR" "$BACKUP_DIR"
   backup_file "$BBR_FILE" bbr-file
+  backup_file "$BBR_MODULE_FILE" bbr-module-file
   backup_file "$SYSCTL_FILE" sysctl-file
   backup_file "$LIMITS_FILE" limits-file
   backup_file "$GAI_FILE" gai-file
@@ -585,6 +635,8 @@ remove_state_files() {
     "$STATE_DIR/rps-changed" \
     "$BACKUP_DIR/bbr-file" \
     "$BACKUP_DIR/bbr-file.missing" \
+    "$BACKUP_DIR/bbr-module-file" \
+    "$BACKUP_DIR/bbr-module-file.missing" \
     "$BACKUP_DIR/sysctl-file" \
     "$BACKUP_DIR/sysctl-file.missing" \
     "$BACKUP_DIR/limits-file" \
@@ -608,6 +660,7 @@ rollback_internal() {
   restore_original_values
   restore_ulimit
   restore_file "$BBR_FILE" bbr-file
+  restore_file "$BBR_MODULE_FILE" bbr-module-file
   restore_file "$SYSCTL_FILE" sysctl-file
   restore_file "$LIMITS_FILE" limits-file
   restore_file "$GAI_FILE" gai-file
@@ -626,6 +679,9 @@ handle_error() {
 
 apply_tuning() {
   local mem_target old_bbr old_somax old_file old_rmem
+  if ! bbr_available; then
+    load_bbr_module || true
+  fi
   build_targets
   NIC_IFACE="$(default_interface || true)"
   mem_target="${SYSCTL_TARGETS[net.core.rmem_max]:-未知}"
@@ -643,6 +699,9 @@ apply_tuning() {
   trap 'handle_error "$?" "$LINENO"' ERR
   install -d -m 0755 /etc/sysctl.d /etc/security/limits.d
   write_sysctl_file
+  if [[ "${SYSCTL_TARGETS[net.ipv4.tcp_congestion_control]:-}" == bbr ]]; then
+    write_bbr_module_file
+  fi
   write_limits_file
   apply_mss_rule
 
@@ -671,16 +730,22 @@ apply_ipv4_preference_only() {
 }
 
 apply_bbr_only() {
+  load_bbr_module || return 1
   build_targets
   NIC_IFACE="$(default_interface || true)"
-  bbr_available || { warn '当前内核没有 BBR，未修改。'; return 1; }
   prepare_state
   trap 'handle_error "$?" "$LINENO"' ERR
   install -d -m 0755 /etc/sysctl.d
   write_bbr_file
+  write_bbr_module_file
   sysctl_supported net.core.default_qdisc && sysctl -w net.core.default_qdisc=fq >/dev/null
   sysctl_supported net.ipv4.tcp_congestion_control && sysctl -w net.ipv4.tcp_congestion_control=bbr >/dev/null
   trap - ERR
+  if ! bbr_fq_active; then
+    warn 'BBR + FQ 写入后校验失败，未报告为成功。'
+    rollback_internal
+    return 1
+  fi
   show_bbr_dashboard
   log 'BBR + fq 已应用并备份。'
 }
@@ -797,13 +862,14 @@ status_badge() {
 }
 
 show_menu() {
-  local algorithm handles ipv4_active=0 bbr_active=0 full_active=0 nic_active=0
+  local algorithm qdisc handles ipv4_active=0 bbr_active=0 full_active=0 nic_active=0
   algorithm="$(sysctl_value net.ipv4.tcp_congestion_control || echo unknown)"
+  qdisc="$(sysctl_value net.core.default_qdisc || echo unknown)"
   handles="$(ulimit -n 2>/dev/null || echo unknown)"
   if [[ -f "$GAI_FILE" ]] && grep -Eq '^[[:space:]]*precedence[[:space:]]+::ffff:0:0/96[[:space:]]+100([[:space:]]|$)' "$GAI_FILE"; then
     ipv4_active=1
   fi
-  [[ "$algorithm" == bbr ]] && bbr_active=1
+  [[ "$algorithm" == bbr && "$qdisc" == fq ]] && bbr_active=1
   [[ -f "$SYSCTL_FILE" ]] && full_active=1
   [[ "$(sysctl_value net.core.rps_sock_flow_entries || true)" == 32768 ]] && nic_active=1
   printf '\n%b==================================================%b\n' "$YELLOW" "$NC"
