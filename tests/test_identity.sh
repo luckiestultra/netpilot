@@ -18,7 +18,7 @@ identity_namespace() (
   [[ "$INSTALL_PATH" == /usr/local/bin/netpilot.sh && "$SHORTCUT_PATH" == /usr/local/bin/netpilot ]] || fail 'installation namespace is not exclusively NetPilot'
   [[ "$BBR_FILE" == /etc/sysctl.d/10-netpilot-bbr.conf && "$SYSCTL_FILE" == /etc/sysctl.d/99-netpilot.conf ]] || fail 'sysctl namespace is not exclusively NetPilot'
   [[ "$LIMITS_FILE" == /etc/security/limits.d/99-netpilot.conf && "$BBR_MODULE_FILE" == /etc/modules-load.d/netpilot.conf && "$MSS_COMMENT" == netpilot ]] || fail 'module/limits/firewall namespace is not NetPilot'
-  [[ "$UPDATE_URL" == 'https://github.com/liuxr0814/netpilot/raw/refs/heads/main/netpilot.sh' ]] || fail 'update URL is not canonical'
+  [[ "$UPDATE_URL" == 'https://github.com/luckiestultra/netpilot/raw/refs/heads/main/netpilot.sh' ]] || fail 'update URL is not canonical'
   declare -f run_mutation | grep -q '/run/netpilot.lock' || fail 'mutation lock is not NetPilot-owned'
 )
 
@@ -33,7 +33,7 @@ identity_entrypoint() (
 
 identity_static_ownership() (
   INSTALL_PATH="$TMP/owned-script"
-  UPDATE_URL='https://github.com/liuxr0814/netpilot/raw/refs/heads/main/netpilot.sh'
+  UPDATE_URL='https://github.com/luckiestultra/netpilot/raw/refs/heads/main/netpilot.sh'
   printf '#!/bin/bash\nreadonly UPDATE_URL="%s"\nuninstall_own_script() {\n  :\n}\ntouch "%s"\n' "$UPDATE_URL" "$TMP/executed-target" > "$INSTALL_PATH"
   installed_script_owned || fail 'canonical installed revision was not recognized'
   [[ ! -e "$TMP/executed-target" ]] || fail 'ownership check executed installed target'
@@ -85,7 +85,7 @@ identity_single_alias() (
 
 identity_update_alias_failure() (
   INSTALL_PATH="$TMP/update-target"
-  UPDATE_URL='https://github.com/liuxr0814/netpilot/raw/refs/heads/main/netpilot.sh'
+  UPDATE_URL='https://github.com/luckiestultra/netpilot/raw/refs/heads/main/netpilot.sh'
   printf '#!/bin/bash\nprintf old\n' > "$INSTALL_PATH"
   curl() {
     while (($#)); do

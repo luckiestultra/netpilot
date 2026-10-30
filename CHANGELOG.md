@@ -15,6 +15,7 @@
 
 ### Changed
 
+- 下载和更新地址统一使用 `luckiestultra/netpilot` 公开仓库。
 - 项目统一使用 NetPilot 名称、`netpilot.sh` 主脚本和对应的仓库、下载及更新链接。
 - 安装、备份、锁、受管配置和测速报告使用独立命名空间；不自动迁移或清理其他工具的数据。
 - `apply` 与菜单 `3` 改为先预览、确认后应用保守自适应计划，不再默认一并修改 limits、MSS、ECN、TFO、重试和 TIME_WAIT 参数。

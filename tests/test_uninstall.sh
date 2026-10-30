@@ -15,7 +15,7 @@ setup() {
   INSTALL_PATH="$CASE_DIR/netpilot.sh"; SCRIPT_PATH="$CASE_DIR/download.sh"
   SHORTCUT_PATH="$CASE_DIR/netpilot"
   STATE_DIR="$CASE_DIR/state"; SOURCE_SNAPSHOT=''
-  UPDATE_URL='https://github.com/liuxr0814/netpilot/raw/refs/heads/main/netpilot.sh'
+  UPDATE_URL='https://github.com/luckiestultra/netpilot/raw/refs/heads/main/netpilot.sh'
   cp "$SCRIPT" "$INSTALL_PATH"; cp "$SCRIPT" "$SCRIPT_PATH"
   ln -s "$INSTALL_PATH" "$SHORTCUT_PATH"
   rollback_internal() { :; }

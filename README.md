@@ -20,7 +20,7 @@
 
 ```bash
 curl -fsSL --proto '=https' --tlsv1.2 \
-  https://raw.githubusercontent.com/liuxr0814/netpilot/main/netpilot.sh \
+  https://raw.githubusercontent.com/luckiestultra/netpilot/main/netpilot.sh \
   -o /tmp/netpilot.sh
 
 bash -n /tmp/netpilot.sh
@@ -39,7 +39,7 @@ bash /tmp/netpilot.sh install
 也可通过一行命令直接打开菜单：
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/liuxr0814/netpilot/main/netpilot.sh)
+bash <(curl -fsSL https://raw.githubusercontent.com/luckiestultra/netpilot/main/netpilot.sh)
 ```
 
 直接打开菜单、运行 `doctor`、`plan` 或 `status` 不会隐式安装脚本。需要一行安装时，在同一命令后加 `install`。

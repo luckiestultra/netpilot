@@ -51,7 +51,7 @@ while (($#)); do
     *) shift ;;
   esac
 done
-[[ "$url" == 'https://github.com/liuxr0814/netpilot/raw/refs/heads/main/netpilot.sh' && -n "$output" ]] || exit 22
+[[ "$url" == 'https://github.com/luckiestultra/netpilot/raw/refs/heads/main/netpilot.sh' && -n "$output" ]] || exit 22
 printf '%s\n' "$url" >> "$NETPILOT_CURL_LOG"
 cp -- "$NETPILOT_TEST_PAYLOAD" "$output"
 CURL
@@ -65,7 +65,7 @@ printf '0\n' | bash "$SCRIPT" install > "$TMP/install.log"
 cmp -s "$SCRIPT" /usr/local/bin/netpilot.sh || fail 'fresh installed payload differs from source'
 command rm -f /usr/local/bin/netpilot
 printf '0\n' | /usr/local/bin/netpilot.sh update > "$TMP/update.log"
-grep -Fxq 'https://github.com/liuxr0814/netpilot/raw/refs/heads/main/netpilot.sh' "$NETPILOT_CURL_LOG" || fail 'updater did not request canonical URL'
+grep -Fxq 'https://github.com/luckiestultra/netpilot/raw/refs/heads/main/netpilot.sh' "$NETPILOT_CURL_LOG" || fail 'updater did not request canonical URL'
 [[ -L /usr/local/bin/netpilot && "$(readlink /usr/local/bin/netpilot)" == /usr/local/bin/netpilot.sh ]] || fail 'updater did not restore missing command'
 printf 'if then invalid\n' > "$TMP/invalid-payload"
 export NETPILOT_TEST_PAYLOAD="$TMP/invalid-payload"
