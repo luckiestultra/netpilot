@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
-SCRIPT="${SCRIPT_OVERRIDE:-$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)/vps-tcp-full-tune.sh}"
+SCRIPT="${SCRIPT_OVERRIDE:-$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)/netpilot.sh}"
 TEST_DIR="$(mktemp -d)"
 trap 'rm -rf -- "$TEST_DIR"' EXIT
-for name in install_script_atomic install_local_copy check_update; do
+for name in install_script_atomic install_shortcuts install_local_copy check_update; do
   sed -n "/^${name}() {/,/^}/p" "$SCRIPT" >> "$TEST_DIR/functions.sh"
 done
 source "$TEST_DIR/functions.sh"
@@ -31,7 +31,7 @@ test_update_write_failure_keeps_old_version() (
 
 test_install_write_failure_never_executes() (
   INSTALL_PATH="$TEST_DIR/failed-install"; SCRIPT_PATH="$TEST_DIR/install-source"
-  SOURCE_SNAPSHOT=''; SHORTCUT_PATH="$TEST_DIR/shortcut"; LEGACY_SHORTCUT_PATH="$TEST_DIR/legacy"
+  SOURCE_SNAPSHOT=''; NETPILOT_SHORTCUT_PATH="$TEST_DIR/netpilot"; SHORTCUT_PATH="$TEST_DIR/shortcut"; LEGACY_SHORTCUT_PATH="$TEST_DIR/legacy"
   printf '#!/bin/bash\nprintf new\n' > "$SCRIPT_PATH"
   install() { return 1; }
   exec() { printf 'exec\n' >> "$TEST_DIR/install-exec"; }

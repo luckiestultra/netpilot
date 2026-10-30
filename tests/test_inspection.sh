@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
-SNIPPET="${INSPECTION_OVERRIDE:-$ROOT/vps-tcp-full-tune.sh}"
+SNIPPET="${INSPECTION_OVERRIDE:-$ROOT/netpilot.sh}"
 [[ -f "$SNIPPET" ]] || { echo 'FAIL: inspection functions missing'; exit 1; }
 source <(sed -n '/^# BEGIN INSPECTION$/,/^# END INSPECTION$/p' "$SNIPPET")
 TMP="$(mktemp -d)"

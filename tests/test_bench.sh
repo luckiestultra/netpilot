@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
-FRAGMENT="${BENCH_FUNCTIONS_OVERRIDE:-$ROOT/vps-tcp-full-tune.sh}"
+FRAGMENT="${BENCH_FUNCTIONS_OVERRIDE:-$ROOT/netpilot.sh}"
 source "$FRAGMENT"
 TEST_DIR="$(mktemp -d)"
 trap 'rm -rf -- "$TEST_DIR"' EXIT

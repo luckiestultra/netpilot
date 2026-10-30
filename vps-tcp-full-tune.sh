@@ -8,11 +8,12 @@ if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
   set -Eeuo pipefail
 fi
 
-# Capability-aware TCP recommendations, bounded measurements and verified rollback.
+# NetPilot: capability-aware TCP recommendations, bounded measurements and verified rollback.
 #
 # Optional dependencies are never installed implicitly. Updating is explicit.
 # Read-only commands never install or tune. Changes preserve a baseline snapshot.
 
+# Keep legacy on-disk identities so existing baselines, updates and locks remain valid.
 readonly STATE_DIR="/var/lib/vps-tcp-full-tune"
 readonly BACKUP_DIR="$STATE_DIR/backup"
 readonly INSTALL_PATH="/usr/local/bin/tcp.sh"
@@ -23,8 +24,9 @@ readonly LIMITS_FILE="/etc/security/limits.d/99-network-performance.conf"
 readonly GAI_FILE="/etc/gai.conf"
 readonly MSS_COMMENT="vps-tcp-full-tune"
 readonly SHORTCUT_PATH="/usr/local/bin/tcp"
+readonly NETPILOT_SHORTCUT_PATH="/usr/local/bin/netpilot"
 readonly LEGACY_SHORTCUT_PATH="/usr/local/bin/t"
-readonly UPDATE_URL="https://github.com/liuxr0814/vps-tcp-tune/raw/refs/heads/main/vps-tcp-full-tune.sh"
+readonly UPDATE_URL="https://github.com/liuxr0814/netpilot/raw/refs/heads/main/netpilot.sh"
 readonly RED=$'\033[0;31m'
 readonly GREEN=$'\033[0;32m'
 readonly YELLOW=$'\033[0;33m'
@@ -38,9 +40,9 @@ declare -a SYSCTL_KEYS=()
 declare -A SYSCTL_TARGETS=()
 NIC_IFACE=""
 
-log() { printf '[vps-tcp-full-tune] %s\n' "$*"; }
-warn() { printf '[vps-tcp-full-tune] 警告：%s\n' "$*" >&2; }
-die() { printf '[vps-tcp-full-tune] 错误：%s\n' "$*" >&2; exit 1; }
+log() { printf '[NetPilot] %s\n' "$*"; }
+warn() { printf '[NetPilot] 警告：%s\n' "$*" >&2; }
+die() { printf '[NetPilot] 错误：%s\n' "$*" >&2; exit 1; }
 
 draw_line() {
   printf '%b\n' "${YELLOW}--------------------------------------------------${NC}"
@@ -221,7 +223,7 @@ write_sysctl_file() {
   local tmp key line value
   local -A merged=()
   if [[ -e "$SYSCTL_FILE" || -L "$SYSCTL_FILE" ]]; then
-    if [[ -L "$SYSCTL_FILE" ]] || ! grep -qx '# Managed by vps-tcp-full-tune.sh.' "$SYSCTL_FILE"; then
+    if [[ -L "$SYSCTL_FILE" ]] || ! grep -Eq '^# Managed by (netpilot|vps-tcp-full-tune)\.sh\.$' "$SYSCTL_FILE"; then
       warn "Refusing to replace unowned configuration: $SYSCTL_FILE"
       return 1
     fi
@@ -237,7 +239,7 @@ write_sysctl_file() {
   for key in "${SYSCTL_KEYS[@]}"; do merged["$key"]="${SYSCTL_TARGETS[$key]}"; done
   tmp="$(mktemp "${SYSCTL_FILE}.tmp.XXXXXX")" || return 1
   if ! {
-    printf '%s\n' '# Managed by vps-tcp-full-tune.sh.' '# Run rollback to restore the saved state.'
+    printf '%s\n' '# Managed by netpilot.sh.' '# Run rollback to restore the saved state.'
     for key in "${!merged[@]}"; do
       printf '%s = %s\n' "$key" "${merged[$key]}" || return 1
     done
@@ -251,7 +253,7 @@ write_sysctl_file() {
 
 owned_config_target() {
   local path="$1"
-  if [[ -L "$path" ]] || { [[ -e "$path" ]] && { [[ ! -f "$path" ]] || ! grep -qx '# Managed by vps-tcp-full-tune.sh.' "$path"; }; }; then
+  if [[ -L "$path" ]] || { [[ -e "$path" ]] && { [[ ! -f "$path" ]] || ! grep -Eq '^# Managed by (netpilot|vps-tcp-full-tune)\.sh\.$' "$path"; }; }; then
     warn "拒绝覆盖非本工具管理的配置：$path"
     return 1
   fi
@@ -260,7 +262,7 @@ owned_config_target() {
 write_bbr_file() {
   owned_config_target "$BBR_FILE" || return 1
   write_lines "$BBR_FILE" 0644 \
-    '# Managed by vps-tcp-full-tune.sh.' \
+    '# Managed by netpilot.sh.' \
     'net.core.default_qdisc = fq' \
     'net.ipv4.tcp_congestion_control = bbr'
 }
@@ -268,7 +270,7 @@ write_bbr_file() {
 write_bbr_module_file() {
   owned_config_target "$BBR_MODULE_FILE" || return 1
   install -d -m 0755 "$(dirname "$BBR_MODULE_FILE")" || return 1
-  write_lines "$BBR_MODULE_FILE" 0644 '# Managed by vps-tcp-full-tune.sh.' 'tcp_bbr'
+  write_lines "$BBR_MODULE_FILE" 0644 '# Managed by netpilot.sh.' 'tcp_bbr'
 }
 
 save_original_values() {
@@ -350,7 +352,7 @@ apply_gai_preference() {
     return 0
   fi
   # The backup was taken by prepare_state before this append.
-  printf '\n# Added by vps-tcp-full-tune.sh.\nprecedence ::ffff:0:0/96 100\n' >> "$GAI_FILE" || return 1
+  printf '\n# Added by netpilot.sh.\nprecedence ::ffff:0:0/96 100\n' >> "$GAI_FILE" || return 1
   : > "$STATE_DIR/gai-changed" || return 1
 }
 
@@ -697,9 +699,31 @@ install_script_atomic() {
   fi
 }
 
+install_shortcuts() {
+  local shortcut
+  for shortcut in "$SHORTCUT_PATH" "$NETPILOT_SHORTCUT_PATH"; do
+    if [[ ! -e "$shortcut" && ! -L "$shortcut" ]]; then
+      ln -s "$INSTALL_PATH" "$shortcut" || return 1
+      log "已创建快捷命令：${shortcut##*/}"
+    elif [[ -L "$shortcut" && "$(readlink "$shortcut")" == "$INSTALL_PATH" ]]; then
+      :
+    else
+      warn "$shortcut 已被其他文件占用，未覆盖。"
+    fi
+  done
+  if [[ -L "$LEGACY_SHORTCUT_PATH" && "$(readlink "$LEGACY_SHORTCUT_PATH")" == "$INSTALL_PATH" ]]; then
+    rm -f -- "$LEGACY_SHORTCUT_PATH" || return 1
+    log '已移除旧快捷命令：t'
+  fi
+  return 0
+}
+
 install_local_copy() {
-  [[ "$SCRIPT_PATH" == "$INSTALL_PATH" ]] && return 0
   [[ -f "$SCRIPT_PATH" ]] || return 0
+  if [[ "$SCRIPT_PATH" == "$INSTALL_PATH" ]]; then
+    install_shortcuts || return 1
+    return 0
+  fi
 
   if [[ -e "$INSTALL_PATH" ]] && ! cmp -s "$SCRIPT_PATH" "$INSTALL_PATH"; then
     if [[ -n "$SOURCE_SNAPSHOT" ]]; then
@@ -709,19 +733,8 @@ install_local_copy() {
     fi
   fi
   install_script_atomic "$SCRIPT_PATH" "$INSTALL_PATH" || return 1
-  if [[ ! -e "$SHORTCUT_PATH" && ! -L "$SHORTCUT_PATH" ]]; then
-    ln -s "$INSTALL_PATH" "$SHORTCUT_PATH" || return 1
-    log "已创建快捷命令：tcp"
-  elif [[ -L "$SHORTCUT_PATH" && "$(readlink "$SHORTCUT_PATH")" == "$INSTALL_PATH" ]]; then
-    :
-  else
-    warn "$SHORTCUT_PATH 已被其他文件占用，未覆盖。"
-  fi
-  if [[ -L "$LEGACY_SHORTCUT_PATH" && "$(readlink "$LEGACY_SHORTCUT_PATH")" == "$INSTALL_PATH" ]]; then
-    rm -f -- "$LEGACY_SHORTCUT_PATH"
-    log '已移除旧快捷命令：t'
-  fi
-  [[ -z "$SOURCE_SNAPSHOT" ]] || rm -f -- "$SOURCE_SNAPSHOT"
+  install_shortcuts || return 1
+  [[ -z "$SOURCE_SNAPSHOT" ]] || rm -f -- "$SOURCE_SNAPSHOT" || return 1
   exec 9>&-
   exec bash "$INSTALL_PATH" "$@"
 }
@@ -745,25 +758,30 @@ check_update() {
     rm -f -- "$tmp"
     return 1
   fi
-  rm -f -- "$tmp"
-  log '已从 GitHub 更新脚本，正在重新载入。'
+  rm -f -- "$tmp" || return 1
+  install_shortcuts || return 1
+  log '已从 GitHub 更新 NetPilot，正在重新载入。'
   exec 9>&-
   exec bash "$INSTALL_PATH"
 }
 
 installed_script_owned() {
+  local url
   [[ -f "$INSTALL_PATH" && ! -L "$INSTALL_PATH" ]] || return 1
-  # Recognize our existing revisions without executing the installed file.
-  grep -Fqx "readonly UPDATE_URL=\"$UPDATE_URL\"" "$INSTALL_PATH" &&
-    grep -Fqx 'uninstall_own_script() {' "$INSTALL_PATH"
+  # Recognize current and pre-rename revisions without executing the installed file.
+  grep -Fqx 'uninstall_own_script() {' "$INSTALL_PATH" || return 1
+  for url in "$UPDATE_URL" 'https://github.com/liuxr0814/vps-tcp-tune/raw/refs/heads/main/vps-tcp-full-tune.sh'; do
+    if grep -Fqx "readonly UPDATE_URL=\"$url\"" "$INSTALL_PATH"; then return 0; fi
+  done
+  return 1
 }
 
 uninstall_own_script() {
   local answer shortcut
   printf '\n这只会回退本脚本的配置，并删除已安装脚本和自有快捷命令：\n'
-  printf '  脚本：%s\n  快捷命令：%s\n' "$INSTALL_PATH" "$SHORTCUT_PATH"
+  printf '  脚本：%s\n  快捷命令：%s、%s\n' "$INSTALL_PATH" "$NETPILOT_SHORTCUT_PATH" "$SHORTCUT_PATH"
   printf '下载副本和源码文件保留；不会删除 3x-ui、Xray、面板或其他服务。\n'
-  read -r -p '确定卸载本调优脚本？[y/N] ' answer
+  read -r -p '确定卸载 NetPilot？[y/N] ' answer
   [[ "$answer" =~ ^[Yy]$ ]] || { log '已取消卸载。'; return 0; }
 
   if [[ -e "$INSTALL_PATH" || -L "$INSTALL_PATH" ]]; then
@@ -773,7 +791,7 @@ uninstall_own_script() {
     [[ -d "$STATE_DIR" && ! -L "$STATE_DIR" ]] || { warn '运行状态路径不是普通目录，拒绝卸载。'; return 1; }
     rollback_internal || return 1
   fi
-  for shortcut in "$SHORTCUT_PATH" "$LEGACY_SHORTCUT_PATH"; do
+  for shortcut in "$SHORTCUT_PATH" "$NETPILOT_SHORTCUT_PATH" "$LEGACY_SHORTCUT_PATH"; do
     if [[ -L "$shortcut" && "$(readlink "$shortcut")" == "$INSTALL_PATH" ]]; then
       rm -f -- "$shortcut" || return 1
     fi
@@ -803,9 +821,9 @@ show_menu() {
   [[ -f "$SYSCTL_FILE" ]] && full_active=1
   [[ "$(sysctl_value net.core.rps_sock_flow_entries || true)" == 32768 ]] && nic_active=1
   printf '\n%b==================================================%b\n' "$YELLOW" "$NC"
-  printf '%b            TCP/UDP 网络深度调优与性能看板            %b\n' "$YELLOW" "$NC"
+  printf '%b            NetPilot 网络诊断与调优            %b\n' "$YELLOW" "$NC"
   printf '%b            bash <(curl -fsSL GitHub Raw)%b\n' "$GREEN" "$NC"
-  printf '%b                    快捷命令: tcp                    %b\n' "$GREEN" "$NC"
+  printf '%b                    快捷命令: netpilot / tcp                    %b\n' "$GREEN" "$NC"
   printf '%b==================================================%b\n' "$YELLOW" "$NC"
   printf '  1. 设置 IPv4 优先解析 -> %s : [改变地址选择顺序，按需启用]\n' "$(status_badge "$ipv4_active")"
   printf '  2. 开启 BBR + FQ       -> %s : [切换算法与默认队列，需实测效果]\n' "$(status_badge "$bbr_active")"
@@ -813,7 +831,7 @@ show_menu() {
   printf '  4. 网卡多队列均衡     -> %s : [高级选项，单核跳过RPS]\n' "$(status_badge "$nic_active")"
   printf '  5. 一键回退本脚本全部修改\n'
   printf '  6. 检查并同步更新脚本\n'
-  printf '  7. 彻底卸载本调优脚本（不卸载 3x-ui）\n'
+  printf '  7. 卸载 NetPilot（不卸载 3x-ui）\n'
   printf '  8. 新功能：机器诊断 / 参数计划 / 测速对比 / 验证\n'
   printf '  0. 退出脚本\n'
   draw_line
@@ -1229,10 +1247,10 @@ feature_menu() {
 # Bounded measurement only: these functions never change kernel/network settings.
 bench_usage() {
   cat <<'EOF'
-用法：tcp bench --peer HOST [--port 5201] [--budget-mib 1024]
+NetPilot 测速用法：netpilot bench --peer HOST [--port 5201] [--budget-mib 1024]
                [--direction both|send|receive] [--streams 1] [--timeout 30]
                [--latency] [--output FILE] [--yes]
-      tcp compare BEFORE.json AFTER.json
+      netpilot compare BEFORE.json AFTER.json
 预算为全部方向和流的测试 payload 预算；协议开销、重传和商家计费不等同于该值。
 --latency 额外测量空闲/负载下 ICMP RTT；不能据此确定排队或丢包原因。
 EOF
@@ -1277,7 +1295,7 @@ bench_command() {
   # Reserve one default 128 KiB block per stream for concurrent final writes.
   quota=$(( (budget * 1048576 / rounds / 131072 - streams) * 131072 ))
   (( quota >= 131072 )) || { printf '预算不足，请减少流数或提高预算。\n' >&2; return 2; }
-  [[ -n "$output" ]] || output="./tcp-bench-$(date -u +%Y%m%dT%H%M%SZ)-$$.json"
+  [[ -n "$output" ]] || output="./netpilot-bench-$(date -u +%Y%m%dT%H%M%SZ)-$$.json"
   [[ ! -e "$output" && ! -L "$output" && -d "$(dirname -- "$output")" ]] || {
     printf '报告路径必须尚不存在，且父目录必须存在。\n' >&2; return 2;
   }
@@ -1345,7 +1363,7 @@ bench_command() {
     # A failed/busy peer must not automatically trigger another full-budget retry.
     (( rc == 0 )) || break
   done
-  report_tmp="$(mktemp "$(dirname -- "$output")/.tcp-bench.XXXXXX")" || { bench_finish 0; return 1; }
+  report_tmp="$(mktemp "$(dirname -- "$output")/.netpilot-bench.XXXXXX")" || { bench_finish 0; return 1; }
   if ! python3 - "$bench_dir" "$peer" "$port" "$budget" "$streams" "$deadline" "$direction" "$quota" "$latency" > "$report_tmp" <<'PY'
 import datetime, json, math, pathlib, re, sys
 folder=pathlib.Path(sys.argv[1]); peer=sys.argv[2]
@@ -1394,6 +1412,7 @@ for path in sorted(folder.glob('*.direction'),key=lambda p:int(p.stem)):
         loaded['p95_delta_ms']=(loaded['p95_ms']-idle['p95_ms']) if loaded['status']==idle['status']=='ok' else None
         run['loaded_latency']=loaded
     runs.append(run)
+# Keep the schema-v1 wire identifier so historical reports remain comparable.
 report={'schema_version':1,'kind':'vps-tcp-tune-benchmark',
         'created_at':datetime.datetime.now(datetime.timezone.utc).isoformat(),
         'peer':peer,'port':port,'budget_bytes':budget*1048576,'streams':streams,
@@ -1482,7 +1501,8 @@ PY
 
 usage() {
   cat <<'EOF'
-用法：tcp <命令> [参数]（也可 bash vps-tcp-full-tune.sh <命令>）
+NetPilot — Linux VPS 网络诊断与调优
+用法：netpilot <命令> [参数]（兼容 tcp；也可 bash netpilot.sh <命令>）
   menu                 中文交互菜单
   doctor               只读查看内存/CPU/BBR/实际qdisc/外部调优器
   plan [--profile balanced|proxy|bulk] [--bandwidth Mbps --rtt ms]
@@ -1496,7 +1516,7 @@ usage() {
         [--output FILE] [--yes]  有预算的双向测速，需iperf3/python3/timeout
   compare BEFORE.json AFTER.json  比较同条件测速报告
   rollback             恢复首次记录的原值；失败保留备份
-  install              显式安装本脚本及tcp快捷命令
+  install              显式安装 NetPilot 及 netpilot/tcp 快捷命令
   update               从自有仓库下载并检查更新
   uninstall            回退并卸载本工具
   help                 显示帮助
@@ -1558,16 +1578,16 @@ resolve_source_path() {
   else
     # When launched with bash <(curl ...), Bash has already consumed the fd.
     # Re-fetch the canonical GitHub copy, just like the original script did.
-    SOURCE_SNAPSHOT="$(mktemp /tmp/vps-tcp-full-tune.XXXXXX)"
+    SOURCE_SNAPSHOT="$(mktemp /tmp/netpilot.XXXXXX)"
     if ! command -v curl >/dev/null 2>&1 || ! curl --fail --silent --show-error \
       --location --proto '=https' --tlsv1.2 --output "$SOURCE_SNAPSHOT" "$UPDATE_URL"; then
       rm -f -- "$SOURCE_SNAPSHOT"
-      printf '%s\n' '[vps-tcp-full-tune] 错误：无法重新下载 GitHub 脚本。' >&2
+      printf '%s\n' '[NetPilot] 错误：无法重新下载 GitHub 脚本。' >&2
       exit 1
     fi
     if [[ ! -s "$SOURCE_SNAPSHOT" ]]; then
       rm -f -- "$SOURCE_SNAPSHOT"
-      printf '%s\n' '[vps-tcp-full-tune] 错误：下载的 GitHub 脚本为空。' >&2
+      printf '%s\n' '[NetPilot] 错误：下载的 GitHub 脚本为空。' >&2
       exit 1
     fi
     if ! bash -n "$SOURCE_SNAPSHOT"; then

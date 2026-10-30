@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
-SCRIPT="${SCRIPT_OVERRIDE:-$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)/vps-tcp-full-tune.sh}"
+SCRIPT="${SCRIPT_OVERRIDE:-$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)/netpilot.sh}"
 TEST_DIR="$(mktemp -d)"
 trap 'rm -rf -- "$TEST_DIR"' EXIT
 for name in installed_script_owned uninstall_own_script resolve_source_path; do
@@ -13,9 +13,9 @@ fail() { printf 'FAIL: %s\n' "$*" >&2; exit 1; }
 setup() {
   CASE_DIR="$TEST_DIR/$1"; mkdir -p "$CASE_DIR"
   INSTALL_PATH="$CASE_DIR/tcp.sh"; SCRIPT_PATH="$CASE_DIR/download.sh"
-  SHORTCUT_PATH="$CASE_DIR/tcp"; LEGACY_SHORTCUT_PATH="$CASE_DIR/t"
+  SHORTCUT_PATH="$CASE_DIR/tcp"; NETPILOT_SHORTCUT_PATH="$CASE_DIR/netpilot"; LEGACY_SHORTCUT_PATH="$CASE_DIR/t"
   STATE_DIR="$CASE_DIR/state"; SOURCE_SNAPSHOT=''
-  UPDATE_URL='https://github.com/liuxr0814/vps-tcp-tune/raw/refs/heads/main/vps-tcp-full-tune.sh'
+  UPDATE_URL='https://github.com/liuxr0814/netpilot/raw/refs/heads/main/netpilot.sh'
   cp "$SCRIPT" "$INSTALL_PATH"; cp "$SCRIPT" "$SCRIPT_PATH"
   ln -s "$INSTALL_PATH" "$SHORTCUT_PATH"
   ln -s "$INSTALL_PATH" "$LEGACY_SHORTCUT_PATH"
