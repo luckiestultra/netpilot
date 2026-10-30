@@ -751,24 +751,34 @@ check_update() {
   exec bash "$INSTALL_PATH"
 }
 
+installed_script_owned() {
+  [[ -f "$INSTALL_PATH" && ! -L "$INSTALL_PATH" ]] || return 1
+  # Recognize our existing revisions without executing the installed file.
+  grep -Fqx "readonly UPDATE_URL=\"$UPDATE_URL\"" "$INSTALL_PATH" &&
+    grep -Fqx 'uninstall_own_script() {' "$INSTALL_PATH"
+}
+
 uninstall_own_script() {
-  local answer
-  printf '\n这只会回退本脚本的配置，并删除本脚本和快捷命令：\n'
-  printf '  脚本：%s\n  快捷命令：%s\n' "$SCRIPT_PATH" "$SHORTCUT_PATH"
-  printf '不会删除 3x-ui、Xray、面板或其他服务。\n'
+  local answer shortcut
+  printf '\n这只会回退本脚本的配置，并删除已安装脚本和自有快捷命令：\n'
+  printf '  脚本：%s\n  快捷命令：%s\n' "$INSTALL_PATH" "$SHORTCUT_PATH"
+  printf '下载副本和源码文件保留；不会删除 3x-ui、Xray、面板或其他服务。\n'
   read -r -p '确定卸载本调优脚本？[y/N] ' answer
   [[ "$answer" =~ ^[Yy]$ ]] || { log '已取消卸载。'; return 0; }
 
-  if [[ -f "$STATE_DIR/original-values" ]]; then
+  if [[ -e "$INSTALL_PATH" || -L "$INSTALL_PATH" ]]; then
+    installed_script_owned || { warn "无法确认安装文件归属，拒绝删除：$INSTALL_PATH"; return 1; }
+  fi
+  if [[ -e "$STATE_DIR" || -L "$STATE_DIR" ]]; then
+    [[ -d "$STATE_DIR" && ! -L "$STATE_DIR" ]] || { warn '运行状态路径不是普通目录，拒绝卸载。'; return 1; }
     rollback_internal || return 1
   fi
-  if [[ -L "$SHORTCUT_PATH" && "$(readlink "$SHORTCUT_PATH")" == "$INSTALL_PATH" ]]; then
-    rm -f -- "$SHORTCUT_PATH"
-  fi
-  if [[ -L "$LEGACY_SHORTCUT_PATH" && "$(readlink "$LEGACY_SHORTCUT_PATH")" == "$INSTALL_PATH" ]]; then
-    rm -f -- "$LEGACY_SHORTCUT_PATH"
-  fi
-  rm -f -- "$SCRIPT_PATH" || return 1
+  for shortcut in "$SHORTCUT_PATH" "$LEGACY_SHORTCUT_PATH"; do
+    if [[ -L "$shortcut" && "$(readlink "$shortcut")" == "$INSTALL_PATH" ]]; then
+      rm -f -- "$shortcut" || return 1
+    fi
+  done
+  rm -f -- "$INSTALL_PATH" || return 1
   log '本调优脚本及其快捷命令已移除；3x-ui/Xray 未修改。'
   exit 0
 }
