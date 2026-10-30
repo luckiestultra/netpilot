@@ -5,7 +5,7 @@ set -Eeuo pipefail
   echo 'Requires a disposable Docker container with writable namespaced sysctls.' >&2; exit 2;
 }
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
-SCRIPT="$ROOT/vps-tcp-full-tune.sh"
+SCRIPT="$ROOT/netpilot.sh"
 # Containers may cap core socket maxima at their parent namespace's ceiling.
 # Use smaller real TCP maxima so both plans fit inside that inherited ceiling.
 sysctl -w net.ipv4.tcp_rmem='4096 131072 1048576' > /dev/null

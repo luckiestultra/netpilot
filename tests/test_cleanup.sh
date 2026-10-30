@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
-SCRIPT="${SCRIPT_OVERRIDE:-$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)/vps-tcp-full-tune.sh}"
+SCRIPT="${SCRIPT_OVERRIDE:-$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)/netpilot.sh}"
 TMP="$(mktemp -d)"
 trap 'command rm -rf -- "$TMP"' EXIT
 for name in remove_state_files rollback_internal rollback_tuning; do

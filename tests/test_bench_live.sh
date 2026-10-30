@@ -2,7 +2,7 @@
 # Run only against a real loopback iperf3 server; no external network is used.
 set -Eeuo pipefail
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
-SCRIPT="${SCRIPT_OVERRIDE:-$ROOT/vps-tcp-full-tune.sh}"
+SCRIPT="${SCRIPT_OVERRIDE:-$ROOT/netpilot.sh}"
 TEST_DIR="$(mktemp -d)"
 server_pid=''
 cleanup() {

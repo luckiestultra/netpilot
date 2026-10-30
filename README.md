@@ -1,6 +1,6 @@
-# VPS TCP Tune
+# NetPilot
 
-面向通用 Linux VPS 的 TCP 诊断、参数建议、预算测速与回滚工具。根据当前内核能力、有效内存、CPU 配额和路径输入生成建议，保留 `tcp` 中文菜单与单文件运行方式。
+面向通用 Linux VPS 的 TCP 诊断、参数建议、预算测速与回滚工具。根据当前内核能力、有效内存、CPU 配额和路径输入生成建议，提供 `netpilot` 中文菜单与单文件运行方式，兼容原有 `tcp` 命令。
 
 调优不能增加云厂商带宽，也不能保证改善拥塞或代理体验。工具展示读回值和实际测量结果，不把配置成功当作性能提升。
 
@@ -20,29 +20,47 @@
 
 ```bash
 curl -fsSL --proto '=https' --tlsv1.2 \
-  https://raw.githubusercontent.com/liuxr0814/vps-tcp-tune/main/vps-tcp-full-tune.sh \
-  -o /tmp/vps-tcp-full-tune.sh
+  https://raw.githubusercontent.com/liuxr0814/netpilot/main/netpilot.sh \
+  -o /tmp/netpilot.sh
 
-bash -n /tmp/vps-tcp-full-tune.sh
-bash /tmp/vps-tcp-full-tune.sh doctor
-bash /tmp/vps-tcp-full-tune.sh plan --profile balanced
+bash -n /tmp/netpilot.sh
+bash /tmp/netpilot.sh doctor
+bash /tmp/netpilot.sh plan --profile balanced
 ```
 
 确认需要保留快捷命令后，以 root 执行显式安装：
 
 ```bash
-bash /tmp/vps-tcp-full-tune.sh install
+bash /tmp/netpilot.sh install
 ```
 
-安装位置为 `/usr/local/bin/tcp.sh`，快捷命令为 `/usr/local/bin/tcp`。之后运行 `tcp` 打开菜单。`install` 遇到内容不同的既有安装文件会保护原文件；已有版本使用 `tcp update` 更新。
+安装文件沿用 `/usr/local/bin/tcp.sh`，`netpilot` 和 `tcp` 快捷命令指向同一文件。运行 `netpilot` 打开菜单，使用 `netpilot update` 更新。`install` 遇到内容不同的既有安装文件会保护原文件；被其他文件占用的快捷命令也不会覆盖。
 
 仍可通过一行命令直接打开菜单：
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/liuxr0814/vps-tcp-tune/main/vps-tcp-full-tune.sh)
+bash <(curl -fsSL https://raw.githubusercontent.com/liuxr0814/netpilot/main/netpilot.sh)
 ```
 
 直接打开菜单、运行 `doctor`、`plan` 或 `status` 不再隐式安装脚本。需要一行安装时，在同一命令后加 `install`。
+
+## 旧版升级与兼容
+
+项目原名 VPS TCP Tune，仓库现名为 [NetPilot](https://github.com/liuxr0814/netpilot)。已有安装继续使用原来的 `tcp` 命令升级：
+
+```bash
+tcp update
+
+# 更新完成后，若还没有 netpilot 命令，补建快捷入口。
+tcp install
+netpilot help
+```
+
+升级保留首次备份和原有配置，不需要卸载后重装。`tcp` 与 `netpilot` 使用同一安装文件、状态目录和互斥锁；原来的回滚、更新、卸载命令仍可使用。已有状态路径 `/var/lib/vps-tcp-full-tune`、锁路径 `/run/vps-tcp-full-tune.lock`、模块配置名及防火墙标识保持兼容，不按项目改名迁移这些记录。
+
+仓库改名依赖 GitHub 的重定向兼容；不要重新创建同名的旧仓库，以免覆盖旧地址的重定向（[GitHub 说明](https://docs.github.com/en/repositories/creating-and-managing-repositories/renaming-a-repository)）。
+
+`netpilot.sh` 是主脚本；旧文件名 `vps-tcp-full-tune.sh` 继续提供内容相同、可独立运行的完整脚本，供旧版写死的下载地址更新。旧版生成的配置标记和 schema 1 测速报告仍被识别；报告内部的历史标识保留，不因改名破坏 `compare`。
 
 ## 推荐流程
 
@@ -55,11 +73,11 @@ bash <(curl -fsSL https://raw.githubusercontent.com/liuxr0814/vps-tcp-tune/main/
 ### 诊断与建议
 
 ```bash
-tcp doctor
-tcp plan --profile proxy
+netpilot doctor
+netpilot plan --profile proxy
 
 # 带宽与 RTT 应来自同一条实际路径；不要直接填写网卡标称速率。
-tcp plan --profile proxy --bandwidth 500 --rtt 80
+netpilot plan --profile proxy --bandwidth 500 --rtt 80
 ```
 
 `doctor` 查看有效内存、可用 CPU、可用/当前拥塞算法、默认与实际 qdisc，并提示可检测到的 tuned 配置。只读操作不测速、不加载模块或改内核。
@@ -84,13 +102,13 @@ tcp plan --profile proxy --bandwidth 500 --rtt 80
 
 ```bash
 # 先显示计划，确认后才写入和持久化。
-tcp apply --profile proxy --bandwidth 500 --rtt 80
+netpilot apply --profile proxy --bandwidth 500 --rtt 80
 
 # 明确授权的非交互用法。
-tcp apply --profile proxy --bandwidth 500 --rtt 80 --yes
+netpilot apply --profile proxy --bandwidth 500 --rtt 80 --yes
 
-tcp status
-tcp verify
+netpilot status
+netpilot verify
 ```
 
 原有 `tcp apply` 命令仍保留，采用 `balanced` 档。基础调优默认保留 `tcp_mem`、socket 初始缓冲、ECN、TFO、重试次数、TIME_WAIT、IPv4/IPv6 地址策略；不再一并修改 limits/MSS，也不重启 Xray 或改动 3x-ui 入站。
@@ -100,8 +118,8 @@ tcp verify
 ### 网络计数诊断
 
 ```bash
-tcp diagnose
-tcp diagnose --seconds 5
+netpilot diagnose
+netpilot diagnose --seconds 5
 ```
 
 查看接收 softnet 丢弃/处理预算耗尽、监听队列溢出和 TCP 重传等累计计数；指定 `--seconds 1..60` 时观察增量，不发送测速流量。计数可能包含其他业务；TCP 重传不等于直接测量的端到端丢包率，单个计数也不能独自确定瓶颈。
@@ -111,16 +129,16 @@ tcp diagnose --seconds 5
 使用你有权测试、能够连接的 iperf3 服务端：
 
 ```bash
-tcp bench --peer iperf.example.net --port 5201 \
+netpilot bench --peer iperf.example.net --port 5201 \
   --budget-mib 256 --direction both --streams 1 \
   --timeout 30 --output before.json
 
 # 应用计划后，用相同对端与选项重新测量。
-tcp bench --peer iperf.example.net --port 5201 \
+netpilot bench --peer iperf.example.net --port 5201 \
   --budget-mib 256 --direction both --streams 1 \
   --timeout 30 --output after.json
 
-tcp compare before.json after.json
+netpilot compare before.json after.json
 ```
 
 `iperf.example.net` 是占位符，需换成实际服务端。默认预算为 1024MiB，包含全部测试方向和并行流的 payload 目标；默认单流、双向、每方向最多 30 秒：
@@ -152,15 +170,15 @@ JSON 报告记录测试条件、吞吐、重传、CPU 与可选延迟信息，�
 | `8` | 诊断、计划、预算测速、对比、验证和网络计数观察。 |
 | `0` | 退出。 |
 
-保留 `status/apply/rollback/update/uninstall`，新增 `doctor/plan/bench/compare/verify/diagnose/install`。`tcp help` 查看完整参数。
+保留 `status/apply/rollback/update/uninstall`，新增 `doctor/plan/bench/compare/verify/diagnose/install`。`netpilot help` 查看完整参数。
 
 选项 `4` 可能提升设备 ring 至允许上限并设置 RPS，属于独立高级操作；硬件支持不等于一定有收益，使用前后应观察延迟、吞吐和 CPU。工具不安装替代内核，不自动开启 swap，也不提供深度限速器扫描、HTB 接管或命名配置存档。
 
 ## 备份、回滚和卸载
 
 ```bash
-tcp rollback
-tcp uninstall
+netpilot rollback
+netpilot uninstall
 ```
 
 本工具管理的主要路径：
@@ -171,28 +189,33 @@ tcp uninstall
 /etc/modules-load.d/vps-tcp-full-tune.conf
 /etc/gai.conf                         # 仅显式选择 IPv4 优先时
 /var/lib/vps-tcp-full-tune/            # 原值、备份与状态
-/usr/local/bin/tcp.sh
-/usr/local/bin/tcp
+/usr/local/bin/tcp.sh                 # 兼容安装路径
+/usr/local/bin/netpilot               # 新命令
+/usr/local/bin/tcp                    # 兼容命令
 ```
 
 旧版遗留的 limits/MSS 状态和已备份网卡项目仍参与回滚。首次原值不会因重复应用而被更新值覆盖；`rollback` 恢复首次记录的运行值和受管文件，成功后清理记录。恢复失败返回非零、保留备份并报告失败项，修复原因后可重试；此时卸载也会停止。
 
 文件备份在完整复制后才发布；复制失败不留下可供重试接受的正式备份。此机制不能判断旧版本已经留下的备份内容是否完整。清理失败也返回非零；已完成恢复后若仅剩未知文件，保留这些文件并提示，不递归删除。
 
-卸载针对 `/usr/local/bin/tcp.sh` 中可识别为本工具的普通文件，以及指向该路径的自有快捷方式。下载或源码副本保留；安装路径若被其他文件或符号链接占用则拒绝删除。回滚或清理失败时停止卸载。
+卸载针对 `/usr/local/bin/tcp.sh` 中可识别为本工具的普通文件，以及指向该路径的自有 `netpilot`、`tcp` 或旧 `t` 快捷方式。下载或源码副本保留；安装路径若被其他文件或符号链接占用则拒绝删除。回滚或清理失败时停止卸载。
 
 回滚不等于恢复任意时刻的完整系统快照，不删除其他程序的防火墙规则，也不能还原在工具之外发生的所有配置变化。对已运行服务，脚本自身的 `ulimit` 不等于该服务的实际句柄限制。
 
 ## 开发与测试
 
 ```bash
-bash -n vps-tcp-full-tune.sh
+bash -n netpilot.sh
+# 修改主脚本后，同步完整旧入口，再运行测试。
+bash scripts/sync-legacy.sh
 bash tests/run.sh
 ```
 
-完整测试包含建议边界、重复应用、真实复制中断后的备份重试、卸载路径/文件归属、清理失败传播、报告与真实本机回环测速；需要 Linux/Bash 4+，以及 `iperf3`、`python3`、`ping`、`timeout`、`ss` 和 `shellcheck`。缺少依赖会报错，不会当作通过。
+测试入口会检查 `netpilot.sh` 与兼容副本逐字节相同，避免旧版下载到过期或不完整的入口。完整测试包含改名兼容、建议边界、重复应用、真实复制中断后的备份重试、卸载路径/文件归属、清理失败传播、报告与真实本机回环测速；需要 Linux/Bash 4+，以及 `iperf3`、`python3`、`ping`、`timeout`、`ss` 和 `shellcheck`。缺少依赖会报错，不会当作通过。
 
 `tests/test_bench_live.sh` 使用真实 `iperf3`，也可单独运行，不需要公网测速对端。真实内核写入集成测试另在 `tests/linux_apply_integration.sh`，仅允许在具有可写网络命名空间 sysctl 和相应权限的可丢弃 Docker 容器中运行，不包含在默认套件里。重启持久化效果仍需另行验证，不能只靠模拟测试宣布生产效果。
+
+`tests/migration_cli_integration.sh` 另外验证旧版原位升级、备份、别名、回滚与卸载；同样仅限可丢弃 Docker 容器，不在默认套件运行。用 `MIGRATION_OLD_SCRIPT` 指向由提交 `231fe4701b018b5fb0818f5c75b5067b94cd7b24` 导出的旧版 `vps-tcp-full-tune.sh`；测试会核对旧版哈希，下载传输使用离线替身。仓库 URL 的在线重定向需另行实测。
 
 ## 参考与取舍
 

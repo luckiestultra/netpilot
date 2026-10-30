@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
-SCRIPT="${SCRIPT_OVERRIDE:-$ROOT/vps-tcp-full-tune.sh}"
+SCRIPT="${SCRIPT_OVERRIDE:-$ROOT/netpilot.sh}"
 TMP="$(mktemp -d)"
 trap 'rm -rf -- "$TMP"' EXIT
 fail() { printf 'FAIL: %s\n' "$*" >&2; exit 1; }
