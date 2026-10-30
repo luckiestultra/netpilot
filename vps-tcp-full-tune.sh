@@ -166,11 +166,17 @@ show_status() {
 }
 
 backup_file() {
-  local path="$1" name="$2"
+  local path="$1" name="$2" tmp
+  tmp="$(mktemp "$BACKUP_DIR/.${name}.tmp.XXXXXX")" || return 1
   if [[ -e "$path" || -L "$path" ]]; then
-    cp -a -- "$path" "$BACKUP_DIR/$name"
-  else
-    : > "$BACKUP_DIR/$name.missing"
+    # Publish only a complete copy; retries must never accept a partial backup.
+    if ! rm -f -- "$tmp" || ! cp -a -- "$path" "$tmp" || ! mv -fT -- "$tmp" "$BACKUP_DIR/$name"; then
+      rm -f -- "$tmp"
+      return 1
+    fi
+  elif ! mv -fT -- "$tmp" "$BACKUP_DIR/$name.missing"; then
+    rm -f -- "$tmp"
+    return 1
   fi
 }
 
@@ -517,8 +523,9 @@ restore_rps() {
 }
 
 remove_state_files() {
-  rm -f -- \
-    "$STATE_DIR/original-values" \
+  local dir entry nonempty
+  # Retain the retry marker until every other owned file has been removed.
+  if ! rm -f -- \
     "$STATE_DIR/ulimit.before" \
     "$STATE_DIR/interface" \
     "$STATE_DIR/gai-changed" \
@@ -538,9 +545,28 @@ remove_state_files() {
     "$BACKUP_DIR/limits-file" \
     "$BACKUP_DIR/limits-file.missing" \
     "$BACKUP_DIR/gai-file" \
-    "$BACKUP_DIR/gai-file.missing"
-  rmdir "$BACKUP_DIR" 2>/dev/null || true
-  rmdir "$STATE_DIR" 2>/dev/null || true
+    "$BACKUP_DIR/gai-file.missing"; then
+    warn 'Unable to remove saved state files; retry cleanup after fixing the error.'
+    return 1
+  fi
+  if ! rm -f -- "$STATE_DIR/original-values"; then
+    warn 'Unable to remove the saved-state marker.'
+    return 1
+  fi
+  for dir in "$BACKUP_DIR" "$STATE_DIR"; do
+    [[ -d "$dir" ]] || continue
+    nonempty=0
+    for entry in "$dir"/* "$dir"/.[!.]* "$dir"/..?*; do
+      if [[ -e "$entry" || -L "$entry" ]]; then nonempty=1; break; fi
+    done
+    if (( nonempty )); then
+      warn "Retaining directory containing unowned files: $dir"
+    elif ! rmdir -- "$dir"; then
+      warn "Unable to remove empty state directory: $dir"
+      return 1
+    fi
+  done
+  return 0
 }
 
 rollback_internal() {
@@ -725,24 +751,34 @@ check_update() {
   exec bash "$INSTALL_PATH"
 }
 
+installed_script_owned() {
+  [[ -f "$INSTALL_PATH" && ! -L "$INSTALL_PATH" ]] || return 1
+  # Recognize our existing revisions without executing the installed file.
+  grep -Fqx "readonly UPDATE_URL=\"$UPDATE_URL\"" "$INSTALL_PATH" &&
+    grep -Fqx 'uninstall_own_script() {' "$INSTALL_PATH"
+}
+
 uninstall_own_script() {
-  local answer
-  printf '\n这只会回退本脚本的配置，并删除本脚本和快捷命令：\n'
-  printf '  脚本：%s\n  快捷命令：%s\n' "$SCRIPT_PATH" "$SHORTCUT_PATH"
-  printf '不会删除 3x-ui、Xray、面板或其他服务。\n'
+  local answer shortcut
+  printf '\n这只会回退本脚本的配置，并删除已安装脚本和自有快捷命令：\n'
+  printf '  脚本：%s\n  快捷命令：%s\n' "$INSTALL_PATH" "$SHORTCUT_PATH"
+  printf '下载副本和源码文件保留；不会删除 3x-ui、Xray、面板或其他服务。\n'
   read -r -p '确定卸载本调优脚本？[y/N] ' answer
   [[ "$answer" =~ ^[Yy]$ ]] || { log '已取消卸载。'; return 0; }
 
-  if [[ -f "$STATE_DIR/original-values" ]]; then
+  if [[ -e "$INSTALL_PATH" || -L "$INSTALL_PATH" ]]; then
+    installed_script_owned || { warn "无法确认安装文件归属，拒绝删除：$INSTALL_PATH"; return 1; }
+  fi
+  if [[ -e "$STATE_DIR" || -L "$STATE_DIR" ]]; then
+    [[ -d "$STATE_DIR" && ! -L "$STATE_DIR" ]] || { warn '运行状态路径不是普通目录，拒绝卸载。'; return 1; }
     rollback_internal || return 1
   fi
-  if [[ -L "$SHORTCUT_PATH" && "$(readlink "$SHORTCUT_PATH")" == "$INSTALL_PATH" ]]; then
-    rm -f -- "$SHORTCUT_PATH"
-  fi
-  if [[ -L "$LEGACY_SHORTCUT_PATH" && "$(readlink "$LEGACY_SHORTCUT_PATH")" == "$INSTALL_PATH" ]]; then
-    rm -f -- "$LEGACY_SHORTCUT_PATH"
-  fi
-  rm -f -- "$SCRIPT_PATH" || return 1
+  for shortcut in "$SHORTCUT_PATH" "$LEGACY_SHORTCUT_PATH"; do
+    if [[ -L "$shortcut" && "$(readlink "$shortcut")" == "$INSTALL_PATH" ]]; then
+      rm -f -- "$shortcut" || return 1
+    fi
+  done
+  rm -f -- "$INSTALL_PATH" || return 1
   log '本调优脚本及其快捷命令已移除；3x-ui/Xray 未修改。'
   exit 0
 }
