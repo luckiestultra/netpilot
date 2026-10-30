@@ -523,8 +523,9 @@ restore_rps() {
 }
 
 remove_state_files() {
-  rm -f -- \
-    "$STATE_DIR/original-values" \
+  local dir entry nonempty
+  # Retain the retry marker until every other owned file has been removed.
+  if ! rm -f -- \
     "$STATE_DIR/ulimit.before" \
     "$STATE_DIR/interface" \
     "$STATE_DIR/gai-changed" \
@@ -544,9 +545,28 @@ remove_state_files() {
     "$BACKUP_DIR/limits-file" \
     "$BACKUP_DIR/limits-file.missing" \
     "$BACKUP_DIR/gai-file" \
-    "$BACKUP_DIR/gai-file.missing"
-  rmdir "$BACKUP_DIR" 2>/dev/null || true
-  rmdir "$STATE_DIR" 2>/dev/null || true
+    "$BACKUP_DIR/gai-file.missing"; then
+    warn 'Unable to remove saved state files; retry cleanup after fixing the error.'
+    return 1
+  fi
+  if ! rm -f -- "$STATE_DIR/original-values"; then
+    warn 'Unable to remove the saved-state marker.'
+    return 1
+  fi
+  for dir in "$BACKUP_DIR" "$STATE_DIR"; do
+    [[ -d "$dir" ]] || continue
+    nonempty=0
+    for entry in "$dir"/* "$dir"/.[!.]* "$dir"/..?*; do
+      if [[ -e "$entry" || -L "$entry" ]]; then nonempty=1; break; fi
+    done
+    if (( nonempty )); then
+      warn "Retaining directory containing unowned files: $dir"
+    elif ! rmdir -- "$dir"; then
+      warn "Unable to remove empty state directory: $dir"
+      return 1
+    fi
+  done
+  return 0
 }
 
 rollback_internal() {
