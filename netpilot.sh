@@ -13,19 +13,17 @@ fi
 # Optional dependencies are never installed implicitly. Updating is explicit.
 # Read-only commands never install or tune. Changes preserve a baseline snapshot.
 
-# Keep legacy on-disk identities so existing baselines, updates and locks remain valid.
-readonly STATE_DIR="/var/lib/vps-tcp-full-tune"
+# All persisted state, owned files and locks use the NetPilot namespace.
+readonly STATE_DIR="/var/lib/netpilot"
 readonly BACKUP_DIR="$STATE_DIR/backup"
-readonly INSTALL_PATH="/usr/local/bin/tcp.sh"
-readonly BBR_FILE="/etc/sysctl.d/10-bbr.conf"
-readonly BBR_MODULE_FILE="/etc/modules-load.d/vps-tcp-full-tune.conf"
-readonly SYSCTL_FILE="/etc/sysctl.d/99-network-performance.conf"
-readonly LIMITS_FILE="/etc/security/limits.d/99-network-performance.conf"
+readonly INSTALL_PATH="/usr/local/bin/netpilot.sh"
+readonly BBR_FILE="/etc/sysctl.d/10-netpilot-bbr.conf"
+readonly BBR_MODULE_FILE="/etc/modules-load.d/netpilot.conf"
+readonly SYSCTL_FILE="/etc/sysctl.d/99-netpilot.conf"
+readonly LIMITS_FILE="/etc/security/limits.d/99-netpilot.conf"
 readonly GAI_FILE="/etc/gai.conf"
-readonly MSS_COMMENT="vps-tcp-full-tune"
-readonly SHORTCUT_PATH="/usr/local/bin/tcp"
-readonly NETPILOT_SHORTCUT_PATH="/usr/local/bin/netpilot"
-readonly LEGACY_SHORTCUT_PATH="/usr/local/bin/t"
+readonly MSS_COMMENT="netpilot"
+readonly SHORTCUT_PATH="/usr/local/bin/netpilot"
 readonly UPDATE_URL="https://github.com/liuxr0814/netpilot/raw/refs/heads/main/netpilot.sh"
 readonly RED=$'\033[0;31m'
 readonly GREEN=$'\033[0;32m'
@@ -223,7 +221,7 @@ write_sysctl_file() {
   local tmp key line value
   local -A merged=()
   if [[ -e "$SYSCTL_FILE" || -L "$SYSCTL_FILE" ]]; then
-    if [[ -L "$SYSCTL_FILE" ]] || ! grep -Eq '^# Managed by (netpilot|vps-tcp-full-tune)\.sh\.$' "$SYSCTL_FILE"; then
+    if [[ -L "$SYSCTL_FILE" ]] || ! grep -Fqx '# Managed by netpilot.sh.' "$SYSCTL_FILE"; then
       warn "Refusing to replace unowned configuration: $SYSCTL_FILE"
       return 1
     fi
@@ -253,7 +251,7 @@ write_sysctl_file() {
 
 owned_config_target() {
   local path="$1"
-  if [[ -L "$path" ]] || { [[ -e "$path" ]] && { [[ ! -f "$path" ]] || ! grep -Eq '^# Managed by (netpilot|vps-tcp-full-tune)\.sh\.$' "$path"; }; }; then
+  if [[ -L "$path" ]] || { [[ -e "$path" ]] && { [[ ! -f "$path" ]] || ! grep -Fqx '# Managed by netpilot.sh.' "$path"; }; }; then
     warn "拒绝覆盖非本工具管理的配置：$path"
     return 1
   fi
@@ -582,7 +580,7 @@ rollback_internal() {
   remove_mss_rule || failed=1
   restore_original_values || failed=1
   restore_ulimit || failed=1
-  # Old versions recorded every file. New operations own only explicit backups.
+  # Restore only files with recorded backup metadata.
   for name in bbr-file bbr-module-file sysctl-file limits-file gai-file; do
     if [[ -e "$BACKUP_DIR/$name" || -L "$BACKUP_DIR/$name" || -e "$BACKUP_DIR/$name.missing" ]]; then
       path="$(managed_file_path "$name")" || { failed=1; continue; }
@@ -700,20 +698,13 @@ install_script_atomic() {
 }
 
 install_shortcuts() {
-  local shortcut
-  for shortcut in "$SHORTCUT_PATH" "$NETPILOT_SHORTCUT_PATH"; do
-    if [[ ! -e "$shortcut" && ! -L "$shortcut" ]]; then
-      ln -s "$INSTALL_PATH" "$shortcut" || return 1
-      log "已创建快捷命令：${shortcut##*/}"
-    elif [[ -L "$shortcut" && "$(readlink "$shortcut")" == "$INSTALL_PATH" ]]; then
-      :
-    else
-      warn "$shortcut 已被其他文件占用，未覆盖。"
-    fi
-  done
-  if [[ -L "$LEGACY_SHORTCUT_PATH" && "$(readlink "$LEGACY_SHORTCUT_PATH")" == "$INSTALL_PATH" ]]; then
-    rm -f -- "$LEGACY_SHORTCUT_PATH" || return 1
-    log '已移除旧快捷命令：t'
+  if [[ ! -e "$SHORTCUT_PATH" && ! -L "$SHORTCUT_PATH" ]]; then
+    ln -s "$INSTALL_PATH" "$SHORTCUT_PATH" || return 1
+    log '已创建快捷命令：netpilot'
+  elif [[ -L "$SHORTCUT_PATH" && "$(readlink "$SHORTCUT_PATH")" == "$INSTALL_PATH" ]]; then
+    :
+  else
+    warn "$SHORTCUT_PATH 已被其他文件占用，未覆盖。"
   fi
   return 0
 }
@@ -766,20 +757,16 @@ check_update() {
 }
 
 installed_script_owned() {
-  local url
   [[ -f "$INSTALL_PATH" && ! -L "$INSTALL_PATH" ]] || return 1
-  # Recognize current and pre-rename revisions without executing the installed file.
-  grep -Fqx 'uninstall_own_script() {' "$INSTALL_PATH" || return 1
-  for url in "$UPDATE_URL" 'https://github.com/liuxr0814/vps-tcp-tune/raw/refs/heads/main/vps-tcp-full-tune.sh'; do
-    if grep -Fqx "readonly UPDATE_URL=\"$url\"" "$INSTALL_PATH"; then return 0; fi
-  done
-  return 1
+  # Inspect ownership as data; never execute the installation being removed.
+  grep -Fqx "readonly UPDATE_URL=\"$UPDATE_URL\"" "$INSTALL_PATH" &&
+    grep -Fqx 'uninstall_own_script() {' "$INSTALL_PATH"
 }
 
 uninstall_own_script() {
-  local answer shortcut
+  local answer
   printf '\n这只会回退本脚本的配置，并删除已安装脚本和自有快捷命令：\n'
-  printf '  脚本：%s\n  快捷命令：%s、%s\n' "$INSTALL_PATH" "$NETPILOT_SHORTCUT_PATH" "$SHORTCUT_PATH"
+  printf '  脚本：%s\n  快捷命令：%s\n' "$INSTALL_PATH" "$SHORTCUT_PATH"
   printf '下载副本和源码文件保留；不会删除 3x-ui、Xray、面板或其他服务。\n'
   read -r -p '确定卸载 NetPilot？[y/N] ' answer
   [[ "$answer" =~ ^[Yy]$ ]] || { log '已取消卸载。'; return 0; }
@@ -791,11 +778,9 @@ uninstall_own_script() {
     [[ -d "$STATE_DIR" && ! -L "$STATE_DIR" ]] || { warn '运行状态路径不是普通目录，拒绝卸载。'; return 1; }
     rollback_internal || return 1
   fi
-  for shortcut in "$SHORTCUT_PATH" "$NETPILOT_SHORTCUT_PATH" "$LEGACY_SHORTCUT_PATH"; do
-    if [[ -L "$shortcut" && "$(readlink "$shortcut")" == "$INSTALL_PATH" ]]; then
-      rm -f -- "$shortcut" || return 1
-    fi
-  done
+  if [[ -L "$SHORTCUT_PATH" && "$(readlink "$SHORTCUT_PATH")" == "$INSTALL_PATH" ]]; then
+    rm -f -- "$SHORTCUT_PATH" || return 1
+  fi
   rm -f -- "$INSTALL_PATH" || return 1
   log '本调优脚本及其快捷命令已移除；3x-ui/Xray 未修改。'
   exit 0
@@ -823,7 +808,7 @@ show_menu() {
   printf '\n%b==================================================%b\n' "$YELLOW" "$NC"
   printf '%b            NetPilot 网络诊断与调优            %b\n' "$YELLOW" "$NC"
   printf '%b            bash <(curl -fsSL GitHub Raw)%b\n' "$GREEN" "$NC"
-  printf '%b                    快捷命令: netpilot / tcp                    %b\n' "$GREEN" "$NC"
+  printf '%b                    快捷命令: netpilot                    %b\n' "$GREEN" "$NC"
   printf '%b==================================================%b\n' "$YELLOW" "$NC"
   printf '  1. 设置 IPv4 优先解析 -> %s : [改变地址选择顺序，按需启用]\n' "$(status_badge "$ipv4_active")"
   printf '  2. 开启 BBR + FQ       -> %s : [切换算法与默认队列，需实测效果]\n' "$(status_badge "$bbr_active")"
@@ -1412,8 +1397,8 @@ for path in sorted(folder.glob('*.direction'),key=lambda p:int(p.stem)):
         loaded['p95_delta_ms']=(loaded['p95_ms']-idle['p95_ms']) if loaded['status']==idle['status']=='ok' else None
         run['loaded_latency']=loaded
     runs.append(run)
-# Keep the schema-v1 wire identifier so historical reports remain comparable.
-report={'schema_version':1,'kind':'vps-tcp-tune-benchmark',
+# NetPilot benchmark reports use an explicit versioned wire identifier.
+report={'schema_version':1,'kind':'netpilot-benchmark',
         'created_at':datetime.datetime.now(datetime.timezone.utc).isoformat(),
         'peer':peer,'port':port,'budget_bytes':budget*1048576,'streams':streams,
         'timeout_seconds':timeout,'direction':direction,'bytes_per_run_target':quota,
@@ -1461,7 +1446,7 @@ try:
         return type(value) in (int,float) and math.isfinite(value) and value>0
     def validate(report):
         if not isinstance(report,dict): raise ValueError('报告必须是JSON对象')
-        if type(report.get('schema_version')) is not int or report['schema_version']!=1 or report.get('kind')!='vps-tcp-tune-benchmark':
+        if type(report.get('schema_version')) is not int or report['schema_version']!=1 or report.get('kind')!='netpilot-benchmark':
             raise ValueError('不支持的报告格式')
         if not isinstance(report.get('peer'),str) or not report['peer']: raise ValueError('缺少对端')
         for key,low,high in [('port',1,65535),('streams',1,32),('budget_bytes',1048576,1099511627776),('timeout_seconds',2,600)]:
@@ -1502,7 +1487,7 @@ PY
 usage() {
   cat <<'EOF'
 NetPilot — Linux VPS 网络诊断与调优
-用法：netpilot <命令> [参数]（兼容 tcp；也可 bash netpilot.sh <命令>）
+用法：netpilot <命令> [参数]（也可 bash netpilot.sh <命令>）
   menu                 中文交互菜单
   doctor               只读查看内存/CPU/BBR/实际qdisc/外部调优器
   plan [--profile balanced|proxy|bulk] [--bandwidth Mbps --rtt ms]
@@ -1516,7 +1501,7 @@ NetPilot — Linux VPS 网络诊断与调优
         [--output FILE] [--yes]  有预算的双向测速，需iperf3/python3/timeout
   compare BEFORE.json AFTER.json  比较同条件测速报告
   rollback             恢复首次记录的原值；失败保留备份
-  install              显式安装 NetPilot 及 netpilot/tcp 快捷命令
+  install              显式安装 NetPilot 及 netpilot 快捷命令
   update               从自有仓库下载并检查更新
   uninstall            回退并卸载本工具
   help                 显示帮助
@@ -1555,7 +1540,7 @@ run_mutation() {
   local status=0
   need_root
   command -v flock >/dev/null 2>&1 || { warn 'flock is required for changes.'; return 1; }
-  exec 9>/run/vps-tcp-full-tune.lock || return 1
+  exec 9>/run/netpilot.lock || return 1
   if ! flock -n 9; then
     warn 'Another tuning operation is running.'
     exec 9>&-

@@ -37,6 +37,7 @@ run_case() {
 import json,os,stat,sys
 path,direction,streams,budget=sys.argv[1:]
 report=json.load(open(path)); runs=report['runs']
+assert report['kind']=='netpilot-benchmark'
 expected=['send','receive'] if direction=='both' else [direction]
 assert [r['direction'] for r in runs]==expected, runs
 assert all(r['status']=='ok' for r in runs), runs

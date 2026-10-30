@@ -50,6 +50,7 @@ python3 - "$TEST_DIR/before.json" <<'PY'
 import json, os, stat, sys
 report = json.load(open(sys.argv[1]))
 assert report['schema_version'] == 1
+assert report['kind'] == 'netpilot-benchmark'
 assert report['budget_bytes'] == 2 * 1024 * 1024
 assert report['peer'] == '::1'
 assert len(report['runs']) == 2
@@ -68,6 +69,7 @@ variants={}
 variants['empty-runs']=copy.deepcopy(valid); variants['empty-runs']['runs']=[]
 variants['missing-metadata']=copy.deepcopy(valid); variants['missing-metadata'].pop('peer')
 variants['illegal-schema']=copy.deepcopy(valid); variants['illegal-schema']['schema_version']=999
+variants['foreign-kind']=copy.deepcopy(valid); variants['foreign-kind']['kind']='other-tool-benchmark'
 variants['boolean-schema']=copy.deepcopy(valid); variants['boolean-schema']['schema_version']=True
 variants['top-level-list']=[valid]
 variants['duplicate-direction']=copy.deepcopy(valid); variants['duplicate-direction']['runs'][1]['direction']='send'

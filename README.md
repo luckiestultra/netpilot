@@ -1,6 +1,6 @@
 # NetPilot
 
-面向通用 Linux VPS 的 TCP 诊断、参数建议、预算测速与回滚工具。根据当前内核能力、有效内存、CPU 配额和路径输入生成建议，提供 `netpilot` 中文菜单与单文件运行方式，兼容原有 `tcp` 命令。
+面向通用 Linux VPS 的 TCP 诊断、参数建议、预算测速与回滚工具。根据当前内核能力、有效内存、CPU 配额和路径输入生成建议，提供 `netpilot` 中文菜单与单文件运行方式。
 
 调优不能增加云厂商带宽，也不能保证改善拥塞或代理体验。工具展示读回值和实际测量结果，不把配置成功当作性能提升。
 
@@ -34,33 +34,17 @@ bash /tmp/netpilot.sh plan --profile balanced
 bash /tmp/netpilot.sh install
 ```
 
-安装文件沿用 `/usr/local/bin/tcp.sh`，`netpilot` 和 `tcp` 快捷命令指向同一文件。运行 `netpilot` 打开菜单，使用 `netpilot update` 更新。`install` 遇到内容不同的既有安装文件会保护原文件；被其他文件占用的快捷命令也不会覆盖。
+安装文件为 `/usr/local/bin/netpilot.sh`，快捷命令为 `netpilot`。运行 `netpilot` 打开菜单，使用 `netpilot update` 更新。`install` 遇到内容不同的既有安装文件会保护原文件；被其他文件占用的快捷命令也不会覆盖。
 
-仍可通过一行命令直接打开菜单：
+也可通过一行命令直接打开菜单：
 
 ```bash
 bash <(curl -fsSL https://raw.githubusercontent.com/liuxr0814/netpilot/main/netpilot.sh)
 ```
 
-直接打开菜单、运行 `doctor`、`plan` 或 `status` 不再隐式安装脚本。需要一行安装时，在同一命令后加 `install`。
+直接打开菜单、运行 `doctor`、`plan` 或 `status` 不会隐式安装脚本。需要一行安装时，在同一命令后加 `install`。
 
-## 旧版升级与兼容
-
-项目原名 VPS TCP Tune，仓库现名为 [NetPilot](https://github.com/liuxr0814/netpilot)。已有安装继续使用原来的 `tcp` 命令升级：
-
-```bash
-tcp update
-
-# 更新完成后，若还没有 netpilot 命令，补建快捷入口。
-tcp install
-netpilot help
-```
-
-升级保留首次备份和原有配置，不需要卸载后重装。`tcp` 与 `netpilot` 使用同一安装文件、状态目录和互斥锁；原来的回滚、更新、卸载命令仍可使用。已有状态路径 `/var/lib/vps-tcp-full-tune`、锁路径 `/run/vps-tcp-full-tune.lock`、模块配置名及防火墙标识保持兼容，不按项目改名迁移这些记录。
-
-仓库改名依赖 GitHub 的重定向兼容；不要重新创建同名的旧仓库，以免覆盖旧地址的重定向（[GitHub 说明](https://docs.github.com/en/repositories/creating-and-managing-repositories/renaming-a-repository)）。
-
-`netpilot.sh` 是主脚本；旧文件名 `vps-tcp-full-tune.sh` 继续提供内容相同、可独立运行的完整脚本，供旧版写死的下载地址更新。旧版生成的配置标记和 schema 1 测速报告仍被识别；报告内部的历史标识保留，不因改名破坏 `compare`。
+NetPilot 使用独立的安装、配置和状态路径。此前安装的其他工具由其自身管理；NetPilot 不自动迁移或清理其他工具的数据。
 
 ## 推荐流程
 
@@ -111,7 +95,7 @@ netpilot status
 netpilot verify
 ```
 
-原有 `tcp apply` 命令仍保留，采用 `balanced` 档。基础调优默认保留 `tcp_mem`、socket 初始缓冲、ECN、TFO、重试次数、TIME_WAIT、IPv4/IPv6 地址策略；不再一并修改 limits/MSS，也不重启 Xray 或改动 3x-ui 入站。
+`netpilot apply` 默认采用 `balanced` 档。基础调优保留 `tcp_mem`、socket 初始缓冲、ECN、TFO、重试次数、TIME_WAIT、IPv4/IPv6 地址策略；不修改 limits/MSS，也不重启 Xray 或改动 3x-ui 入站。
 
 `verify` 对比本工具两个 sysctl 配置路径中的期望值与运行值；没有可验证配置、参数不可读或存在偏离时返回非零。它验证参数一致性，不验证吞吐，也不核验所有外部配置文件或服务限制。其他调优器仍可能在稍后覆盖相同参数，应先解决管理冲突。
 
@@ -150,13 +134,13 @@ netpilot compare before.json after.json
 - payload 预算不等于商家计费硬上限，协议开销、重传、ACK 与可选 ICMP 流量另计。10Gbps 连跑 10 秒约为 12.5GB 单方向 payload，应按套餐选择预算。
 - 高速链路可能在很短时间用完预算；短于 3 秒的样本会标记为不足以确定峰值，不会自动扩大预算。
 
-JSON 报告记录测试条件、吞吐、重传、CPU 与可选延迟信息，以私有权限保存，包含对端地址和可能的错误详情；分享前自行脱敏。默认报告写在当前目录，`--output` 不覆盖已有文件。
+JSON 报告类型为 `netpilot-benchmark`，记录测试条件、吞吐、重传、CPU 与可选延迟信息，以私有权限保存，包含对端地址和可能的错误详情；分享前自行脱敏。默认报告写在当前目录，`--output` 不覆盖已有文件。
 
 `compare` 要求对端、端口、方向、流数、预算、超时和延迟采样选项一致，并拒绝失败或格式不匹配的报告。结果只代表该对端、方向和时段；VPS 与近端的测速不能代替用户到节点的真实代理体验，线路波动也可能造成前后差异。
 
-## 中文菜单与兼容命令
+## 中文菜单与命令
 
-原有菜单数字保留，新功能从选项 `8` 进入：
+运行 `netpilot` 打开菜单：
 
 | 选项 | 作用 |
 |---|---|
@@ -170,7 +154,7 @@ JSON 报告记录测试条件、吞吐、重传、CPU 与可选延迟信息，�
 | `8` | 诊断、计划、预算测速、对比、验证和网络计数观察。 |
 | `0` | 退出。 |
 
-保留 `status/apply/rollback/update/uninstall`，新增 `doctor/plan/bench/compare/verify/diagnose/install`。`netpilot help` 查看完整参数。
+`netpilot help` 查看所有命令与完整参数。
 
 选项 `4` 可能提升设备 ring 至允许上限并设置 RPS，属于独立高级操作；硬件支持不等于一定有收益，使用前后应观察延迟、吞吐和 CPU。工具不安装替代内核，不自动开启 swap，也不提供深度限速器扫描、HTB 接管或命名配置存档。
 
@@ -184,21 +168,21 @@ netpilot uninstall
 本工具管理的主要路径：
 
 ```text
-/etc/sysctl.d/10-bbr.conf
-/etc/sysctl.d/99-network-performance.conf
-/etc/modules-load.d/vps-tcp-full-tune.conf
+/etc/sysctl.d/10-netpilot-bbr.conf
+/etc/sysctl.d/99-netpilot.conf
+/etc/modules-load.d/netpilot.conf
 /etc/gai.conf                         # 仅显式选择 IPv4 优先时
-/var/lib/vps-tcp-full-tune/            # 原值、备份与状态
-/usr/local/bin/tcp.sh                 # 兼容安装路径
-/usr/local/bin/netpilot               # 新命令
-/usr/local/bin/tcp                    # 兼容命令
+/var/lib/netpilot/                    # 原值、备份与状态
+/run/netpilot.lock                    # 修改操作互斥锁
+/usr/local/bin/netpilot.sh
+/usr/local/bin/netpilot
 ```
 
-旧版遗留的 limits/MSS 状态和已备份网卡项目仍参与回滚。首次原值不会因重复应用而被更新值覆盖；`rollback` 恢复首次记录的运行值和受管文件，成功后清理记录。恢复失败返回非零、保留备份并报告失败项，修复原因后可重试；此时卸载也会停止。
+首次原值不会因重复应用而被更新值覆盖；`rollback` 恢复首次记录的运行值和受管文件，成功后清理记录。恢复失败返回非零、保留备份并报告失败项，修复原因后可重试；此时卸载也会停止。
 
-文件备份在完整复制后才发布；复制失败不留下可供重试接受的正式备份。此机制不能判断旧版本已经留下的备份内容是否完整。清理失败也返回非零；已完成恢复后若仅剩未知文件，保留这些文件并提示，不递归删除。
+文件备份在完整复制后才发布；复制失败不留下可供重试接受的正式备份。清理失败也返回非零；已完成恢复后若仅剩未知文件，保留这些文件并提示，不递归删除。
 
-卸载针对 `/usr/local/bin/tcp.sh` 中可识别为本工具的普通文件，以及指向该路径的自有 `netpilot`、`tcp` 或旧 `t` 快捷方式。下载或源码副本保留；安装路径若被其他文件或符号链接占用则拒绝删除。回滚或清理失败时停止卸载。
+卸载针对 `/usr/local/bin/netpilot.sh` 中可识别为本工具的普通文件，以及指向该路径的自有 `netpilot` 快捷方式。下载或源码副本保留；安装路径若被其他文件或符号链接占用则拒绝删除。回滚或清理失败时停止卸载。
 
 回滚不等于恢复任意时刻的完整系统快照，不删除其他程序的防火墙规则，也不能还原在工具之外发生的所有配置变化。对已运行服务，脚本自身的 `ulimit` 不等于该服务的实际句柄限制。
 
@@ -206,16 +190,14 @@ netpilot uninstall
 
 ```bash
 bash -n netpilot.sh
-# 修改主脚本后，同步完整旧入口，再运行测试。
-bash scripts/sync-legacy.sh
 bash tests/run.sh
 ```
 
-测试入口会检查 `netpilot.sh` 与兼容副本逐字节相同，避免旧版下载到过期或不完整的入口。完整测试包含改名兼容、建议边界、重复应用、真实复制中断后的备份重试、卸载路径/文件归属、清理失败传播、报告与真实本机回环测速；需要 Linux/Bash 4+，以及 `iperf3`、`python3`、`ping`、`timeout`、`ss` 和 `shellcheck`。缺少依赖会报错，不会当作通过。
+完整测试包含 NetPilot 名称与独立路径、建议边界、重复应用、真实复制中断后的备份重试、卸载路径/文件归属、清理失败传播、报告与真实本机回环测速；需要 Linux/Bash 4+，以及 `iperf3`、`python3`、`ping`、`timeout`、`ss` 和 `shellcheck`。缺少依赖会报错，不会当作通过。
 
 `tests/test_bench_live.sh` 使用真实 `iperf3`，也可单独运行，不需要公网测速对端。真实内核写入集成测试另在 `tests/linux_apply_integration.sh`，仅允许在具有可写网络命名空间 sysctl 和相应权限的可丢弃 Docker 容器中运行，不包含在默认套件里。重启持久化效果仍需另行验证，不能只靠模拟测试宣布生产效果。
 
-`tests/migration_cli_integration.sh` 另外验证旧版原位升级、备份、别名、回滚与卸载；同样仅限可丢弃 Docker 容器，不在默认套件运行。用 `MIGRATION_OLD_SCRIPT` 指向由提交 `231fe4701b018b5fb0818f5c75b5067b94cd7b24` 导出的旧版 `vps-tcp-full-tune.sh`；测试会核对旧版哈希，下载传输使用离线替身。仓库 URL 的在线重定向需另行实测。
+`tests/install_cli_integration.sh` 另外验证完整 CLI 的安装、更新、回滚与卸载，仅限可丢弃 Docker 容器，不在默认套件运行。
 
 ## 参考与取舍
 
@@ -227,4 +209,4 @@ bash tests/run.sh
 - [leandromoreira/linux-network-performance-parameters](https://github.com/leandromoreira/linux-network-performance-parameters)：基于计数定位问题，而非堆叠参数。
 - [Linux TCP 参数文档](https://docs.kernel.org/networking/ip-sysctl.html)、[网络扩展/RPS](https://docs.kernel.org/networking/scaling.html)、[default_qdisc](https://docs.kernel.org/admin-guide/sysctl/net.html#default-qdisc) 与 [iperf3 官方文档](https://software.es.net/iperf/invoking.html)：参数语义和测量边界。
 
-本轮独立实现相关思路，没有直接合入上述项目的代码，也未改变本仓库既有代码的许可声明。
+相关功能独立实现，没有直接合入上述项目的代码，也未改变本仓库既有代码的许可声明。

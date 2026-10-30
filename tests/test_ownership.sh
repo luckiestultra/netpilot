@@ -12,7 +12,7 @@ fail() { printf 'FAIL: %s\n' "$*" >&2; exit 1; }
 setup() {
   STATE_DIR="$TMP/$1/state"; BACKUP_DIR="$STATE_DIR/backup"
   mkdir -p "$TMP/$1"
-  BBR_FILE="$TMP/$1/10-bbr.conf"; BBR_MODULE_FILE="$TMP/$1/module.conf"
+  BBR_FILE="$TMP/$1/10-netpilot-bbr.conf"; BBR_MODULE_FILE="$TMP/$1/module.conf"
   SYSCTL_FILE="$TMP/$1/99-network.conf"; LIMITS_FILE="$TMP/$1/limits.conf"; GAI_FILE="$TMP/$1/gai.conf"
   NIC_IFACE=eth0; SYSCTL_KEYS=()
   restore_rps() { :; }; restore_nic_ring() { :; }; remove_mss_rule() { :; }
@@ -41,14 +41,14 @@ test_no_file_operation_never_takes_config_ownership() (
   [[ "$(cat "$SYSCTL_FILE")" == 'administrator sysctl' ]] || fail 'NIC rollback removed unrelated sysctl config'
 )
 
-test_legacy_metadata_still_restores() (
-  setup legacy
+test_recorded_metadata_restores_owned_file() (
+  setup recorded
   prepare_state
-  printf 'legacy original\n' > "$GAI_FILE"
+  printf 'recorded original\n' > "$GAI_FILE"
   backup_file "$GAI_FILE" gai-file
-  printf 'legacy tuned\n' > "$GAI_FILE"
+  printf 'recorded tuned\n' > "$GAI_FILE"
   rollback_internal
-  [[ "$(cat "$GAI_FILE")" == 'legacy original' ]] || fail 'old backup metadata was ignored'
+  [[ "$(cat "$GAI_FILE")" == 'recorded original' ]] || fail 'recorded backup metadata was ignored'
 )
 
 test_unowned_bbr_file_is_preserved() (
@@ -77,7 +77,7 @@ test_existing_ipv4_preference_does_not_claim_file() (
 )
 
 failures=0
-for test in test_existing_ipv4_preference_does_not_claim_file test_sysctl_only_never_restores_untouched_files test_no_file_operation_never_takes_config_ownership test_legacy_metadata_still_restores test_unowned_bbr_file_is_preserved test_bbr_module_symlink_is_preserved; do
+for test in test_existing_ipv4_preference_does_not_claim_file test_sysctl_only_never_restores_untouched_files test_no_file_operation_never_takes_config_ownership test_recorded_metadata_restores_owned_file test_unowned_bbr_file_is_preserved test_bbr_module_symlink_is_preserved; do
   if "$test"; then printf 'PASS: %s\n' "$test"; else failures=$((failures + 1)); fi
 done
 [[ "$failures" == 0 ]]

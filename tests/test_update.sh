@@ -31,7 +31,7 @@ test_update_write_failure_keeps_old_version() (
 
 test_install_write_failure_never_executes() (
   INSTALL_PATH="$TEST_DIR/failed-install"; SCRIPT_PATH="$TEST_DIR/install-source"
-  SOURCE_SNAPSHOT=''; NETPILOT_SHORTCUT_PATH="$TEST_DIR/netpilot"; SHORTCUT_PATH="$TEST_DIR/shortcut"; LEGACY_SHORTCUT_PATH="$TEST_DIR/legacy"
+  SOURCE_SNAPSHOT=''; SHORTCUT_PATH="$TEST_DIR/shortcut"
   printf '#!/bin/bash\nprintf new\n' > "$SCRIPT_PATH"
   install() { return 1; }
   exec() { printf 'exec\n' >> "$TEST_DIR/install-exec"; }

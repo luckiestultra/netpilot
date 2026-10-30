@@ -12,19 +12,18 @@ log() { printf '%s\n' "$*"; }
 fail() { printf 'FAIL: %s\n' "$*" >&2; exit 1; }
 setup() {
   CASE_DIR="$TEST_DIR/$1"; mkdir -p "$CASE_DIR"
-  INSTALL_PATH="$CASE_DIR/tcp.sh"; SCRIPT_PATH="$CASE_DIR/download.sh"
-  SHORTCUT_PATH="$CASE_DIR/tcp"; NETPILOT_SHORTCUT_PATH="$CASE_DIR/netpilot"; LEGACY_SHORTCUT_PATH="$CASE_DIR/t"
+  INSTALL_PATH="$CASE_DIR/netpilot.sh"; SCRIPT_PATH="$CASE_DIR/download.sh"
+  SHORTCUT_PATH="$CASE_DIR/netpilot"
   STATE_DIR="$CASE_DIR/state"; SOURCE_SNAPSHOT=''
   UPDATE_URL='https://github.com/liuxr0814/netpilot/raw/refs/heads/main/netpilot.sh'
   cp "$SCRIPT" "$INSTALL_PATH"; cp "$SCRIPT" "$SCRIPT_PATH"
   ln -s "$INSTALL_PATH" "$SHORTCUT_PATH"
-  ln -s "$INSTALL_PATH" "$LEGACY_SHORTCUT_PATH"
   rollback_internal() { :; }
 }
 invoke() { (uninstall_own_script <<< "${1:-y}") > "$CASE_DIR/output" 2>&1; }
 assert_removed() {
   [[ ! -e "$INSTALL_PATH" && ! -L "$INSTALL_PATH" ]] || fail 'installed script remains'
-  [[ ! -L "$SHORTCUT_PATH" && ! -L "$LEGACY_SHORTCUT_PATH" ]] || fail 'owned shortcut remains'
+  [[ ! -L "$SHORTCUT_PATH" ]] || fail 'owned shortcut remains'
 }
 assert_no_success() {
   if grep -q '本调优脚本及其快捷命令已移除' "$CASE_DIR/output"; then fail 'failure reported success'; fi
@@ -67,7 +66,7 @@ test_process_substitution_resolves_then_uninstalls() (
 )
 test_changed_owned_version_is_recognized() (
   setup older-version
-  printf '\n# Older installed revision\n' >> "$INSTALL_PATH"
+  printf '\n# Another installed revision\n' >> "$INSTALL_PATH"
   invoke || fail 'different owned revision was refused'
   assert_removed
 )
@@ -95,14 +94,18 @@ test_dangling_installed_symlink_is_preserved() (
   assert_no_success
 )
 test_unrelated_shortcuts_are_preserved() (
-  setup shortcut
-  rm -f -- "$SHORTCUT_PATH" "$LEGACY_SHORTCUT_PATH"
+  setup shortcut-file
+  rm -f -- "$SHORTCUT_PATH"
   printf 'other executable\n' > "$SHORTCUT_PATH"
-  ln -s "$CASE_DIR/other" "$LEGACY_SHORTCUT_PATH"
-  invoke || fail 'uninstall with unrelated shortcuts failed'
+  invoke || fail 'uninstall with unrelated shortcut file failed'
   [[ ! -e "$INSTALL_PATH" && -f "$SCRIPT_PATH" ]] || fail 'wrong installed/source result'
   [[ "$(cat "$SHORTCUT_PATH")" == 'other executable' ]] || fail 'unrelated shortcut file removed'
-  [[ "$(readlink "$LEGACY_SHORTCUT_PATH")" == "$CASE_DIR/other" ]] || fail 'unrelated shortcut link removed'
+  setup shortcut-link
+  rm -f -- "$SHORTCUT_PATH"
+  ln -s "$CASE_DIR/other" "$SHORTCUT_PATH"
+  invoke || fail 'uninstall with unrelated shortcut link failed'
+  [[ ! -e "$INSTALL_PATH" && -f "$SCRIPT_PATH" ]] || fail 'wrong installed/source result'
+  [[ "$(readlink "$SHORTCUT_PATH")" == "$CASE_DIR/other" ]] || fail 'unrelated shortcut link removed'
 )
 test_absent_installation_keeps_source() (
   setup absent

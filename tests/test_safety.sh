@@ -125,7 +125,7 @@ test_cpu_mask_uses_allowed_ids() (
 test_mss_check_failure_is_not_absence() (
   STATE_DIR="$TEST_DIR/mss-check"; mkdir -p "$STATE_DIR"
   : > "$STATE_DIR/iptables4-added"
-  MSS_COMMENT=vps-tcp-full-tune
+  MSS_COMMENT=netpilot
   iptables() { return 2; }
   if remove_mss_rule; then fail 'iptables inspection error was mistaken for an absent rule'; fi
 )
@@ -133,7 +133,7 @@ test_mss_check_failure_is_not_absence() (
 test_mss_absent_rule_is_success() (
   STATE_DIR="$TEST_DIR/mss-absent"; mkdir -p "$STATE_DIR"
   : > "$STATE_DIR/iptables4-added"
-  MSS_COMMENT=vps-tcp-full-tune
+  MSS_COMMENT=netpilot
   iptables() { return 1; }
   remove_mss_rule || fail 'an already absent MSS rule should be idempotent'
 )
