@@ -10,7 +10,7 @@ SYSCTL_FILE="$TMP/managed.conf"
 GAI_FILE="$TMP/gai.conf"
 warn() { printf '%s\n' "$*" >&2; }
 log() { :; }
-printf '# Managed by vps-tcp-full-tune.sh.\nnet.ipv4.tcp_congestion_control = bbr\n' > "$SYSCTL_FILE"
+printf '# Managed by netpilot.sh.\nnet.ipv4.tcp_congestion_control = bbr\n' > "$SYSCTL_FILE"
 SYSCTL_KEYS=(net.ipv4.tcp_rmem)
 SYSCTL_TARGETS[net.ipv4.tcp_rmem]='4096 131072 33554432'
 write_sysctl_file
