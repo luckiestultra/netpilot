@@ -334,8 +334,12 @@ restore_ulimit() {
 }
 
 
+gai_preference_active() {
+  [[ -f "$GAI_FILE" ]] && grep -Eq '^[[:space:]]*precedence[[:space:]]+::ffff:0:0/96[[:space:]]+100([[:space:]]|$)' "$GAI_FILE"
+}
+
 apply_gai_preference() {
-  if [[ -f "$GAI_FILE" ]] && grep -Eq '^[[:space:]]*precedence[[:space:]]+::ffff:0:0/96[[:space:]]+100([[:space:]]|$)' "$GAI_FILE"; then
+  if gai_preference_active; then
     log 'IPv4 preference already exists; no duplicate rule added.'
     return 0
   fi
@@ -351,16 +355,23 @@ mss_rule_args() {
 
 
 remove_mss_rule() {
-  local rule_args=()
+  local rule_args=() status=0
   [[ -e "$STATE_DIR/iptables4-added" ]] || return 0
   command -v iptables >/dev/null 2>&1 || { warn 'iptables unavailable; cannot verify MSS rollback.'; return 1; }
   mapfile -t rule_args < <(mss_rule_args)
-  if iptables -t mangle -C POSTROUTING "${rule_args[@]}" >/dev/null 2>&1; then
-    iptables -t mangle -D POSTROUTING "${rule_args[@]}" >/dev/null 2>&1 || return 1
-  fi
-  if iptables -t mangle -C POSTROUTING "${rule_args[@]}" >/dev/null 2>&1; then
-    warn 'MSS rule is still present.'; return 1
-  fi
+  iptables -t mangle -C POSTROUTING "${rule_args[@]}" >/dev/null 2>&1 || status=$?
+  case "$status" in
+    0) iptables -t mangle -D POSTROUTING "${rule_args[@]}" >/dev/null 2>&1 || return 1 ;;
+    1) return 0 ;;
+    *) warn 'Cannot inspect MSS rule; keeping rollback state.'; return 1 ;;
+  esac
+  status=0
+  iptables -t mangle -C POSTROUTING "${rule_args[@]}" >/dev/null 2>&1 || status=$?
+  case "$status" in
+    1) return 0 ;;
+    0) warn 'MSS rule is still present.'; return 1 ;;
+    *) warn 'Cannot verify MSS removal; keeping rollback state.'; return 1 ;;
+  esac
 }
 
 ensure_ethtool() {
@@ -584,6 +595,10 @@ apply_tuning() {
 }
 
 apply_ipv4_preference_only() {
+  if gai_preference_active; then
+    log 'IPv4 preference already exists; no changes or rollback claim created.'
+    return 0
+  fi
   SYSCTL_KEYS=(); SYSCTL_TARGETS=()
   NIC_IFACE="$(default_interface || true)"
   prepare_state gai-file || return 1

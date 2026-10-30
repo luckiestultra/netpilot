@@ -3,7 +3,7 @@ set -Eeuo pipefail
 SCRIPT="${SCRIPT_OVERRIDE:-$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)/vps-tcp-full-tune.sh}"
 TMP="$(mktemp -d)"
 trap 'rm -rf -- "$TMP"' EXIT
-for name in backup_file backup_file_once restore_file write_lines write_bbr_file write_bbr_module_file owned_config_target save_original_values managed_file_path prepare_state rollback_internal remove_state_files; do
+for name in backup_file backup_file_once restore_file write_lines write_bbr_file write_bbr_module_file owned_config_target save_original_values managed_file_path prepare_state rollback_internal remove_state_files gai_preference_active apply_gai_preference apply_ipv4_preference_only; do
   sed -n "/^${name}() {/,/^}/p" "$SCRIPT" >> "$TMP/functions.sh"
 done
 source "$TMP/functions.sh"
@@ -67,8 +67,17 @@ test_bbr_module_symlink_is_preserved() (
   [[ "$(cat "$TMP/module/victim")" == 'administrator module' ]] || fail 'module symlink target was modified'
 )
 
+test_existing_ipv4_preference_does_not_claim_file() (
+  setup already-ipv4
+  printf 'precedence ::ffff:0:0/96 100\n' > "$GAI_FILE"
+  default_interface() { printf eth0; }
+  log() { :; }
+  apply_ipv4_preference_only
+  [[ ! -e "$STATE_DIR" ]] || fail 'already-configured no-op created a rollback claim'
+)
+
 failures=0
-for test in test_sysctl_only_never_restores_untouched_files test_no_file_operation_never_takes_config_ownership test_legacy_metadata_still_restores test_unowned_bbr_file_is_preserved test_bbr_module_symlink_is_preserved; do
+for test in test_existing_ipv4_preference_does_not_claim_file test_sysctl_only_never_restores_untouched_files test_no_file_operation_never_takes_config_ownership test_legacy_metadata_still_restores test_unowned_bbr_file_is_preserved test_bbr_module_symlink_is_preserved; do
   if "$test"; then printf 'PASS: %s\n' "$test"; else failures=$((failures + 1)); fi
 done
 [[ "$failures" == 0 ]]

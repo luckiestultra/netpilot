@@ -122,8 +122,24 @@ test_cpu_mask_uses_allowed_ids() (
   if rps_mask_for_cpus '64-65' 2 >/dev/null; then fail 'unsupported high CPU IDs must not wrap'; fi
 )
 
+test_mss_check_failure_is_not_absence() (
+  STATE_DIR="$TEST_DIR/mss-check"; mkdir -p "$STATE_DIR"
+  : > "$STATE_DIR/iptables4-added"
+  MSS_COMMENT=vps-tcp-full-tune
+  iptables() { return 2; }
+  if remove_mss_rule; then fail 'iptables inspection error was mistaken for an absent rule'; fi
+)
+
+test_mss_absent_rule_is_success() (
+  STATE_DIR="$TEST_DIR/mss-absent"; mkdir -p "$STATE_DIR"
+  : > "$STATE_DIR/iptables4-added"
+  MSS_COMMENT=vps-tcp-full-tune
+  iptables() { return 1; }
+  remove_mss_rule || fail 'an already absent MSS rule should be idempotent'
+)
+
 failures=0
-for test in test_restore_reports_failure test_rollback_retains_failed_backup test_failed_apply_never_succeeds test_ring_original_saved_once test_single_cpu_skips_rps test_restore_verifies_readback test_missing_metadata_preserves_file test_dangling_backup_preserved test_saved_values_not_overwritten test_failed_snapshot_keeps_original test_cpu_mask_uses_allowed_ids; do
+for test in test_mss_check_failure_is_not_absence test_mss_absent_rule_is_success test_restore_reports_failure test_rollback_retains_failed_backup test_failed_apply_never_succeeds test_ring_original_saved_once test_single_cpu_skips_rps test_restore_verifies_readback test_missing_metadata_preserves_file test_dangling_backup_preserved test_saved_values_not_overwritten test_failed_snapshot_keeps_original test_cpu_mask_uses_allowed_ids; do
   if "$test"; then printf 'PASS: %s\n' "$test"; else failures=$((failures + 1)); fi
 done
 [[ "$failures" == 0 ]]

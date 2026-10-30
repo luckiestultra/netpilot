@@ -7,6 +7,7 @@ source <(awk '/^log\(\)/ {p=1} /^# CLI entry point/ {exit} p {print}' "$SCRIPT")
 declare -a SYSCTL_KEYS=()
 declare -A SYSCTL_TARGETS=()
 SYSCTL_FILE="$TMP/managed.conf"
+GAI_FILE="$TMP/gai.conf"
 warn() { printf '%s\n' "$*" >&2; }
 log() { :; }
 printf '# Managed by vps-tcp-full-tune.sh.\nnet.ipv4.tcp_congestion_control = bbr\n' > "$SYSCTL_FILE"
