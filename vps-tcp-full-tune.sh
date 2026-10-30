@@ -166,11 +166,17 @@ show_status() {
 }
 
 backup_file() {
-  local path="$1" name="$2"
+  local path="$1" name="$2" tmp
+  tmp="$(mktemp "$BACKUP_DIR/.${name}.tmp.XXXXXX")" || return 1
   if [[ -e "$path" || -L "$path" ]]; then
-    cp -a -- "$path" "$BACKUP_DIR/$name"
-  else
-    : > "$BACKUP_DIR/$name.missing"
+    # Publish only a complete copy; retries must never accept a partial backup.
+    if ! rm -f -- "$tmp" || ! cp -a -- "$path" "$tmp" || ! mv -fT -- "$tmp" "$BACKUP_DIR/$name"; then
+      rm -f -- "$tmp"
+      return 1
+    fi
+  elif ! mv -fT -- "$tmp" "$BACKUP_DIR/$name.missing"; then
+    rm -f -- "$tmp"
+    return 1
   fi
 }
 
