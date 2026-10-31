@@ -2327,7 +2327,15 @@ try:
             else:
                 ladder = (65536, 262144, 1048576, MAX_REQUEST_BYTES)
                 step = 0
+                directions_left = 2 if direction == 'download' else 1
+                window_end = time.monotonic() + max(0, deadline_at - time.monotonic()) / directions_left
+                last_bytes, last_seconds = 0, 0.0
                 while sum(item['request_sizes']) < slots[direction]:
+                    time_left = window_end - time.monotonic()
+                    # Fixed response latency cannot be reduced by requesting
+                    # fewer bytes. Leave room for another whole observed batch.
+                    if last_seconds and time_left <= last_seconds * 1.25:
+                        break
                     available = slots[direction] - sum(item['request_sizes'])
                     sizes = []
                     # A single small pilot protects slow paths from an oversized
@@ -2338,7 +2346,17 @@ try:
                         size = min(target, available)
                         sizes.append(size)
                         available -= size
+                    if last_seconds and sum(sizes) * last_seconds / last_bytes > time_left:
+                        available = min(sum(sizes), last_bytes)
+                        sizes = []
+                        while available and len(sizes) < width:
+                            size = min(target, available)
+                            sizes.append(size)
+                            available -= size
+                    batch_started = time.perf_counter()
                     run_batch(direction, sizes)
+                    last_bytes = sum(sizes)
+                    last_seconds = time.perf_counter() - batch_started
                     step += 1
                     if time.perf_counter() - begin >= 3:
                         break
@@ -2533,6 +2551,26 @@ def print_budget(data):
     if data['status'] == 'completed':
         payload = sum(data[p][d]['payload_bytes'] for p in ('before', 'after') for d in ('download', 'upload'))
         print(text('已完成测试数据：%.2f MiB（协议开销另计）。', 'Completed test payload: %.2f MiB (protocol overhead is additional).') % (payload / 1048576))
+    else:
+        values, valid = [], True
+        for phase in ('before', 'after'):
+            measurement = data.get(phase)
+            if measurement is None:
+                continue
+            if not isinstance(measurement, dict):
+                valid = False
+                continue
+            for direction in ('download', 'upload'):
+                stream = measurement.get(direction)
+                value = stream.get('payload_bytes') if isinstance(stream, dict) else None
+                if type(value) is not int or not 0 <= value <= data['budget_bytes'] // 4:
+                    valid = False
+                else:
+                    values.append(value)
+        if valid and values:
+            print(text('已记录测试数据：%.2f MiB（运行未完成；记录可能不完整，协议开销另计）。', 'Recorded test payload: %.2f MiB (run unfinished; records may be incomplete; protocol overhead is additional).') % (sum(values) / 1048576))
+        else:
+            print(text('已记录测试数据：不可用（运行未完成，详见完整报告）。', 'Recorded test payload: unavailable (run unfinished; see the full report).'))
 SUMMARY_CHOICES = {
     'stage': ('before', 'apply', 'verify', 'after', 'completed'),
     'profile': ('balanced', 'proxy', 'bulk'),

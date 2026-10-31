@@ -37,8 +37,17 @@ from urllib.parse import parse_qs, urlsplit
 root = pathlib.Path(os.environ['NETPILOT_HTTP_TEST_TMP'])
 fragment = os.environ['NETPILOT_HTTP_TEST_FRAGMENT']
 state = {'mode': 'ok', 'requests': [], 'node': 'LAB', 'accepted': 0, 'generation': 0,
-         'active': 0, 'max_active': 0, 'spans': [], 'barrier': None, 'upload_read': 0}
+         'active': 0, 'max_active': 0, 'spans': [], 'barrier': None, 'upload_read': 0,
+         'bandwidth_next': 0.0}
 lock = threading.Lock()
+
+def shared_bandwidth(size):
+    # One aggregate bottleneck for every connection, not one allowance per
+    # worker. Small chunks keep each active connection responsive to its timer.
+    with lock:
+        state['bandwidth_next'] = max(time.monotonic(), state['bandwidth_next']) + size / 25000
+        ready = state['bandwidth_next']
+    time.sleep(max(0, ready - time.monotonic()))
 
 class Server(http.server.ThreadingHTTPServer):
     daemon_threads = True
@@ -112,9 +121,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 return
             remaining = max(0, size - 1) if mode == 'short-body' else length
             while remaining:
-                chunk = b'x' * min(16384 if mode == 'slow-pilot' else 65536, remaining)
+                chunk_size = 4096 if mode == 'shared-bandwidth' else 16384 if mode == 'slow-pilot' else 65536
+                chunk = b'x' * min(chunk_size, remaining)
                 if mode == 'slow-pilot':
                     time.sleep(.8)
+                elif mode == 'shared-bandwidth':
+                    shared_bandwidth(len(chunk))
                 self.wfile.write(chunk)
                 remaining -= len(chunk)
             self.wfile.flush()
@@ -132,7 +144,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
         received = 0
         try:
             while remaining:
-                chunk = self.rfile.read(min(16384 if state['mode'] in ('slow-upload', 'slow-pilot') else 65536, remaining))
+                mode = state['mode']
+                chunk_size = 4096 if mode == 'shared-bandwidth' else 16384 if mode in ('slow-upload', 'slow-pilot') else 65536
+                chunk = self.rfile.read(min(chunk_size, remaining))
                 if not chunk:
                     break
                 assert not chunk.strip(b'\0'), 'upload must contain synthetic zero bytes only'
@@ -144,6 +158,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     time.sleep(.02)
                 elif state['mode'] == 'slow-pilot':
                     time.sleep(.8)
+                elif mode == 'shared-bandwidth':
+                    shared_bandwidth(len(chunk))
             with lock:
                 state['accepted'] += received
             self.headers_for(0, received)
@@ -170,6 +186,7 @@ def run(name, phase='before', previous='', limit=10, endpoint_override=None, ext
 def reset(mode='ok'):
     state.update(mode=mode, requests=[], accepted=0, node='LAB', generation=state['generation'] + 1,
                  active=0, max_active=0, spans=[], upload_read=0,
+                 bandwidth_next=0.0,
                  barrier=threading.Barrier(4) if mode == 'parallel-delay' else None)
 
 def valid_report(report, phase, expected_endpoint=endpoint, expected_address='127.0.0.1'):
@@ -308,7 +325,7 @@ try:
 
     reset('auto-delay')
     budget = 8 * 1024**3
-    result, automatic, automatic_path = run('automatic-before', limit=15)
+    result, automatic, automatic_path = run('automatic-before', limit=30)
     assert result.returncode == 0, result.stderr.decode()
     valid_report(automatic, 'before')
     automatic_requests = collections.Counter((method, size) for method, size, _ in state['requests'])
@@ -321,7 +338,7 @@ try:
     assert automatic['reserved_bytes'] < budget // 8
     assert 2 <= state['max_active'] <= 4
     reset('auto-delay')
-    result, automatic_after, _ = run('automatic-after', 'after', automatic_path, limit=15)
+    result, automatic_after, _ = run('automatic-after', 'after', automatic_path, limit=30)
     assert result.returncode == 0, result.stderr.decode()
     valid_report(automatic_after, 'after')
     for direction in ('download', 'upload'):
@@ -331,6 +348,41 @@ try:
     assert 128 * 1048576 < automatic['reserved_bytes'] + automatic_after['reserved_bytes'] < 16 * 1024**3
     budget = small_budget
     print('PASS: automatic sampling continues online past former limits, stops by duration and replays without restarting or consuming its full cap')
+
+    reset('shared-bandwidth')
+    budget = 8 * 1024**3
+    result, shared, shared_path = run('shared-bandwidth-before', limit=30)
+    assert result.returncode == 0, (result.stderr.decode(), shared, state['requests'])
+    valid_report(shared, 'before')
+    shared_requests = collections.Counter((method, size) for method, size, _ in state['requests'])
+    for direction, method in (('download', 'do_GET'), ('upload', 'do_POST')):
+        item = shared[direction]
+        # A 64 KiB pilot takes about 2.62 seconds on this actual shared link.
+        # It must still expand, while the old next batch (1 MiB) would need
+        # another 41.94 seconds and exceed the default phase deadline.
+        pilot = next(end - begin for name, size, begin, end in state['spans']
+                     if name == method and size == 65536)
+        assert 2.5 <= pilot < 3, (direction, pilot)
+        assert item['request_batches'][0] == [65536] and len(item['request_batches']) >= 2, item
+        assert item['duration_seconds'] >= 3 and item['quality'] == 'sampled', item
+    assert shared['reserved_bytes'] < 1048576, shared
+    assert state['accepted'] == shared['upload']['payload_bytes']
+    assert 1 <= state['max_active'] <= 4
+    reset('shared-bandwidth')
+    result, shared_after, _ = run('shared-bandwidth-after', 'after', shared_path, limit=30)
+    assert result.returncode == 0, (result.stderr.decode(), shared_after, state['requests'])
+    valid_report(shared_after, 'after')
+    for direction in ('download', 'upload'):
+        assert shared_after[direction]['request_sizes'] == shared[direction]['request_sizes']
+        assert shared_after[direction]['request_batches'] == shared[direction]['request_batches']
+        assert shared_after[direction]['duration_seconds'] >= 3
+        assert shared_after[direction]['quality'] == 'sampled'
+    assert collections.Counter((method, size) for method, size, _ in state['requests']) == shared_requests
+    assert shared_after['reserved_bytes'] == shared['reserved_bytes']
+    assert state['accepted'] == shared_after['upload']['payload_bytes']
+    assert 1 <= state['max_active'] <= 4
+    budget = small_budget
+    print('PASS: a real shared 200 kbit/s bottleneck expands its sub-3s pilot safely within the default timeout and replays identical batches')
 
     # Validate a maximum-budget baseline without transferring a GiB: the local
     # server denies the first accepted request, after baseline validation.

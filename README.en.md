@@ -34,7 +34,7 @@ Choose main-menu `10`, or run:
 netpilot --lang en report
 ```
 
-The summary shows configuration state, measurements, budget mode, completed test payload and the report's update time. It reads `/tmp/netpilot-reports` by default; system cleanup or a reboot may remove these temporary reports. If the latest attempt has no report yet, this may be an older record. For a custom directory, use `netpilot --lang en report --report-dir DIR`.
+The summary shows configuration state, measurements, budget mode, test payload and the report's update time. Unfinished runs show recorded payload, which may omit in-flight requests; missing or invalid metrics are marked unavailable. It reads `/tmp/netpilot-reports` by default; system cleanup or a reboot may remove these temporary reports. If the latest attempt has no report yet, this may be an older record. For a custom directory, use `netpilot --lang en report --report-dir DIR`.
 
 | Status | Meaning |
 |---|---|
@@ -124,9 +124,9 @@ Chinese is the default; menu `L` switches the current session. Use `netpilot --l
 
 Tests start with a **64KiB** request, then increase in batches up to **4 connections and 4MiB per request**. These are client policies, not claimed service limits. Each phase gets half the budget, split between download and upload. Each batch is reserved before sending, with no refund on failure. HTTP rejection stops new batches without automatic retry.
 
-Default automatic sampling progressively increases data within the same run. Each baseline direction stops after reaching 3 seconds or its directional cap, without restarting the test. The whole-run cap covers both directions before and after tuning; actual use depends on the measured path. An explicit numeric budget always remains a fixed cap.
+Default automatic sampling progressively increases data within the same run. Each baseline direction stops after reaching 3 seconds or its byte or time allowance, without restarting the test. Baseline downloads reserve time for uploads; a batch predicted to overrun its window is reduced, or sampling ends with a short sample. The whole-run cap covers both directions before and after tuning; actual use depends on the measured path. An explicit numeric budget always remains a fixed cap.
 
-Rates are total bytes divided by elapsed wall time, representing observed multi-connection HTTP throughput. Buffer estimates use measurements only when both baseline directions reach 3 seconds. If samples remain short at the cap, basic tuning proceeds while retaining buffers. Sufficient duration does not prove link saturation. Latency is the average of three TCP connection times.
+Rates are total bytes divided by elapsed wall time, representing observed multi-connection HTTP throughput. Buffer estimates use measurements only when both baseline directions reach 3 seconds. If byte or time limits leave samples short, basic tuning proceeds while retaining buffers. Sufficient duration does not prove link saturation. Latency is the average of three TCP connection times.
 
 Retests reuse the baseline IP, node, parallelism, batch plan and timeout without extra payload. A faster retest lasting less than 3 seconds is still marked short. Reports are saved automatically as `before.json`, `after.json` when available, and `summary.json`. Older serial reports remain readable but cannot be compared with parallel reports.
 

@@ -143,6 +143,99 @@ NETPILOT_LANG=en bash "$SCRIPT" report --report-dir "$TMP/complete" > "$TMP/out"
 grep -q 'Flow: Completed' "$TMP/out" || fail 'English readable result is missing'
 printf '%s\n' 'PASS: completed summary separates flow, configuration, measurements and sample limits in both languages'
 
+# Unfinished runs must distinguish recorded bytes from a complete transfer total.
+python3 - "$SCRIPT" "$TMP" "$complete/summary.json" <<'PY'
+from pathlib import Path
+import copy, json, os, re, subprocess, sys
+
+script, temporary, completed = sys.argv[1:]
+original = Path(completed).read_bytes()
+baseline = json.loads(original)
+
+def unfinished(name, status, variant, lang):
+    folder = Path(temporary) / ('payload-' + name + '-' + lang) / 'run.fixture'
+    folder.mkdir(parents=True)
+    before = copy.deepcopy(baseline['before'])
+    after = None
+    if status == 'failed':
+        before.update(ok=False, error='synthetic transfer interruption')
+    else:
+        after = copy.deepcopy(baseline['after'])
+        after.update(ok=False, error='synthetic transfer interruption', reserved_bytes=524288)
+        for direction in ('download', 'upload'):
+            after[direction].update(request_sizes=[262144], payload_bytes=131072)
+    stream = before['upload']
+    if variant == 'missing': stream.pop('payload_bytes')
+    elif variant == 'missing-direction': before.pop('upload')
+    elif variant == 'bool': stream['payload_bytes'] = True
+    elif variant == 'negative': stream['payload_bytes'] = -1
+    elif variant == 'float': stream['payload_bytes'] = 1.0
+    elif variant == 'string': stream['payload_bytes'] = '1024'
+    elif variant == 'over-cap': stream['payload_bytes'] = baseline['budget_bytes'] + 1
+    elif variant == 'invalid-direction': before['upload'] = []
+    elif variant == 'no-measurements': before = after = None
+    elif variant == 'zero':
+        for direction in ('download', 'upload'): before[direction]['payload_bytes'] = 0
+    for phase, value in [('before', before), ('after', after)]:
+        if value is not None:
+            (folder / (phase + '.json')).write_text(json.dumps(value))
+    stage, code = ('before', 1) if status == 'failed' else ('after', 130 if status == 'cancelled' else 1)
+    changed = '0' if status == 'failed' else '1'
+    verified = 'not-needed' if status == 'failed' else 'verified'
+    command = ['bash', '-c', 'source "$1"; auto_report summary "${@:2}"', '_', script,
+               str(folder), status, stage, str(code), str(baseline['budget_bytes']), 'balanced',
+               changed, changed, changed, verified, 'not-needed', 'synthetic interruption']
+    writer = subprocess.run(command, env={**os.environ, 'NETPILOT_LANG': lang},
+                            capture_output=True, text=True, timeout=5)
+    assert writer.returncode == 0, (name, lang, 'writer failed', writer.stdout, writer.stderr)
+    cli = ['bash', script, '--lang', lang, 'report', '--report-dir', str(folder.parent)]
+    reader = subprocess.run(cli, capture_output=True, text=True, timeout=5)
+    assert reader.returncode == 0, (name, lang, 'reader failed', reader.stdout, reader.stderr)
+    label, complete_label = ('已记录测试数据：', '已完成测试数据：') if lang == 'zh' else ('Recorded test payload:', 'Completed test payload:')
+    for output in (writer.stdout, reader.stdout):
+        assert 'Traceback' not in output and complete_label not in output, (name, lang, output)
+        lines = [line for line in output.splitlines() if line.startswith(label)]
+        assert len(lines) == 1, (name, lang, 'recorded payload label missing', output)
+        line = lines[0]
+        if variant in ('valid', 'zero'):
+            expected = '0.00 MiB' if variant == 'zero' else ('64.00 MiB' if status == 'failed' else '64.25 MiB')
+            assert expected in line, (name, lang, 'recorded sum is wrong', line)
+            warnings = ('运行未完成', '记录可能不完整', '协议开销另计') if lang == 'zh' else ('unfinished', 'incomplete', 'overhead')
+            assert all(word in line.lower() for word in warnings), (name, lang, 'missing limits', line)
+        else:
+            assert ('不可用' in line if lang == 'zh' else 'unavailable' in line.lower()), (name, lang, line)
+            assert re.search(r'\d+(?:\.\d+)?\s*MiB', line) is None, (name, lang, 'invented a transfer total', line)
+    raw = subprocess.run(cli + ['--json'], capture_output=True, text=True, timeout=5)
+    assert raw.returncode == 0 and json.loads(raw.stdout) == json.loads((folder / 'summary.json').read_text())
+
+for status in ('failed', 'partial', 'cancelled'):
+    for lang in ('zh', 'en'):
+        unfinished(status, status, 'valid', lang)
+for lang in ('zh', 'en'):
+    unfinished('recorded-zero', 'failed', 'zero', lang)
+for variant in ('missing', 'missing-direction', 'bool', 'negative', 'float', 'string',
+                'over-cap', 'invalid-direction', 'no-measurements'):
+    for lang in ('zh', 'en'):
+        unfinished(variant, 'failed', variant, lang)
+
+# Historical completed reports keep their existing label and original JSON.
+legacy = Path(temporary) / 'payload-legacy' / 'run.fixture'
+legacy.mkdir(parents=True)
+data = copy.deepcopy(baseline)
+for value in (data, data['before'], data['after']): value.pop('budget_mode', None)
+path = legacy / 'summary.json'
+path.write_text(json.dumps(data))
+saved = path.read_bytes()
+for lang, label in [('zh', '已完成测试数据：'), ('en', 'Completed test payload:')]:
+    cli = ['bash', script, '--lang', lang, 'report', '--report-dir', str(legacy.parent)]
+    output = subprocess.check_output(cli, text=True, timeout=5)
+    assert label + ('128.00 MiB' if lang == 'zh' else ' 128.00 MiB') in output
+    assert '已记录测试数据：' not in output and 'Recorded test payload:' not in output
+    assert json.loads(subprocess.check_output(cli + ['--json'], text=True, timeout=5)) == data
+assert path.read_bytes() == saved and Path(completed).read_bytes() == original
+print('PASS: unfinished payload totals and unavailable metrics stay honest in both languages; legacy completed JSON is unchanged')
+PY
+
 for state in partial cancelled failed; do
   state_code=1
   case "$state" in
