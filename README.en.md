@@ -38,7 +38,7 @@ Choose main-menu `10`, or run:
 netpilot --lang en report
 ```
 
-The summary first shows the retained or selected algorithm and reason, whether this run changed settings, the final retained or restored state, and payload charged to the budget. Missing or invalid metrics are marked unavailable. It reads `/tmp/netpilot-reports` by default; system cleanup or a reboot may remove these temporary reports. If the latest attempt has no report yet, this may be an older record; check its update time. For a custom directory, use `netpilot --lang en report --report-dir DIR`.
+The summary first shows the retained or selected algorithm and reason, whether this run changed settings, the final retained or restored state, and payload charged to the budget. If the selected report is corrupt or incomplete, viewing it fails with an error. It reads `/tmp/netpilot-reports` by default; system cleanup or a reboot may remove these temporary reports. If the latest attempt has no report yet, this may be an older record; check its update time. For a custom directory, use `netpilot --lang en report --report-dir DIR`.
 
 | Status | Meaning |
 |---|---|
@@ -58,7 +58,7 @@ Verification checks parameter consistency; measurements describe the server-to-t
 | Remove the tool and default reports | `7` → `1`, default | `netpilot --lang en uninstall` |
 | Roll back, then uninstall | `7` → `2` | `netpilot --lang en uninstall --rollback` |
 
-Rollback restores the **first saved values**. Default uninstall removes the tool and automatic reports in its default locations, keeping tuning settings and recovery backups. Custom report directories remain user-managed. Rollback-and-uninstall requires successful restoration; missing records or restore failures stop removal. Both uninstall modes require `y/N` confirmation.
+Rollback restores the **first saved values**. Default uninstall removes the tool and automatic reports in its default locations, keeping tuning settings and recovery backups. If restoration is incomplete, the corresponding recovery directory is kept and reported. Custom report directories remain user-managed. Rollback-and-uninstall requires successful restoration; missing records or restore failures stop removal. Both uninstall modes require `y/N` confirmation.
 
 ## Use with AI
 
@@ -126,7 +126,7 @@ Chinese is the default; menu `L` switches the current session. Use `netpilot --l
 | `--endpoint` | `https://speed.cloudflare.com` | HTTPS origin with compatible download/upload APIs; HTTP is limited to loopback addresses. |
 | `--report-dir` | `/tmp/netpilot-reports` | Must not allow other users to write; cannot be inside `/var/lib/netpilot/`. |
 
-Tests start with **64KiB**, then increase in batches up to **4 connections and 4MiB per request**. These are client policies. One ledger covers the baseline, algorithm comparisons, post-test and one regression confirmation. Each batch is charged before sending; failures, partial transfers and cancellation receive no refund. HTTP rejection stops new batches without switching sources and restarting. Comparisons leave two baseline-sized allowances for the normal post-test and a possible confirmation; settings cannot be applied after spending that allowance.
+Tests start with **64KiB**, then increase in batches up to **4 connections and 4MiB per request**. These are client policies. One ledger covers the baseline, algorithm comparisons, post-test and one regression confirmation. Each batch is charged before sending; failures, partial transfers and cancellation receive no refund. HTTP rejection stops the run without sending new batches or switching sources to restart; rejection before application leaves settings unchanged. Comparisons leave two baseline-sized allowances for the normal post-test and a possible confirmation; settings cannot be applied after spending that allowance.
 
 Algorithm comparisons fix the endpoint, IP, verifiable node, connection count, request batches and timeout, alternating algorithm order. Only uploads sent by the VPS count. Selection needs 3 valid pairs: candidate throughput is at least 110% of the original in every pair, both elapsed and actual TCP sender busy time reach 3 seconds for each sample, and the median paired upload TCP SRTT increase is no more than `max(1ms, 20% of the original median)`. Each test socket's algorithm is set and read back; comparisons leave the global default and persistent files unchanged. Missing data, unsupported options, short samples or insufficient budget retain the starting algorithm. These are conservative product rules, not proof of statistical significance.
 

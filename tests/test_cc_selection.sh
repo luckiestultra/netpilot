@@ -111,7 +111,7 @@ for case,reason in [('equal','no_consistent_gain'),('mixed','no_consistent_gain'
                     ('wrong-cc','conditions_mismatch'),('wrong-schedule','conditions_mismatch'),('wrong-peer','conditions_mismatch'),
                     ('forbidden','endpoint_rejected'),('missing-report','trial_failed'),('unsupported-cc','congestion_unavailable')]:
     p,r,calls,_=run(case)
-    assert p.returncode==0 and r['selected']=='cubic' and r['status']=='preserved',(case,p.stderr,r)
+    assert p.returncode==(1 if case=='forbidden' else 0) and r['selected']=='cubic' and r['status']=='preserved',(case,p.stderr,r)
     assert r['reason_code']==reason,(case,r)
     assert calls and r['reserved_bytes']>=len(calls)*1048576,(case,r,calls)
 print('PASS: mixed, slow-ACK-only, short, missing TCP evidence, refused, missing and mismatched trials preserve the original algorithm')

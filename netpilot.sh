@@ -3043,7 +3043,9 @@ try:
     exit_code = 0
 except Preserved as exc:
     report['reason_code'] = exc.reason
-    exit_code = 0
+    # A source refusal ends the whole run; preserving the algorithm must not
+    # turn it into permission to apply settings and contact the source again.
+    exit_code = 1 if exc.reason == 'endpoint_rejected' else 0
 except Cancelled as exc:
     report['reason_code'] = 'cancelled'
     exit_code = exc.code
@@ -3341,6 +3343,12 @@ def show_selection(data):
     reason = text(*SELECTION_REASONS[data['reason_code']])
     verb = text('选择', 'Selected') if data['status'] == 'selected' else text('保留', 'Kept')
     print(text('算法：', 'Algorithm: ') + verb + ' ' + data['selected'] + text('；', '; ') + reason + text('。', '.'))
+    if data['reason_code'] == 'endpoint_rejected':
+        for trial in reversed(data['trials']):
+            detail = trial.get('http_error')
+            if isinstance(detail, dict) and type(detail.get('status')) is int and 100 <= detail['status'] <= 599:
+                print(text('测速错误：HTTP %d；本轮已停止。', 'Measurement error: HTTP %d; this run was stopped.') % detail['status'])
+                break
 
 def reservations(root, total):
     root = Path(root)
@@ -3555,17 +3563,17 @@ try:
         def recognized(data, kind):
             return (isinstance(data, dict) and data.get('type') == kind and
                     type(data.get('version')) is int and data['version'] == 1)
-        def owned_json(directory_fd, name):
+        def owned_json(directory_fd, name, maximum=1048576):
             try:
                 fd = os.open(name, flags | os.O_NONBLOCK, dir_fd=directory_fd)
             except FileNotFoundError:
                 return None
             with os.fdopen(fd, encoding='utf-8') as stream:
                 info = os.fstat(stream.fileno())
-                if not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid() or info.st_size > 1048576:
+                if not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid() or info.st_size > maximum:
                     raise ValueError('unsafe report identity file: ' + repr(name))
                 try:
-                    data = json.loads(stream.read(1048577))
+                    data = json.loads(stream.read(maximum + 1))
                 except (ValueError, RecursionError):
                     return None
                 return data if isinstance(data, dict) else None
@@ -3602,6 +3610,27 @@ try:
                             continue
                         if any(not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid() for _, info in files):
                             raise ValueError('unsafe file in report directory: ' + repr(name))
+                        # A failed run's snapshot is recovery data, not a disposable report.
+                        if any(filename == 'run-snapshot.json' for filename, _ in files):
+                            try: snapshot = owned_json(run_fd, 'run-snapshot.json', 16 * 1048576)
+                            except (OSError, ValueError): snapshot = None
+                            groups = [snapshot.get(key) for key in ('files', 'sysctls')] if isinstance(snapshot, dict) else []
+                            untouched = (recognized(snapshot, 'netpilot-run-snapshot') and len(groups) == 2 and
+                                         all(isinstance(group, dict) for group in groups) and len(groups[0]) == 4 and
+                                         all(isinstance(entry, dict) and entry.get('touched') is False
+                                             for group in groups for entry in group.values()))
+                            completed = False
+                            if not untouched:
+                                try:
+                                    summary = owned_json(run_fd, 'summary.json')
+                                    validate_summary(summary)
+                                    completed = summary['status'] == 'completed'
+                                except (OSError, ValueError, TypeError, KeyError, RecursionError):
+                                    pass
+                            if not untouched and not completed:
+                                print(text('本轮恢复尚未确认，报告与恢复快照已保留：',
+                                           'Run recovery is not confirmed; reports and recovery snapshot were kept: ') + repr(str(root / name)), file=sys.stderr)
+                                continue
                         # Remove the ownership marker last, so interrupted cleanup
                         # can still recognize and retry an otherwise empty run.
                         identity = '.netpilot-report' if marker else 'summary.json'
