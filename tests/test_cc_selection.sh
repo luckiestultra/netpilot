@@ -10,7 +10,7 @@ source "$TMP/functions.sh"
 declare -F http_select_congestion >/dev/null || { printf 'FAIL: congestion selector is missing\n' >&2; exit 1; }
 export NETPILOT_CC_FRAGMENT="$TMP/functions.sh" NETPILOT_CC_TEST_TMP="$TMP"
 python3 - <<'PY'
-import copy,json,os,pathlib,stat,subprocess
+import copy,json,math,os,pathlib,stat,subprocess
 root=pathlib.Path(os.environ['NETPILOT_CC_TEST_TMP'])
 fragment=os.environ['NETPILOT_CC_FRAGMENT']
 # Exercise the actual Linux tcp_info decoder at its binary capability boundary.
@@ -45,25 +45,38 @@ stub=r'''
 http_measure_path() {
   python3 - "$@" <<'STUB'
 import json,os,pathlib,sys
-phase,endpoint,budget,timeout,output,baseline,cc,mode=sys.argv[1:]
+phase,endpoint,budget,timeout,output,baseline,cc,mode=sys.argv[1:9]
+target=int(sys.argv[9]) if len(sys.argv)>9 else None
 b=json.loads(pathlib.Path(baseline).read_text()); case=os.environ['CC_CASE']
 log=pathlib.Path(os.environ['CC_LOG']); count=len(log.read_text().splitlines()) if log.exists() else 0
 with log.open('a') as f:f.write(cc+' '+mode+'\n')
 assert phase=='after' and mode=='upload' and cc in ('cubic','bbr')
-assert endpoint==b['endpoint'] and int(budget)==b['budget_bytes'] and int(timeout)==10
+assert endpoint==b['endpoint'] and int(budget)==b['budget_bytes'] and int(timeout)==b['timeout_seconds']
 if case=='missing-report':sys.exit(1)
 if case=='unsupported-cc':
  pathlib.Path(output).write_text(json.dumps(dict(ok=False,error_code='congestion_unavailable')));sys.exit(1)
 if case=='fatal':sys.exit(139)
 if case=='cancel':sys.exit(130)
-sizes=b['upload']['request_sizes']*2; batches=b['upload']['request_batches']*2
+target=target if target is not None else 2*b['upload']['payload_bytes']
+batches=[]; left=target
+while left:
+ for batch in b['upload']['request_batches']:
+  sizes=[]
+  for size in batch:
+   if not left:break
+   size=min(size,left);sizes.append(size);left-=size
+  if sizes:batches.append(sizes)
+  if not left:break
+sizes=[size for batch in batches for size in batch]
 ratio=1.2 if cc!=os.environ['CC_ORIGINAL'] else 1.
 if case=='threshold':ratio=1.1 if cc!=os.environ['CC_ORIGINAL'] else 1.
-if case=='equal':ratio=1.
+if case in ('equal','replanned'):ratio=1.
 if case=='mixed' and count==2:ratio=1.
 duration=4.8/ratio
+if case=='replanned':duration=b['upload']['duration_seconds']*sum(sizes)/b['upload']['payload_bytes']
 if case=='short':duration=.1
 busy=20. if case=='impossible-busy' else 1. if case=='overlap' else 3.2 if case!='idle' else .001
+if case=='replanned':busy=b['upload']['tcp_info']['busy_time_seconds']*sum(sizes)/b['upload']['payload_bytes']
 srtt=1. if cc==os.environ['CC_ORIGINAL'] else (3. if case=='rtt' else 1.1)
 r=dict(b,phase='after',congestion_algorithm=cc,requested_congestion_algorithm=cc,
        reserved_bytes=sum(sizes),duration_seconds=duration,process_cpu_seconds=.05)
@@ -86,8 +99,8 @@ def run(case,original='cubic',budget=64*1048576,baseline=None):
     d=root/(case+'-'+original+'-'+str(budget));d.mkdir(mode=0o700)
     before=d/'before.json';before.write_text(json.dumps(base if baseline is None else baseline))
     env=dict(os.environ,CC_CASE=case,CC_ORIGINAL=original,CC_LOG=str(d/'calls'))
-    command='source "$1"; '+stub+'\nhttp_select_congestion "$2" "$3" "$4" 10 "$5" "$6"'
-    p=subprocess.run(['bash','-c',command,'_',fragment,str(before),base['endpoint'],str(budget),str(d),original],env=env,capture_output=True,timeout=8)
+    command='source "$1"; '+stub+'\nhttp_select_congestion "$2" "$3" "$4" "$7" "$5" "$6"'
+    p=subprocess.run(['bash','-c',command,'_',fragment,str(before),base['endpoint'],str(budget),str(d),original,str((base if baseline is None else baseline)['timeout_seconds'])],env=env,capture_output=True,timeout=8)
     path=d/'algorithm.json';r=json.loads(path.read_text()) if path.exists() else None
     calls=(d/'calls').read_text().splitlines() if (d/'calls').exists() else []
     if r:
@@ -103,6 +116,51 @@ for original in ('cubic','bbr'):
     candidate=r['selected']
     assert calls==[original+' upload',candidate+' upload',candidate+' upload',original+' upload',original+' upload',candidate+' upload'],calls
     assert r['reserved_bytes']==6*1048576 and len(r['trials'])==6,r
+# The production baseline had 3.021s HTTP wall time but only .845s of
+# active sending. Doubling it yields ~1.69s busy and stops the first trial.
+# A byte-exact plan fits the 16GiB run budget where five whole replays do not.
+fast=copy.deepcopy(base)
+fast.update(budget_bytes=8*1024**3,budget_mode='auto',timeout_seconds=30)
+for direction,large_batches in (('download',37),('upload',29)):
+ item=fast[direction]
+ item['request_batches']=[[65536],[262144]*4,[1048576]*4]+[[4194304]*4 for _ in range(large_batches)]
+ item['request_sizes']=[size for batch in item['request_batches'] for size in batch]
+ item['payload_bytes']=sum(item['request_sizes'])
+ item['duration_seconds']=3.021169241023017
+ item['bits_per_second']=item['payload_bytes']*8/item['duration_seconds']
+ fast[direction+'_bps']=item['bits_per_second']
+fast['reserved_bytes']=sum(fast[d]['payload_bytes'] for d in ('download','upload'))
+fast['upload']['tcp_info']={'supported':True,'busy_time_seconds':.8450000000000001}
+expected=math.ceil(fast['upload']['payload_bytes']*3.5/fast['upload']['tcp_info']['busy_time_seconds'])
+p,r,calls,_=run('replanned',budget=16*1024**3,baseline=fast)
+assert p.returncode==0 and r['reason_code']=='no_consistent_gain',(p.stderr,r)
+assert len(r['trials'])==6 and len(calls)==6 and r['trial_allowance_bytes']==expected,r
+assert r['reserved_bytes']==6*expected<=16*1024**3-3*fast['reserved_bytes'],r
+assert 6*5*fast['upload']['payload_bytes']>16*1024**3-3*fast['reserved_bytes']
+plans=[trial['upload']['request_batches'] for trial in r['trials']]
+assert all(plan==plans[0] for plan in plans),r
+assert plans[0][-1][-1]<4194304 and all(len(batch)<=4 and max(batch)<=4194304 for batch in plans[0])
+assert all(trial['upload']['tcp_info']['busy_time_seconds']>=3 for trial in r['trials']),r
+print('PASS: real fast-path baseline plans fractional replay bytes for six eligible trials without inventing a gain')
+# A complete comparison must fit before the first request, including when
+# TCP activity asks for more payload or predicts a wall-clock timeout.
+p,r,calls,_=run('replanned-budget',budget=14*1024**3,baseline=fast)
+assert p.returncode==0 and r['reason_code']=='insufficient_budget' and not calls,r
+slow_wall=copy.deepcopy(fast);slow_wall['timeout_seconds']=10
+for direction in ('download','upload'):
+ item=slow_wall[direction];item['duration_seconds']=8.
+ item['bits_per_second']=item['payload_bytes']*8/item['duration_seconds'];slow_wall[direction+'_bps']=item['bits_per_second']
+p,r,calls,_=run('replanned-timeout',budget=16*1024**3,baseline=slow_wall)
+assert p.returncode==0 and r['reason_code']=='trial_timeout' and not calls,r
+limited=copy.deepcopy(fast)
+limited['upload'].update(request_sizes=[1],request_batches=[[1]],payload_bytes=1,
+                         duration_seconds=.000001,bits_per_second=8000000.,quality='budget-limited',
+                         tcp_info={'supported':True,'busy_time_seconds':.000001})
+limited['upload_bps']=8000000.
+limited['reserved_bytes']=limited['download']['payload_bytes']+1
+p,r,calls,_=run('replanned-request-limit',budget=16*1024**3,baseline=limited)
+assert p.returncode==0 and r['reason_code']=='insufficient_budget' and not calls,r
+print('PASS: enlarged plans preserve the original without traffic when full byte or wall-clock budgets cannot fit')
 p,r,_,_=run('threshold')
 assert p.returncode==0 and r['status']=='selected',r
 print('PASS: three alternating paired upload schedules select either candidate only on consistent wins')

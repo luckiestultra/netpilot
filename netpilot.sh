@@ -694,7 +694,7 @@ apply_tuning() {
   if ((yes == 0)); then
     adaptive_print_plan
     if ((${#SYSCTL_KEYS[@]} == 0)); then
-      log "$(np_msg '当前支持的参数已满足建议，无需改动。' 'Supported parameters already meet the recommendations; no changes are needed.')"
+      log "$(np_msg '按本轮检查结果保留现有参数。' 'Existing parameters are retained based on this run.')"
       return 0
     fi
     read -r -p "$(np_msg '按以上计划应用并持久化？[y/N] ' 'Apply and persist the plan above? [y/N] ')" answer || return 1
@@ -704,7 +704,7 @@ apply_tuning() {
   if ((yes)); then adaptive_print_plan applying; fi
   if [[ "${AUTO_TUNE_ACTIVE:-0}" == 1 ]] && ((${auto_cancel_code:-0})); then return "$auto_cancel_code"; fi
   if ((${#SYSCTL_KEYS[@]} == 0)); then
-    log "$(np_msg '当前支持的参数已满足建议，无需改动。' 'Supported parameters already meet the recommendations; no changes are needed.')"
+    log "$(np_msg '按本轮检查结果保留现有参数。' 'Existing parameters are retained based on this run.')"
     return 0
   fi
   if [[ "${SYSCTL_TARGETS[net.ipv4.tcp_congestion_control]:-}" == bbr ]]; then
@@ -1611,6 +1611,13 @@ adaptive_plan() {
 
 adaptive_print_plan() {
   local key note mode="${1:-preview}"
+  if [[ "${AUTO_TUNE_ACTIVE:-0}" == 1 ]]; then
+    np_msg '参数检查：%d 项待调整，其他项保持原值。\n' 'Parameter check: %d changes planned; other values are retained.\n' "${#SYSCTL_KEYS[@]}"
+    if [[ -z "$PLAN_BANDWIDTH" ]]; then
+      np_msg '缓冲区：测量样本不足，保留原值；其他项继续检查。\n' 'Buffers: measurement samples are short; retained while other parameters are checked.\n'
+    fi
+    return 0
+  fi
   np_msg '配置档：%s | 有效内存：%s bytes\n' 'Profile: %s | Effective memory: %s bytes\n' "$PLAN_PROFILE" "$PLAN_MEMORY_BYTES"
   if [[ -n "$PLAN_BANDWIDTH" ]]; then
     if [[ "${AUTO_TUNE_ACTIVE:-0}" == 1 ]]; then
@@ -2147,9 +2154,9 @@ PY
 # shellcheck shell=bash
 # HTTP probes use synthetic data only and never change network configuration.
 http_measure_path() {
-  local phase="${1:-}" endpoint="${2:-}" budget="${3:-}" deadline="${4:-}" output="${5:-}" before="${6:-}" congestion="${7:-}" direction="${8:-}" dep
+  local phase="${1:-}" endpoint="${2:-}" budget="${3:-}" deadline="${4:-}" output="${5:-}" before="${6:-}" congestion="${7:-}" direction="${8:-}" upload_target="${9:-}" dep
   local http_measure_pid='' http_measure_status=0
-  if [[ $# -lt 5 || $# -gt 8 || ! "$deadline" =~ ^[0-9]{1,3}$ ]] || ((10#$deadline < 1 || 10#$deadline > 600)); then
+  if [[ $# -lt 5 || $# -gt 9 || ! "$deadline" =~ ^[0-9]{1,3}$ ]] || ((10#$deadline < 1 || 10#$deadline > 600)); then
     printf '%s\n' 'Invalid HTTP measurement arguments or timeout.' >&2
     return 2
   fi
@@ -2161,7 +2168,7 @@ http_measure_path() {
   done
   # Background the actual timeout monitor, so the caller's cancellation trap can
   # signal it while Bash waits. The monitor forwards TERM to its Python child.
-  LC_ALL=C timeout --foreground --kill-after=1 "${deadline}s" python3 - "$phase" "$endpoint" "$budget" "$deadline" "$output" "$before" "$congestion" "$direction" <<'PY' &
+  LC_ALL=C timeout --foreground --kill-after=1 "${deadline}s" python3 - "$phase" "$endpoint" "$budget" "$deadline" "$output" "$before" "$congestion" "$direction" "$upload_target" <<'PY' &
 import http.client
 import ipaddress
 import json
@@ -2182,7 +2189,7 @@ import threading
 from concurrent.futures import ThreadPoolExecutor
 from urllib.parse import urlsplit
 
-phase, raw_endpoint, raw_budget, raw_timeout, output_name, before_name, requested_cc, only_direction = sys.argv[1:]
+phase, raw_endpoint, raw_budget, raw_timeout, output_name, before_name, requested_cc, only_direction, raw_upload_target = sys.argv[1:]
 language = os.environ.get('NETPILOT_LANG', 'zh')
 report = {'type': 'netpilot-http-measurement', 'version': 1, 'ok': False,
           'phase': phase, 'endpoint': raw_endpoint, 'reserved_bytes': 0}
@@ -2326,6 +2333,27 @@ def read_before(path):
     if not integer(value.get('reserved_bytes'), 1, budget) or value['reserved_bytes'] != total:
         raise ValueError('invalid baseline reservation total')
     return value
+
+def upload_replay(batches, target):
+    # Reuse baseline batches in order; only the final batch may be shorter.
+    # Build the complete bounded plan before opening any measurement socket.
+    plan, left, requests = [], target, 0
+    while left:
+        for batch in batches:
+            sizes = []
+            for size in batch:
+                if not left:
+                    break
+                size = min(size, left)
+                sizes.append(size)
+                left -= size
+            requests += len(sizes)
+            if requests > MAX_REQUESTS_PER_DIRECTION * 2:
+                raise ValueError('upload replay exceeds the client request limit')
+            plan.append(sizes)
+            if not left:
+                break
+    return plan
 
 class CongestionUnavailable(OSError):
     pass
@@ -2572,6 +2600,9 @@ try:
     budget = int(raw_budget)
     if not integer(budget, 131072, AUTO_PHASE_BUDGET) or budget > 536870912 and budget != AUTO_PHASE_BUDGET:
         raise ValueError('measurement phase budget is out of range')
+    if raw_upload_target and (not only_direction or not re.fullmatch(r'[0-9]+', raw_upload_target) or
+                              not integer(int(raw_upload_target), 1, budget)):
+        raise ValueError('invalid explicit upload payload target')
     budget_mode = 'auto' if budget == AUTO_PHASE_BUDGET else 'fixed'
     if not output_name or os.path.lexists(output) or not os.path.isdir(os.path.dirname(output)):
         raise ValueError('report output must not exist and its directory must already exist')
@@ -2607,6 +2638,8 @@ try:
         raise ValueError('a baseline input is allowed only for the after phase')
     if only_direction:
         slots['upload'] = budget
+        upload_target = int(raw_upload_target) if raw_upload_target else previous['upload']['payload_bytes'] * 2
+        upload_batches = upload_replay(previous['upload']['request_batches'], upload_target)
         report.update(requested_congestion_algorithm=requested_cc, measurement_direction='upload')
     elif requested_cc:
         report['requested_congestion_algorithm'] = requested_cc
@@ -2658,7 +2691,7 @@ try:
         begin = time.perf_counter()
         try:
             if previous:
-                for sizes in previous[direction]['request_batches'] * (2 if only_direction else 1):
+                for sizes in (upload_batches if only_direction else previous[direction]['request_batches']):
                     run_batch(direction, sizes)
             else:
                 ladder = (65536, 262144, 1048576, MAX_REQUEST_BYTES)
@@ -2771,6 +2804,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from fractions import Fraction
 from urllib.parse import urlsplit
 
 before_name, endpoint_arg, whole_arg, timeout_arg, directory, original, backend = sys.argv[1:]
@@ -2914,7 +2948,40 @@ def validate_baseline():
         raise ValueError('invalid baseline reservations')
     return value
 
-def trial(cc, index, baseline, allowance):
+def plan_upload(baseline):
+    upload = baseline['upload']
+    amount, wall = upload['payload_bytes'], upload['duration_seconds']
+    allowance = amount * 2
+    tcp = upload.get('tcp_info')
+    # Missing TCP activity retains the legacy conservative attempt. HTTP wall
+    # time alone is never evidence of a sender that was busy for three seconds.
+    if (isinstance(tcp, dict) and tcp.get('supported') is True and
+            positive(tcp.get('busy_time_seconds'), wall + 1)):
+        goal = Fraction(7, 2) * amount
+        allowance = max(allowance, math.ceil(goal / Fraction(tcp['busy_time_seconds'])),
+                        math.ceil(goal / Fraction(wall)))
+    return allowance
+
+def replay_batches(batches, target):
+    plan, left, requests = [], target, 0
+    while left:
+        for batch in batches:
+            sizes = []
+            for size in batch:
+                if not left:
+                    break
+                size = min(size, left)
+                sizes.append(size)
+                left -= size
+            requests += len(sizes)
+            if requests > 4096:
+                raise Preserved('insufficient_budget')
+            plan.append(sizes)
+            if not left:
+                break
+    return plan
+
+def trial(cc, index, baseline, allowance, batches):
     global child
     name = os.path.join(directory, 'algorithm-trial-%d.json' % (index + 1))
     if os.path.lexists(name):
@@ -2927,7 +2994,7 @@ def trial(cc, index, baseline, allowance):
     report['trials'].append(evidence)
     child = subprocess.Popen(['bash', '-c', backend + '\nhttp_measure_path "$@"', '_',
         'after', baseline['endpoint'], str(baseline['budget_bytes']), timeout_arg, name,
-        before_name, cc, 'upload'], stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+        before_name, cc, 'upload', str(allowance)], stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
         start_new_session=True)
     try:
         available_time = 6 * int(timeout_arg) - (time.monotonic() - started)
@@ -2973,8 +3040,8 @@ def trial(cc, index, baseline, allowance):
                 value.get('connection_policy') != 'pinned-parallel' or
                 value.get('timeout_seconds') != int(timeout_arg) or
                 value.get('congestion_algorithm') != cc or value.get('requested_congestion_algorithm') != cc or
-                item.get('request_batches') != baseline['upload']['request_batches'] * 2 or
-                item.get('request_sizes') != baseline['upload']['request_sizes'] * 2 or
+                item.get('request_batches') != batches or
+                item.get('request_sizes') != [size for batch in batches for size in batch] or
                 item.get('payload_bytes') != allowance or value.get('reserved_bytes') != allowance):
             raise Preserved('conditions_mismatch')
         duration, bps = item.get('duration_seconds'), item.get('bits_per_second')
@@ -3011,7 +3078,7 @@ try:
         raise ValueError('invalid original congestion algorithm')
     baseline = validate_baseline()
     spent = baseline['reserved_bytes']
-    allowance = baseline['upload']['payload_bytes'] * 2
+    allowance = plan_upload(baseline)
     report.update(budget_bytes=int(whole_arg), baseline_reserved_bytes=spent,
                   final_reserved_bytes=2 * spent, trial_allowance_bytes=allowance,
                   planned_trial_bytes=6 * allowance, endpoint=baseline['endpoint'],
@@ -3021,14 +3088,17 @@ try:
         raise Preserved('unsupported_original')
     if baseline['node_verified'] is not True:
         raise Preserved('unverified_node')
-    if 6 * allowance > int(whole_arg) - 3 * spent:
+    if allowance > baseline['budget_bytes'] or 6 * allowance > int(whole_arg) - 3 * spent:
         raise Preserved('insufficient_budget')
+    if baseline['upload']['duration_seconds'] * allowance / baseline['upload']['payload_bytes'] > int(timeout_arg):
+        raise Preserved('trial_timeout')
+    batches = replay_batches(baseline['upload']['request_batches'], allowance)
     candidate = 'bbr' if original == 'cubic' else 'cubic'
     report['candidate'] = candidate
     pairs = []
     for pair in range(3):
         order = (original, candidate) if pair % 2 == 0 else (candidate, original)
-        items = {cc: trial(cc, pair * 2 + index, baseline, allowance) for index, cc in enumerate(order)}
+        items = {cc: trial(cc, pair * 2 + index, baseline, allowance, batches) for index, cc in enumerate(order)}
         pairs.append(items)
     gains = [pair[candidate]['bits_per_second'] / pair[original]['bits_per_second'] for pair in pairs]
     original_rtt = statistics.median(pair[original]['tcp_info']['srtt_ms'] for pair in pairs)
@@ -3199,6 +3269,44 @@ def summary_configuration_state(data):
     if data['rollback_status'] == 'completed': return 'restored'
     if data['verified'] and data['applied']: return 'verified'
     return 'applied' if data['applied'] else 'unchanged'
+def display(value):
+    # Escape terminal controls while keeping Chinese report text readable.
+    encoded = json.dumps(value, ensure_ascii=False, allow_nan=False, indent=2)
+    return encoded.translate({n: '\\u%04x' % n for n in range(127, 160)})
+def show_outcome(data):
+    status = data['status']
+    cancelled = status == 'cancelled'
+    if data['rollback_status'] == 'failed':
+        outcome = (text('已取消，配置恢复失败，需要处理。', 'Cancelled; configuration restoration failed, action required.') if cancelled else
+                   text('未完成，配置恢复失败，需要处理。', 'Incomplete; configuration restoration failed, action required.'))
+    elif data['rollback_status'] == 'completed':
+        outcome = (text('已恢复原配置。', 'Restored the original configuration.') if data.get('restoration_scope') == 'run' else
+                   text('已恢复首次原值。', 'Restored the first saved baseline.'))
+    elif status == 'completed':
+        outcome = (text('已调整并核验。', 'Adjusted and verified.') if data['applied'] and data['verified'] else
+                   text('保留原配置。', 'Kept the original configuration.'))
+    elif data['applied'] and not data['verified']:
+        outcome = (text('已取消，配置已应用但未核验，需要处理。', 'Cancelled; configuration applied but unverified, action required.') if cancelled else
+                   text('未完成，配置已应用但未核验，需要处理。', 'Incomplete; configuration applied but unverified, action required.'))
+    elif data['applied']:
+        outcome = (text('已取消，已应用配置仍保留。', 'Cancelled; applied configuration retained.') if cancelled else
+                   text('配置已应用，效果检查未完成。', 'Configuration applied; effect checks incomplete.'))
+    elif data['changed']:
+        outcome = (text('已取消，配置状态未确认，需要处理。', 'Cancelled; configuration state unknown, action required.') if cancelled else
+                   text('未完成，配置状态未确认，需要处理。', 'Incomplete; configuration state unknown, action required.'))
+    else:
+        outcome = (text('已取消，配置未修改。', 'Cancelled; configuration unchanged.') if cancelled else
+                   text('未完成，配置未修改。', 'Incomplete; configuration unchanged.'))
+    print(text('结果：', 'Result: ') + outcome)
+def show_errors(data):
+    if data.get('error'):
+        print(text('原因：', 'Reason: ') + display(data['error'][:2048])[1:-1])
+    phase = 'confirmation' if data['stage'] == 'confirm' else 'after' if data['stage'] == 'after' else 'before'
+    failed_measurement = data.get(phase)
+    if isinstance(failed_measurement, dict):
+        detail = failed_measurement.get('error')
+        if isinstance(detail, str) and detail:
+            print(text('测速错误：', 'Measurement error: ') + display(detail[:2048])[1:-1])
 def compare(before, after):
     if before.get('budget_mode', 'fixed') != after.get('budget_mode', 'fixed'):
         raise ValueError('measurement budget mode changed')
@@ -3706,41 +3814,18 @@ try:
             finally:
                 os.close(root_fd)
             validate_summary(data)
-            choices = SUMMARY_CHOICES
             comparison = data.get('comparison')
-            # Escape terminal controls while keeping Chinese report text readable.
-            def display(value):
-                encoded = json.dumps(value, ensure_ascii=False, allow_nan=False, indent=2)
-                return encoded.translate({n: '\\u%04x' % n for n in range(127, 160)})
             rendered = display(data)
             if len(args) > 1 and args[1] == 'json':
                 print(rendered)
             else:
-                labels = {
-                    'status': {'completed': text('完成', 'Completed'), 'failed': text('失败', 'Failed'),
-                               'partial': text('部分完成', 'Partial'), 'cancelled': text('已取消', 'Cancelled')},
-                    'stage': {'before': text('前测','Baseline'), 'selection': text('算法比较','Algorithm comparison'),
-                              'apply': text('应用','Apply'), 'verify': text('核验','Verify'), 'after': text('复测','Retest'),
-                              'confirm': text('退化复核','Regression confirmation'), 'completed': text('完成','Completed')},
-                    'configuration_state': dict(zip(choices['configuration_state'],
-                                  (text('本轮未修改', 'Unchanged this run'), text('已应用，未核验', 'Applied, unverified'),
-                                   text('已应用并核验', 'Applied and verified'), (text('已恢复本轮起点','Run starting state restored') if data.get('restoration_scope') == 'run' else text('已恢复首次原值', 'Original baseline restored')),
-                                   text('状态未确认', 'Unknown')))),
-                    'verify_status': {'not-needed': text('未进行或无需核验', 'Not performed or not needed'),
-                                      'verified': text('通过', 'Passed'), 'failed': text('失败', 'Failed'), 'restored': text('恢复后读回一致','Restored values verified')},
-                    'rollback_status': {'not-needed': text('未触发', 'Not triggered'),
-                                        'completed': text('已恢复', 'Restored'), 'failed': text('失败，保留备份', 'Failed; backups retained')},
-                }
                 from datetime import datetime
+                show_outcome(data)
                 print(text('最新报告：', 'Latest report: ') + display(str(root / name / 'summary.json')))
                 print(text('报告更新：', 'Report updated: ') + datetime.fromtimestamp(info.st_mtime).astimezone().isoformat(timespec='seconds'))
                 print(text('以下为历史运行记录，不代表当前实时状态。', 'Historical run record; not the current live state.'))
                 print_budget(data)
                 if data.get('algorithm') is not None: show_selection(data['algorithm'])
-                for key, label in [('status', text('流程', 'Flow')), ('stage', text('阶段', 'Stage')),
-                                   ('configuration_state', text('配置', 'Configuration')), ('verify_status', text('核验', 'Verification')),
-                                   ('rollback_status', text('回滚', 'Rollback'))]:
-                    print(label + text('：', ': ') + labels[key][data[key]])
                 if comparison is not None:
                     b, a = data['before'], data['after']
                     if b.get('measurement_policy') == 'parallel-http-v1':
@@ -3754,16 +3839,10 @@ try:
                         print(text('部分样本时长不足3秒，不能据此判断线路峰值。', 'Some samples are shorter than 3 seconds and do not establish peak bandwidth.'))
                     if not data['changed']:
                         print(text('本轮没有修改参数，测量波动不能归因于调优。', 'No parameters changed; measurement differences cannot be attributed to tuning.'))
-                if data.get('error'):
-                    print(text('原因：', 'Reason: ') + display(data['error'][:2048])[1:-1])
+                show_errors(data)
                 confirmation = data.get('confirmation')
                 if data.get('confirmation_comparison') is not None:
                     print(text('退化复核：下载 %.2f Mbps；上传 %.2f Mbps。', 'Regression check: download %.2f Mbps; upload %.2f Mbps.') % (confirmation['download_bps']/1e6, confirmation['upload_bps']/1e6))
-                failed_measurement = data.get('confirmation' if data['stage'] == 'confirm' else 'after' if data['stage'] == 'after' else 'before')
-                if isinstance(failed_measurement, dict):
-                    detail = failed_measurement.get('error')
-                    if isinstance(detail, str) and detail:
-                        print(text('测速错误：', 'Measurement error: ') + display(detail[:2048])[1:-1])
                 import shlex
                 command = 'netpilot --lang en report --json' if english else 'netpilot report --json'
                 if root != Path('/tmp/netpilot-reports'):
@@ -3783,7 +3862,10 @@ try:
         b = measurement(root / 'before.json', 'before')
         planned = 12 * b['upload']['payload_bytes']
         fits = planned <= total - 3 * b['reserved_bytes']
-        charge = planned if fits else 0
+        # Active-time planning may need more than the historical fixed 2x
+        # workload. Reserve the entire available selection allowance before
+        # spawning it; a valid result charges only the actual trial work.
+        charge = max(0, total - 3 * b['reserved_bytes']) if fits else 0
         atomic(root / 'algorithm-reservation.json', dict(type='netpilot-payload-reservation', reserved_bytes=charge))
         print(1 if fits else 0)
     elif op == 'reserve':
@@ -3845,9 +3927,9 @@ try:
             except (OSError, ValueError, TypeError, KeyError): pass
         validate_summary(data)
         atomic(root / 'summary.json', data)
+        show_outcome(data)
         print_budget(data)
         if data.get('algorithm') is not None: show_selection(data['algorithm'])
-        print(text('最终配置：','Final configuration: ') + (text('已恢复本轮起点','Run starting state restored') if rollback_status == 'completed' else text('恢复失败，需检查冲突','Restoration failed; inspect conflicts') if rollback_status == 'failed' else text('已应用并核验','Applied and verified') if data['applied'] and data['verified'] else text('本轮未修改','Unchanged this run')))
         if data['comparison'] is not None:
             c = data['comparison']; b = data['before']; a = data['after']
             print(text('观测下载：%.2f → %.2f Mbps（%+.2f%%）', 'Observed download: %.2f -> %.2f Mbps (%+.2f%%)') % (b['download_bps']/1e6, a['download_bps']/1e6, c['download_change_pct']))
@@ -3858,6 +3940,7 @@ try:
         if data['confirmation_comparison'] is not None:
             repeat = data['confirmation']
             print(text('退化复核：下载 %.2f Mbps；上传 %.2f Mbps。', 'Regression check: download %.2f Mbps; upload %.2f Mbps.') % (repeat['download_bps']/1e6, repeat['upload_bps']/1e6))
+        show_errors(data)
         print(text('自动报告：', 'Automatic report: ') + str(root / 'summary.json'))
     else:
         raise ValueError('unknown report operation')
@@ -3930,8 +4013,8 @@ auto_tune() {
     [[ -z "$saved_traps" ]] || eval "$saved_traps"
     if ! auto_report summary "$run_dir" "$status" "$stage" "$result" "$total" "$profile" "$changed" "$applied" "$verified" "$verify_status" "$rollback_status" "$error"; then
       warn "$(np_msg '无法保存汇总报告；已有数据保留在 %s。' 'Could not save the summary; existing data is retained in %s.' "$run_dir")"; result=1
+      [[ -z "$error" ]] || warn "$error"
     fi
-    [[ -z "$error" ]] || warn "$error"
     return "$result"
   }
   # Capture before network sampling; the final pre-write check detects external drift.

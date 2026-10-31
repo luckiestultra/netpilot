@@ -270,14 +270,55 @@ for measurement in (before,after):
     for direction in ('download','upload'):
         assert measurement[direction]['request_batches']==[[65536]]
         assert measurement[direction]['quality']=='sampled' and measurement[direction]['duration_seconds']>=3
-assert summary['algorithm']['status']=='preserved' and summary['algorithm']['selected']=='cubic'
-assert summary['algorithm']['reason_code']=='short_sample' and len(summary['algorithm']['trials'])==1
-assert summary['algorithm']['reserved_bytes']==131072
-assert summary['accounted_bytes']==before['reserved_bytes']+after['reserved_bytes']+summary['algorithm']['reserved_bytes']==393216 < summary['budget_bytes']
+# The peer delays its HTTP response after reading the entire small upload.
+# That wall time must never establish active sender time or select an algorithm.
+# Positive Linux busy counters can ask for work that fails preflight; zero or
+# unavailable counters retain a legacy attempt. Derive each branch from the
+# recorded input and independently verify the resulting request ledger.
+import math
+from fractions import Fraction
+algorithm=summary['algorithm']; upload=before['upload']; tcp=upload['tcp_info']
+assert algorithm['status']=='preserved' and algorithm['selected']=='cubic'
+amount,wall=upload['payload_bytes'],upload['duration_seconds']
+busy=tcp.get('busy_time_seconds')
+usable=(tcp.get('supported') is True and type(busy) in (int,float) and
+        math.isfinite(busy) and 0<busy<=wall+1)
+if tcp.get('supported') is True:
+    assert type(busy) in (int,float) and math.isfinite(busy) and 0<=busy<3,tcp
+expected_target=2*amount
+if usable:
+    expected_target=max(expected_target,math.ceil(Fraction(7*amount,2)/Fraction(busy)),
+                        math.ceil(Fraction(7*amount,2)/Fraction(wall)))
+assert algorithm['trial_allowance_bytes']==expected_target,algorithm
+assert algorithm['planned_trial_bytes']==6*expected_target,algorithm
+budget_fits=(expected_target<=before['budget_bytes'] and
+             6*expected_target<=summary['budget_bytes']-3*before['reserved_bytes'])
+wall_fits=wall*expected_target/amount<=before['timeout_seconds']
 requests=[json.loads(line) for line in (root/'http-requests.jsonl').read_text().splitlines()]
 automatic_requests=[item for item in requests if item['mode']=='auto']
-assert len(automatic_requests)==6 and all(item['requested']==65536 for item in automatic_requests)
-assert sum(item['sent']+item['received'] for item in automatic_requests)==393216
+assert [(item['method'],item['requested']) for item in automatic_requests[:2]]==[('GET',65536),('POST',65536)]
+assert [(item['method'],item['requested']) for item in automatic_requests[-2:]]==[('GET',65536),('POST',65536)]
+candidate_requests=automatic_requests[2:-2]
+if not budget_fits or not wall_fits:
+    expected_reason='insufficient_budget' if not budget_fits else 'trial_timeout'
+    assert algorithm['reason_code']==expected_reason,algorithm
+    assert algorithm['trials']==[] and algorithm['reserved_bytes']==0,algorithm
+    assert candidate_requests==[],candidate_requests
+else:
+    assert len(algorithm['trials'])==1 and algorithm['reserved_bytes']==expected_target,algorithm
+    trial=algorithm['trials'][0]; evidence=trial['upload']; observed=evidence['tcp_info']
+    assert trial['exit_code']==0 and evidence['duration_seconds']>=3,trial
+    if observed.get('supported') is True:
+        assert observed['busy_time_seconds']<3 and algorithm['reason_code']=='short_sample',trial
+    else:
+        assert algorithm['reason_code']=='missing_tcp_info',trial
+    expected_sizes=[65536]*(expected_target//65536)+([expected_target%65536] if expected_target%65536 else [])
+    assert [(item['method'],item['requested']) for item in candidate_requests]==[('POST',size) for size in expected_sizes]
+    assert evidence['payload_bytes']==expected_target,trial
+assert summary['accounted_bytes']==before['reserved_bytes']+after['reserved_bytes']+algorithm['reserved_bytes'] < summary['budget_bytes']
+assert sum(item['sent']+item['received'] for item in automatic_requests)==summary['accounted_bytes']
+print('DETAIL: delayed-response algorithm=%s; trials=%d; candidate_requests=%d; accounted_bytes=%d' %
+      (algorithm['reason_code'],len(algorithm['trials']),len(candidate_requests),summary['accounted_bytes']))
 (root/'auto-completed-report').write_text(str(path))
 PY
 report_path="$(cat "$TMP/auto-completed-report")"
@@ -294,7 +335,8 @@ import json, pathlib, sys
 assert json.loads(pathlib.Path(sys.argv[1]).read_text()) == json.loads(pathlib.Path(sys.argv[2]).read_text())
 PY
 printf '10\n0\n' | bash "$SCRIPT" --lang en > "$TMP/menu-report.log"
-grep -q 'Flow: Completed' "$TMP/menu-report.log" || fail 'menu 10 cannot read the default report'
+grep -qx 'Result: Adjusted and verified.' "$TMP/menu-report.log" || fail 'menu 10 cannot read the default report outcome'
+if grep -Eq '^(Flow|Stage|Configuration|Verification|Rollback|Final configuration):' "$TMP/menu-report.log"; then fail 'menu 10 repeats internal status panels'; fi
 grep -qx 'Full data: netpilot --lang en report --json' "$TMP/menu-report.log" || fail 'default report command still requires a custom path'
 [[ "$(stat -c '%a:%u:%g' /var/log)" == "$log_identity" ]] || fail 'automatic tuning changed /var/log permissions or ownership'
 [[ "$(sha256sum /var/log/netpilot/legacy-report | awk '{print $1}')" == "$legacy_hash" ]] || fail 'automatic tuning changed a legacy report'

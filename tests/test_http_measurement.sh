@@ -38,7 +38,7 @@ root = pathlib.Path(os.environ['NETPILOT_HTTP_TEST_TMP'])
 fragment = os.environ['NETPILOT_HTTP_TEST_FRAGMENT']
 state = {'mode': 'ok', 'requests': [], 'node': 'LAB', 'accepted': 0, 'generation': 0,
          'active': 0, 'max_active': 0, 'spans': [], 'barrier': None, 'upload_read': 0,
-         'bandwidth_next': 0.0}
+         'bandwidth_next': 0.0, 'connections': 0}
 lock = threading.Lock()
 
 def shared_bandwidth(size):
@@ -51,6 +51,11 @@ def shared_bandwidth(size):
 
 class Server(http.server.ThreadingHTTPServer):
     daemon_threads = True
+    def get_request(self):
+        connection, address = super().get_request()
+        with lock:
+            state['connections'] += 1
+        return connection, address
     def handle_error(self, request, client_address):
         # Deliberate early aborts reject bad headers before reading the body.
         if not isinstance(sys.exc_info()[1], OSError):
@@ -174,13 +179,15 @@ threading.Thread(target=server.serve_forever, daemon=True).start()
 endpoint = 'http://127.0.0.1:%d' % server.server_address[1]
 budget = 1048576
 
-def run(name, phase='before', previous='', limit=10, endpoint_override=None, extra_env=None, cc='', direction=''):
+def run(name, phase='before', previous='', limit=10, endpoint_override=None, extra_env=None, cc='', direction='', upload_target=None):
     output = root / (name + '.json')
     env = dict(os.environ, NETPILOT_LANG='en', HTTP_PROXY='http://127.0.0.1:1', HTTPS_PROXY='http://127.0.0.1:1', ALL_PROXY='http://127.0.0.1:1')
     if extra_env:
         env.update(extra_env)
     args = ['bash', '-c', 'source "$1"; http_measure_path "${@:2}"', '_', fragment, phase,
             endpoint_override or endpoint, str(budget), str(limit), str(output), str(previous), cc, direction]
+    if upload_target is not None:
+        args.append(str(upload_target))
     result = subprocess.run(args, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=limit + 4)
     report = json.loads(output.read_text()) if output.exists() else None
     return result, report, output
@@ -188,7 +195,7 @@ def run(name, phase='before', previous='', limit=10, endpoint_override=None, ext
 def reset(mode='ok'):
     state.update(mode=mode, requests=[], accepted=0, node='LAB', generation=state['generation'] + 1,
                  active=0, max_active=0, spans=[], upload_read=0,
-                 bandwidth_next=0.0,
+                 bandwidth_next=0.0, connections=0,
                  barrier=threading.Barrier(4) if mode == 'parallel-delay' else None)
 
 def valid_report(report, phase, expected_endpoint=endpoint, expected_address='127.0.0.1'):
@@ -256,13 +263,64 @@ try:
     assert set(upload_cc['socket_congestion_algorithms']) == {'cubic'}
     print('PASS: real per-socket CUBIC readback, unchanged global algorithm and identical doubled upload-only batches')
 
+    # Explicit upload work can exceed two replays and end within a batch.
+    # All callers use the same deterministic cycle and exact last request.
+    expanded_before = copy.deepcopy(before)
+    expanded_before['budget_bytes'] = budget * 4
+    expanded_path = root / 'expanded-before.json'
+    expanded_path.write_text(json.dumps(expanded_before))
+    original_budget = budget
+    budget *= 4
+    target = 3 * before['upload']['payload_bytes'] + 65536 + 262144 + 17
+    fixed_plan = None
+    for name in ('target-cubic-1', 'target-cubic-2'):
+        reset()
+        result, planned, _ = run(name, 'after', expanded_path, cc='cubic', direction='upload', upload_target=target)
+        assert result.returncode == 0, (result.stderr.decode(), planned)
+        item = planned['upload']
+        assert item['payload_bytes'] == planned['reserved_bytes'] == state['accepted'] == target
+        assert item['request_sizes'] == before['upload']['request_sizes'] * 3 + [65536, 262144, 17]
+        assert item['request_batches'] == before['upload']['request_batches'] * 3 + [[65536], [262144, 17]]
+        assert all(method == 'POST' and size <= 4194304 for method, size, _ in state['requests'])
+        assert state['max_active'] <= 4
+        if fixed_plan is None: fixed_plan = item['request_batches']
+        else: assert item['request_batches'] == fixed_plan
+    for number, (phase, cc, mode, target_arg) in enumerate((
+            ('before', '', '', 1), ('after', 'cubic', '', 1),
+            ('after', 'cubic', 'upload', 0), ('after', 'cubic', 'upload', 'bad'),
+            ('after', 'cubic', 'upload', budget + 1))):
+        reset()
+        result, invalid, _ = run('invalid-target-%d' % number, phase, expanded_path if phase == 'after' else '',
+                                 cc=cc, direction=mode, upload_target=target_arg)
+        assert result.returncode != 0 and not state['requests'] and state['connections'] == 0, (result.returncode, invalid, state['requests'], state['connections'])
+    tiny_before = copy.deepcopy(expanded_before)
+    tiny_before['upload'].update(request_sizes=[1], request_batches=[[1]], payload_bytes=1)
+    tiny_before['upload']['bits_per_second'] = 8 / tiny_before['upload']['duration_seconds']
+    tiny_before['upload_bps'] = tiny_before['upload']['bits_per_second']
+    tiny_before['reserved_bytes'] = tiny_before['download']['payload_bytes'] + 1
+    tiny_path = root / 'tiny-plan-before.json'
+    tiny_path.write_text(json.dumps(tiny_before))
+    reset()
+    result, invalid, _ = run('request-limit-target', 'after', tiny_path,
+                             cc='cubic', direction='upload', upload_target=4097)
+    assert result.returncode != 0 and not state['requests'] and state['connections'] == 0 and invalid['reserved_bytes'] == 0
+    assert 'request limit' in invalid['error'], invalid
+    budget = original_budget
+    print('PASS: explicit upload byte plans replay identically beyond 2U, truncate the final request and reject invalid arguments before traffic')
+
+    # A synthetic baseline without usable TCP activity retains the legacy 2U
+    # attempt; delayed ACK wall time still cannot qualify that trial.
+    legacy_before = copy.deepcopy(before)
+    legacy_before['upload'].pop('tcp_info', None)
+    legacy_path = root / 'legacy-selector-before.json'
+    legacy_path.write_text(json.dumps(legacy_before))
     # A slow service response can exceed 3 seconds while the sender's TCP busy
     # counter stays short. It must never qualify an algorithm comparison.
     reset('delayed-upload-ack')
     selection_dir = root / 'real-selector'
     selection_dir.mkdir(mode=0o700)
     result = subprocess.run(['bash', '-c', 'source "$1"; http_select_congestion "$2" "$3" 67108864 10 "$4" cubic',
-        '_', fragment, str(before_path), endpoint, str(selection_dir)], capture_output=True, timeout=15)
+        '_', fragment, str(legacy_path), endpoint, str(selection_dir)], capture_output=True, timeout=15)
     selection = json.loads((selection_dir / 'algorithm.json').read_text())
     assert result.returncode == 0 and selection['status'] == 'preserved', (result.stderr.decode(), selection)
     assert selection['reason_code'] in ('short_sample', 'missing_tcp_info'), selection
@@ -279,7 +337,7 @@ try:
     cancel_dir = root / 'selector-cancel'
     cancel_dir.mkdir(mode=0o700)
     process = subprocess.Popen(['bash', '-c', 'source "$1"; http_select_congestion "$2" "$3" 67108864 10 "$4" cubic',
-        '_', fragment, str(before_path), endpoint, str(cancel_dir)], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        '_', fragment, str(legacy_path), endpoint, str(cancel_dir)], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
         start_new_session=True)
     descendants = {process.pid}
     try:

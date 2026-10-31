@@ -644,7 +644,7 @@ p=pathlib.Path(sys.argv[1]);d=json.loads(p.read_text())
 assert d['status']=='failed' and d['stage']=='selection' and not d['changed'],d
 b=json.loads((p.parent/'before.json').read_text())
 assert d['accounting_conservative'] is True and d['algorithm'] is None,d
-assert d['accounted_bytes']==b['reserved_bytes']+12*b['upload']['payload_bytes'],d
+assert d['accounted_bytes']==d['budget_bytes']-2*b['reserved_bytes'],d
 PY
 )
 
@@ -849,7 +849,7 @@ test_http_rejection_stops_before_application() (
   source <(sed -n '/^http_select_congestion() {/,/^# END HTTP MEASUREMENT$/p' "$SCRIPT")
   source <(declare -f http_measure_path | sed '1s/http_measure_path/fixture_path_before_rejection/')
   http_measure_path() {
-    if [[ $# == 8 && "$8" == upload ]]; then
+    if [[ $# -ge 8 && "$8" == upload ]]; then
       printf 'http-refused\t%s\n' "$NETPILOT_TEST_HTTP_STATUS" >> "$CASE_DIR/trace"
       python3 - "$5" "$6" "$NETPILOT_TEST_HTTP_STATUS" <<'PY'
 import json, pathlib, sys
@@ -887,7 +887,28 @@ PY
   done
 )
 
+test_individual_skips_do_not_skip_other_changes() (
+  local language
+  for language in zh en; do
+    setup_case "individual-skips-$language"
+    printf '16777216\n' > "$KERNEL_DIR/net.core.rmem_max"
+    printf '4096 131072 16777216\n' > "$KERNEL_DIR/net.ipv4.tcp_rmem"
+    main --lang "$language" tune < /dev/null > "$CASE_DIR/output" 2>&1 || fail 'retaining one parameter blocked automatic tuning'
+    [[ "$(cat "$KERNEL_DIR/net.core.rmem_max")" == 16777216 ]] || fail 'larger receive ceiling was lowered'
+    ! grep -q '^net.core.rmem_max=' "$CASE_DIR/writes" || fail 'retained receive ceiling was rewritten'
+    [[ "$(cat "$KERNEL_DIR/net.core.wmem_max")" -gt 212992 ]] || fail 'send ceiling was skipped with receive ceiling'
+    [[ "$(cat "$KERNEL_DIR/net.ipv4.tcp_moderate_rcvbuf")" == 1 ]] || fail 'receive autotuning was skipped with receive ceiling'
+    ! grep -Eq '有效内存|Effective memory|BDP|以上仅为计划|This is a plan only' "$CASE_DIR/output" || fail 'one-click output still contains the manual planning explanation'
+    python3 - "$(summary_file)" <<'PY'
+import json, sys
+data = json.load(open(sys.argv[1]))
+assert data['status']=='completed' and data['changed'] and data['applied'] and data['verified'],data
+PY
+  done
+)
+
 failures=0
+if test_individual_skips_do_not_skip_other_changes; then printf 'PASS: test_individual_skips_do_not_skip_other_changes\n'; else failures=$((failures+1)); fi
 if test_http_rejection_stops_before_application; then printf 'PASS: test_http_rejection_stops_before_application\n'; else failures=$((failures+1)); fi
 if test_retest_reserve_required_before_apply; then printf 'PASS: test_retest_reserve_required_before_apply\n'; else failures=$((failures+1)); fi
 for test in test_manual_fixture_and_rollback test_automatic_command_and_bilingual_menu test_short_samples_keep_buffers_and_apply_basic_tuning test_automatic_options_and_budget test_invalid_options_are_zero_traffic test_baseline_failures_never_apply test_application_and_verification_failures_restore test_post_failures_restore_current_run test_no_change_still_compares test_confirmed_regression_restores_current_run test_transient_regression_is_confirmed_only_once test_existing_tuning_restores_this_run_not_first_backup test_preapply_external_drift_stops_without_overwrite test_selected_candidate_applies_only_after_comparison test_retained_bbr_preserves_existing_queue test_missing_algorithm_report_cannot_reach_application test_repeated_runs_preserve_reports_and_first_backup test_report_paths_preserve_existing_data test_report_paths_cannot_enter_tuning_state test_cancel_does_not_report_success test_noop_cancellation_preserves_previous_tuning test_cancelled_apply_with_failed_rollback_reports_uncertainty test_unloaded_bbr_in_bilingual_menu test_failed_baseline_does_not_load_bbr; do

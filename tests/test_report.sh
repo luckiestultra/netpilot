@@ -40,7 +40,7 @@ grep -q 'run.aaa/summary.json' "$TMP/out" || fail 'selected path was not shown'
 grep -q '最新报告' "$TMP/out" || fail 'Chinese report heading is missing'
 printf '%s\n' 'PASS: actual report CLI selects latest summary by file time, including paths with spaces'
 
-grep -q '流程：失败' "$TMP/out" || fail 'default report needs a readable flow status'
+grep -q '^结果：未完成，配置未修改。' "$TMP/out" || fail 'default report needs a clear outcome'
 ! grep -q '"type"' "$TMP/out" || fail 'default report should not dump raw JSON'
 python3 - "$TMP/out" "$SCRIPT" "$reports" <<'PY'
 import json, shlex, subprocess, sys
@@ -133,15 +133,14 @@ PY
 bash -c 'source "$1"; auto_report summary "$2" completed completed 0 134217728 balanced 1 1 1 verified not-needed ""' \
   _ "$SCRIPT" "$complete" > /dev/null
 bash "$SCRIPT" report --report-dir "$TMP/complete" > "$TMP/out"
-grep -q '流程：完成' "$TMP/out" || fail 'completed report status is missing'
-grep -q '配置：已应用并核验' "$TMP/out" || fail 'verified configuration is not distinct from flow completion'
+grep -q '^结果：已调整并核验。' "$TMP/out" || fail 'completed report needs one verified configuration outcome'
 grep -q '100.00.*125.00' "$TMP/out" || fail 'download observations are missing'
 grep -q '40.00.*50.00' "$TMP/out" || fail 'upload observations are missing'
 grep -q '50.000.*40.000' "$TMP/out" || fail 'TCP-connect latency observations are missing'
 grep -q '预算' "$TMP/out" || fail 'limited sample warning is missing'
 NETPILOT_LANG=en bash "$SCRIPT" report --report-dir "$TMP/complete" > "$TMP/out"
-grep -q 'Flow: Completed' "$TMP/out" || fail 'English readable result is missing'
-printf '%s\n' 'PASS: completed summary separates flow, configuration, measurements and sample limits in both languages'
+grep -q '^Result: Adjusted and verified.' "$TMP/out" || fail 'English readable result is missing'
+printf '%s\n' 'PASS: completed summary presents one outcome with measurements and sample limits in both languages'
 
 # Unfinished runs must distinguish recorded bytes from a complete transfer total.
 python3 - "$SCRIPT" "$TMP" "$complete/summary.json" <<'PY'
@@ -239,16 +238,16 @@ PY
 for state in partial cancelled failed; do
   state_code=1
   case "$state" in
-    partial) stage=after; applied=1; verified=1; verify_status=verified; rollback_status=not-needed; expected='已应用并核验' ;;
+    partial) stage=after; applied=1; verified=1; verify_status=verified; rollback_status=not-needed; expected='配置已应用，效果检查未完成。' ;;
     cancelled) stage=apply; state_code=130; applied=0; verified=0; verify_status=not-needed; rollback_status=completed; expected='已恢复首次原值' ;;
-    failed) stage=apply; applied=0; verified=0; verify_status=failed; rollback_status=failed; expected='状态未确认' ;;
+    failed) stage=apply; applied=0; verified=0; verify_status=failed; rollback_status=failed; expected='未完成，配置恢复失败，需要处理。' ;;
   esac
   folder="$TMP/states/run.$state"
   mkdir -p "$folder"
   bash -c 'source "$1"; auto_report summary "${@:2}"' _ "$SCRIPT" "$folder" "$state" "$stage" "$state_code" \
     134217728 balanced 1 "$applied" "$verified" "$verify_status" "$rollback_status" 'example failure' > /dev/null
   bash "$SCRIPT" report --report-dir "$TMP/states" > "$TMP/out"
-  grep -q "配置：$expected" "$TMP/out" || fail "$state configuration state was misrepresented"
+  grep -q "^结果：$expected" "$TMP/out" || fail "$state configuration state was misrepresented"
   ! grep -q '观测下载' "$TMP/out" || fail 'unfinished flow displayed a performance comparison'
 done
 printf '%s\n' 'PASS: partial, cancelled and failed restoration results retain distinct configuration states'
@@ -262,7 +261,7 @@ data.update(changed=False, applied=False, configuration_state='unchanged')
 path.write_text(json.dumps(data))
 PY
 bash "$SCRIPT" report --report-dir "$TMP/complete" > "$TMP/out"
-grep -q '本轮未修改' "$TMP/out" || fail 'unchanged run was shown as a new application'
+grep -q '^结果：保留原配置。' "$TMP/out" || fail 'unchanged run was shown as a new application'
 grep -q '测量波动不能归因于调优' "$TMP/out" || fail 'unchanged run needs a clear measurement limit'
 python3 - "$complete/summary.json" <<'PY'
 from pathlib import Path
