@@ -120,7 +120,7 @@ Chinese is the default; menu `L` switches the current session. Use `netpilot --l
 | `--budget-mib` | `128` | Whole-run payload; integer 1–1024MiB. |
 | `--timeout` | `30` | Per-phase timeout; integer 5–120 seconds. |
 | `--endpoint` | `https://speed.cloudflare.com` | HTTPS origin with compatible download/upload APIs; HTTP is limited to loopback addresses. |
-| `--report-dir` | `/tmp/netpilot-reports` | Private report directory; cannot be inside `/var/lib/netpilot/`. |
+| `--report-dir` | `/tmp/netpilot-reports` | Must not allow other users to write; cannot be inside `/var/lib/netpilot/`. |
 
 Latency is the average of three TCP connection times. Each phase gets half the budget, split between download and upload. Failed requests consume budget, with no automatic retry. Samples shorter than 3 seconds are marked budget-limited and cannot establish peak bandwidth.
 
@@ -202,7 +202,7 @@ Original values and files are saved before their first change; repeated runs pre
 
 Restore failures retain backups. After program-only removal, run the online command again and choose `5` to restore from retained records. Rollback covers changes managed by NetPilot.
 
-View older reports with `netpilot --lang en report --report-dir /var/log/netpilot`. Uninstall also cleans recognized NetPilot reports there, preserving unrelated files.
+View older reports with `netpilot --lang en report --report-dir /var/log/netpilot`. Uninstall also cleans recognized NetPilot reports there; run directories containing other files are kept with a warning.
 
 ### Requirements
 

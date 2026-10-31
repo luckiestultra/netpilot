@@ -120,7 +120,7 @@ netpilot report --json
 | `--budget-mib` | `128` | 整轮测试数据，整数 1–1024MiB。 |
 | `--timeout` | `30` | 每阶段超时，整数 5–120 秒。 |
 | `--endpoint` | `https://speed.cloudflare.com` | 兼容下载/上传接口的 HTTPS 源；HTTP 仅限回环地址。 |
-| `--report-dir` | `/tmp/netpilot-reports` | 私有报告目录，不能位于 `/var/lib/netpilot/` 内。 |
+| `--report-dir` | `/tmp/netpilot-reports` | 报告目录不能向其他用户开放写权限，也不能位于 `/var/lib/netpilot/` 内。 |
 
 延迟采用 3 次 TCP 建连耗时的平均值。前测、复测各占一半预算，再平分给下载和上传；失败请求也计入预算，不自动重试。短于 3 秒的样本标记为预算受限，不能判断峰值。
 
@@ -202,7 +202,7 @@ netpilot compare before.json after.json
 
 恢复失败会保留备份。仅卸载后，重新运行在线命令并选 `5`，可用保留的备份恢复；回滚范围为 NetPilot 管理的变更。
 
-旧版报告可用 `netpilot report --report-dir /var/log/netpilot` 查看，卸载时也清理可识别的工具报告；目录中的其他文件保留。
+旧版报告可用 `netpilot report --report-dir /var/log/netpilot` 查看，卸载时也清理可识别的工具报告；混有其他文件的运行目录会保留并提示。
 
 ### 环境要求
 

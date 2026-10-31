@@ -127,8 +127,19 @@ assert_removed() {
   [[ ! -L "$SHORTCUT_PATH" ]] || fail 'owned shortcut remains'
 }
 assert_no_success() {
-  if grep -Eq '本调优脚本及其快捷命令已移除|NetPilot and its shortcut were removed|回退已完成|Rollback completed' "$CASE_DIR/output"; then fail 'failure reported success'; fi
+  if grep -Eq '程序、自有快捷命令和可识别的默认报告已清理|The tool, its owned shortcut and recognized default reports were removed|回退已完成|Rollback completed' "$CASE_DIR/output"; then fail 'failure reported success'; fi
 }
+
+test_completion_assertion_rejects_actual_success() (
+  local language
+  for language in zh en; do
+    setup "completion-assertion-$language"; np_set_language "$language"
+    invoke_cli y || fail 'success fixture could not uninstall'
+    if (assert_no_success) > "$CASE_DIR/assertion-result" 2>&1; then
+      fail 'failure assertion accepted the actual success message'
+    fi
+  done
+)
 
 test_download_uninstall_removes_installed_copy_only() (
   setup download
@@ -527,7 +538,7 @@ test_bilingual_menu_cancellation_and_eof() (
 )
 
 failures=0
-for test in test_download_uninstall_removes_installed_copy_only test_installed_path_uninstalls test_menu_uninstall_without_resolved_source test_process_substitution_resolves_then_uninstalls test_changed_owned_version_is_recognized test_unrelated_installed_file_is_preserved test_installed_symlink_is_preserved test_dangling_installed_symlink_is_preserved test_unrelated_shortcuts_are_preserved test_absent_installation_keeps_source test_failed_rollback_keeps_installation test_residual_state_failure_keeps_installation test_shortcut_remove_failure_is_reported test_install_remove_failure_is_reported test_cancel_does_not_mutate test_default_uninstall_keeps_configuration_backup_and_unrelated_files test_uninstall_cleans_only_managed_default_reports test_report_cleanup_does_not_follow_links_or_delete_user_files test_default_uninstall_does_not_validate_or_follow_damaged_state test_explicit_rollback_uninstall_runs_before_removal test_explicit_rollback_without_state_preserves_installation test_explicit_rollback_rejects_empty_and_unknown_only_state test_file_only_backups_are_restored_without_original_values_marker test_uninstall_rejects_unknown_options_before_confirmation test_uninstall_confirmation_defaults_to_cancel test_bilingual_menu_default_and_keep_choice_route test_bilingual_menu_rollback_choice_route test_bilingual_menu_cancellation_and_eof; do
+for test in test_completion_assertion_rejects_actual_success test_download_uninstall_removes_installed_copy_only test_installed_path_uninstalls test_menu_uninstall_without_resolved_source test_process_substitution_resolves_then_uninstalls test_changed_owned_version_is_recognized test_unrelated_installed_file_is_preserved test_installed_symlink_is_preserved test_dangling_installed_symlink_is_preserved test_unrelated_shortcuts_are_preserved test_absent_installation_keeps_source test_failed_rollback_keeps_installation test_residual_state_failure_keeps_installation test_shortcut_remove_failure_is_reported test_install_remove_failure_is_reported test_cancel_does_not_mutate test_default_uninstall_keeps_configuration_backup_and_unrelated_files test_uninstall_cleans_only_managed_default_reports test_report_cleanup_does_not_follow_links_or_delete_user_files test_default_uninstall_does_not_validate_or_follow_damaged_state test_explicit_rollback_uninstall_runs_before_removal test_explicit_rollback_without_state_preserves_installation test_explicit_rollback_rejects_empty_and_unknown_only_state test_file_only_backups_are_restored_without_original_values_marker test_uninstall_rejects_unknown_options_before_confirmation test_uninstall_confirmation_defaults_to_cancel test_bilingual_menu_default_and_keep_choice_route test_bilingual_menu_rollback_choice_route test_bilingual_menu_cancellation_and_eof; do
   if "$test"; then printf 'PASS: %s\n' "$test"; else failures=$((failures + 1)); fi
 done
 [[ "$(sha256sum "$SCRIPT" | awk '{print $1}')" == "$SOURCE_HASH" ]] || fail 'uninstall tests modified source bytes'

@@ -602,19 +602,20 @@ restore_rps() {
 
 remove_state_files() {
   local dir entry nonempty
-  # Retain the retry marker until every other owned file has been removed.
-  # A failed auxiliary marker removal must leave its snapshot available to retry.
+  # Remove change markers before snapshots. A partially failed rm must never
+  # leave a change marker behind after deleting the snapshot needed to retry.
+  # Keep original-values until all other owned files have been removed.
   if ! rm -f -- "$STATE_DIR/rps-sysctl-changed" || ! rm -f -- \
-    "$STATE_DIR/ulimit.before" \
-    "$STATE_DIR/interface" \
     "$STATE_DIR/gai-changed" \
     "$STATE_DIR/iptables4-added" \
+    "$STATE_DIR/nic-ring-changed" \
+    "$STATE_DIR/rps-changed" || ! rm -f -- \
+    "$STATE_DIR/ulimit.before" \
+    "$STATE_DIR/interface" \
     "$STATE_DIR/ethtool-g.before" \
     "$STATE_DIR/nic-ring.before" \
-    "$STATE_DIR/nic-ring-changed" \
     "$STATE_DIR/rps.before" \
     "$STATE_DIR/rps-sysctl.before" \
-    "$STATE_DIR/rps-changed" \
     "$BACKUP_DIR/bbr-file" \
     "$BACKUP_DIR/bbr-file.missing" \
     "$BACKUP_DIR/bbr-module-file" \
@@ -649,7 +650,8 @@ remove_state_files() {
 }
 
 rollback_internal() {
-  local previous_iface name path failed=0
+  local previous_iface name path failed=0 keep_state=0
+  [[ "${1:-}" != --keep-state ]] || keep_state=1
   if [[ -f "$STATE_DIR/interface" ]]; then
     previous_iface="$(cat "$STATE_DIR/interface")" || failed=1
     NIC_IFACE="${previous_iface:-}"
@@ -666,7 +668,7 @@ rollback_internal() {
     fi
   done
   if (( failed == 0 )); then
-    remove_state_files || failed=1
+    if ((keep_state == 0)); then remove_state_files || failed=1; fi
   else
     warn "$(np_msg '回退未完成，备份已保留；检查错误后重试回退。' 'Rollback is incomplete. Backups are retained; inspect errors and retry rollback.')"
   fi
@@ -891,7 +893,8 @@ remove_automatic_reports() {
 }
 
 uninstall_own_script() {
-  local answer option name rollback_requested=0 has_record=0
+  local answer option name rollback_requested=0 has_record=0 shortcut_removed=0
+  local recovery_dir='' recovery_tmp='' recovery_target='' recovery_failed=0
   for option in "$@"; do
     case "$option" in
       --rollback) rollback_requested=1 ;;
@@ -933,14 +936,75 @@ uninstall_own_script() {
       warn "$(np_msg '未找到可识别的回退记录，未执行恢复或卸载；现有文件保留。' 'No recognizable rollback records found; nothing was restored or uninstalled. Existing files are retained.')"
       return 1
     }
-    rollback_internal || return 1
+    rollback_internal --keep-state || return 1
+    # Keep only the known recovery records needed to compensate a final state
+    # cleanup failure. Never copy the state directory or its unowned contents.
+    recovery_dir="$(mktemp -d /tmp/netpilot-uninstall.XXXXXX)" || return 1
+    if ! { [[ ! -e "$INSTALL_PATH" ]] || cp -p -- "$INSTALL_PATH" "$recovery_dir/program"; } ||
+      ! { if [[ -f "$STATE_DIR/original-values" && ! -L "$STATE_DIR/original-values" ]]; then
+          cp -p -- "$STATE_DIR/original-values" "$recovery_dir/original-values"
+        else
+          # File-only recovery has completed; an empty original-values record
+          # permits cleanup to retry without inventing kernel values.
+          : > "$recovery_dir/original-values"
+        fi; }; then
+      warn "$(np_msg '无法暂存卸载恢复文件，程序和回退记录保留；请检查：%s' 'Unable to stage uninstall recovery files; the tool and rollback records are retained. Inspect: %s' "$recovery_dir")"
+      return 1
+    fi
   fi
-  remove_automatic_reports || return 1
+  if ! remove_automatic_reports; then
+    [[ -z "$recovery_dir" ]] || rm -rf -- "$recovery_dir" || warn "$(np_msg '无法清理临时恢复副本：%s' 'Unable to remove temporary recovery copies: %s' "$recovery_dir")"
+    return 1
+  fi
   if [[ -L "$SHORTCUT_PATH" && "$(readlink "$SHORTCUT_PATH")" == "$INSTALL_PATH" ]]; then
-    rm -f -- "$SHORTCUT_PATH" || return 1
+    if ! rm -f -- "$SHORTCUT_PATH"; then
+      [[ -z "$recovery_dir" ]] || rm -rf -- "$recovery_dir" || warn "$(np_msg '无法清理临时恢复副本：%s' 'Unable to remove temporary recovery copies: %s' "$recovery_dir")"
+      return 1
+    fi
+    shortcut_removed=1
   fi
-  rm -f -- "$INSTALL_PATH" || return 1
+  if ! rm -f -- "$INSTALL_PATH"; then
+    if ((rollback_requested && shortcut_removed)); then
+      ln -sT -- "$INSTALL_PATH" "$SHORTCUT_PATH" || warn "$(np_msg '无法恢复快捷命令，未覆盖现有路径：%s' 'Unable to restore the shortcut; no existing path was replaced: %s' "$SHORTCUT_PATH")"
+    fi
+    [[ -z "$recovery_dir" ]] || rm -rf -- "$recovery_dir" || warn "$(np_msg '无法清理临时恢复副本：%s' 'Unable to remove temporary recovery copies: %s' "$recovery_dir")"
+    return 1
+  fi
   if ((rollback_requested)); then
+    if ! remove_state_files; then
+      # Restore through exclusive hard-link publication, so a concurrently
+      # created file or symlink is never overwritten by compensation.
+      if [[ ! -e "$STATE_DIR" && ! -L "$STATE_DIR" ]]; then
+        mkdir -m 0700 -- "$STATE_DIR" || recovery_failed=1
+      fi
+      for name in original-values program; do
+        [[ -f "$recovery_dir/$name" ]] || continue
+        if [[ "$name" == program ]]; then recovery_target="$INSTALL_PATH"
+        elif [[ -d "$STATE_DIR" && ! -L "$STATE_DIR" ]]; then recovery_target="$STATE_DIR/original-values"
+        else recovery_failed=1; continue; fi
+        if [[ -e "$recovery_target" || -L "$recovery_target" ]]; then
+          if [[ "$name" == original-values && -f "$recovery_target" && ! -L "$recovery_target" ]] &&
+            cmp -s -- "$recovery_dir/$name" "$recovery_target"; then continue; fi
+          recovery_failed=1
+          continue
+        fi
+        recovery_tmp="$(mktemp "${recovery_target}.recover.XXXXXX")" || { recovery_failed=1; continue; }
+        if ! cp -p -- "$recovery_dir/$name" "$recovery_tmp" || ! ln -T -- "$recovery_tmp" "$recovery_target"; then recovery_failed=1; fi
+        rm -f -- "$recovery_tmp" || { recovery_failed=1; warn "$(np_msg '无法删除临时恢复文件：%s' 'Unable to remove temporary recovery file: %s' "$recovery_tmp")"; }
+      done
+      if ((shortcut_removed)); then
+        if [[ -f "$recovery_dir/program" ]] && ! installed_script_owned; then recovery_failed=1
+        else ln -sT -- "$INSTALL_PATH" "$SHORTCUT_PATH" || recovery_failed=1; fi
+      fi
+      if ((recovery_failed)); then
+        warn "$(np_msg '卸载未完成，补偿恢复遇到错误；未覆盖现有文件，恢复副本保留在：%s' 'Uninstall is incomplete and compensation encountered errors; existing files were not overwritten. Recovery copies remain at: %s' "$recovery_dir")"
+      else
+        warn "$(np_msg '状态清理失败，程序和重试记录已恢复；修复错误后可重试相同卸载命令。' 'State cleanup failed; the tool and retry records were restored. Fix the error and retry the same uninstall command.')"
+        rm -rf -- "$recovery_dir" || warn "$(np_msg '无法清理临时恢复副本：%s' 'Unable to remove temporary recovery copies: %s' "$recovery_dir")"
+      fi
+      return 1
+    fi
+    rm -rf -- "$recovery_dir" || warn "$(np_msg '无法清理临时恢复副本：%s' 'Unable to remove temporary recovery copies: %s' "$recovery_dir")"
     log "$(np_msg '回退已完成，程序、自有快捷命令和可识别的默认报告已清理；源码副本保留。' 'Rollback completed; the tool, its owned shortcut and recognized default reports were removed. Source copies are retained.')"
   else
     log "$(np_msg '程序、自有快捷命令和可识别的默认报告已清理；调优配置和回退备份保留。' 'The tool, its owned shortcut and recognized default reports were removed; tuning configuration and rollback backups are retained.')"
@@ -2419,7 +2483,7 @@ try:
                 except FileExistsError: pass
                 info = directory.lstat()
             if (not stat.S_ISDIR(info.st_mode) or info.st_uid not in (0, os.geteuid()) or
-                    info.st_mode & 0o022 and not info.st_mode & stat.S_ISVTX):
+                    info.st_mode & 0o022 and (directory == root or not info.st_mode & stat.S_ISVTX)):
                 raise ValueError(text('报告路径目录权限不安全：%s（权限 %04o，属主 UID %d）',
                                       'Unsafe report path directory: %s (mode %04o, owner UID %d)') %
                                  (repr(str(directory)), stat.S_IMODE(info.st_mode), info.st_uid))
@@ -2435,6 +2499,31 @@ try:
     elif op == 'cleanup':
         import errno
         flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW
+        def open_directory_chain(path):
+            descriptors, bindings = [], []
+            try:
+                descriptors.append(os.open(path.anchor, flags | os.O_DIRECTORY))
+                for part in path.parts[1:]:
+                    if part == '..':
+                        raise ValueError('parent traversal is not allowed during report cleanup')
+                    parent_fd = descriptors[-1]
+                    child_fd = os.open(part, flags | os.O_DIRECTORY, dir_fd=parent_fd)
+                    descriptors.append(child_fd)
+                    bindings.append((parent_fd, part, child_fd))
+                return descriptors, bindings
+            except BaseException:
+                for fd in reversed(descriptors):
+                    os.close(fd)
+                raise
+        def attached(bindings):
+            for parent_fd, name, child_fd in bindings:
+                entry = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+                opened = os.fstat(child_fd)
+                if not stat.S_ISDIR(entry.st_mode) or (entry.st_dev, entry.st_ino) != (opened.st_dev, opened.st_ino):
+                    raise ValueError('report directory changed before cleanup: ' + repr(name))
+        def recognized(data, kind):
+            return (isinstance(data, dict) and data.get('type') == kind and
+                    type(data.get('version')) is int and data['version'] == 1)
         def owned_json(directory_fd, name):
             try:
                 fd = os.open(name, flags | os.O_NONBLOCK, dir_fd=directory_fd)
@@ -2452,11 +2541,13 @@ try:
         for value in args:
             root = Path(value).absolute()
             try:
-                root_fd = os.open(root, flags | os.O_DIRECTORY)
+                descriptors, bindings = open_directory_chain(root)
             except FileNotFoundError:
                 continue
+            root_fd = descriptors[-1]
             try:
                 root_info = os.fstat(root_fd)
+                attached(bindings)
                 if root_info.st_uid != os.geteuid() or root_info.st_mode & 0o022:
                     raise ValueError('unsafe report cleanup directory: ' + repr(str(root)))
                 with os.scandir(root_fd) as entries:
@@ -2469,14 +2560,13 @@ try:
                             raise ValueError('unsafe report run directory: ' + repr(name))
                         marker = owned_json(run_fd, '.netpilot-report')
                         summary = None if marker else owned_json(run_fd, 'summary.json')
-                        identified = (marker == dict(type='netpilot-report-directory', version=1) or
-                                      summary is not None and summary.get('type') == 'netpilot-tune-report' and summary.get('version') == 1)
+                        identified = (recognized(marker, 'netpilot-report-directory') or
+                                      recognized(summary, 'netpilot-tune-report'))
                         if not identified:
                             continue
                         with os.scandir(run_fd) as entries:
                             files = [(entry.name, entry.stat(follow_symlinks=False)) for entry in entries]
-                        if any(filename not in ('.netpilot-report', 'before.json', 'after.json', 'summary.json') and
-                               not filename.startswith(('.summary.', '.http-report-')) for filename, _ in files):
+                        if any(filename not in ('.netpilot-report', 'before.json', 'after.json', 'summary.json') for filename, _ in files):
                             print(text('报告目录包含其他文件，已保留：', 'Report directory contains other files and was kept: ') + repr(str(root / name)), file=sys.stderr)
                             continue
                         if any(not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid() for _, info in files):
@@ -2485,12 +2575,16 @@ try:
                         # can still recognize and retry an otherwise empty run.
                         identity = '.netpilot-report' if marker else 'summary.json'
                         for filename, _ in sorted(files, key=lambda item: item[0] == identity):
+                            attached(bindings + [(root_fd, name, run_fd)])
                             os.unlink(filename, dir_fd=run_fd)
+                        attached(bindings + [(root_fd, name, run_fd)])
                     finally:
                         os.close(run_fd)
                     os.rmdir(name, dir_fd=root_fd)
+                attached(bindings)
             finally:
-                os.close(root_fd)
+                for fd in reversed(descriptors):
+                    os.close(fd)
             current = root.lstat()
             if (current.st_dev, current.st_ino) != (root_info.st_dev, root_info.st_ino):
                 raise ValueError('report directory changed during cleanup: ' + repr(str(root)))
