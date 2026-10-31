@@ -12,12 +12,17 @@ temporary = tempfile.TemporaryDirectory()
 root = Path(temporary.name)
 
 def write_measurements(folder, budget=67108864, request_sizes=None, timeout=30, parallel=False):
-    for phase, down, up, latency in [('before', 100e6, 40e6, 50), ('after', 125e6, 50e6, 40)]:
+    rates = [('before', 100e6, 40e6, 50), ('after', 125e6, 50e6, 40)]
+    if budget > 536870912:
+        rates = [('before', 10e9, 8e9, 50), ('after', 12e9, 10e9, 40)]
+    for phase, down, up, latency in rates:
         data = dict(type='netpilot-http-measurement', version=1, ok=True, phase=phase,
                     endpoint='https://speed.cloudflare.com', address='1.1.1.1', port=443,
                     node='NRT', family='IPv4', node_verified=True, connection_policy='pinned-preconnected',
                     latency_method='tcp-connect-estimate', latency_ms=latency, budget_bytes=budget,
                     reserved_bytes=budget, timeout_seconds=timeout, download_bps=down, upload_bps=up)
+        if budget > 536870912:
+            data['budget_mode'] = 'auto'
         if parallel:
             data.update(measurement_policy='parallel-http-v1', parallelism=4, connection_policy='pinned-parallel')
         for direction, rate in [('download', down), ('upload', up)]:
@@ -93,6 +98,11 @@ for json_mode in (False, True):
         assert legacy['before']['download']['request_sizes'] == [32 * 1048576]
 print('PASS: historical 32 MiB chunks remain valid for offline summary generation and report readers')
 
+legacy = json.loads(legacy_path.read_text())
+legacy.pop('budget_mode', None)
+legacy_path.write_text(json.dumps(legacy))
+assert read(legacy_path).returncode == 0
+
 maximum_path = make_summary('maximum-budget-128-requests', status='completed', stage='completed', code=0,
                             budget=1073741824, request_sizes=[2 * 1048576] * 128, timeout=120)
 maximum = json.loads(maximum_path.read_text())
@@ -108,6 +118,23 @@ for json_mode in (False, True):
     if json_mode:
         assert json.loads(result.stdout) == maximum
 print('PASS: real summary generation and report readers accept 128 chunks per direction at the 1 GiB run budget')
+
+auto_path = make_summary('auto-budget-2048-requests', status='completed', stage='completed', code=0,
+                         budget=17179869184, request_sizes=[2 * 1048576] * 2048, parallel=True)
+automatic = json.loads(auto_path.read_text())
+assert automatic['budget_mode'] == 'auto' and automatic['budget_bytes'] == 17179869184
+for phase in ('before', 'after'):
+    assert automatic[phase]['budget_mode'] == 'auto'
+    assert automatic[phase]['budget_bytes'] == automatic[phase]['reserved_bytes'] == 8589934592
+    for direction in ('download', 'upload'):
+        assert len(automatic[phase][direction]['request_sizes']) == 2048
+for json_mode in (False, True):
+    result = read(auto_path, json_mode)
+    assert result.returncode == 0, result.stderr
+    if not json_mode:
+        assert 'automatic' in result.stdout.lower() and '16GiB' in result.stdout, result.stdout
+        assert '16384.00 MiB' in result.stdout, result.stdout
+print('PASS: automatic 16 GiB cap and 2048 requests per direction are validated without transferring payload')
 
 base = json.loads(valid[12].read_text())
 failure = json.loads(valid[2].read_text())
@@ -143,13 +170,22 @@ for name, update in [
     rejected(name, parallel, update)
 print('PASS: parallel reports validate bounded batch plans and reject mixed measurement policies or changed parallelism')
 
-too_many_sizes = [2 * 1048576] * 127 + [1048576, 1048576]
-assert len(too_many_sizes) == 129 and sum(too_many_sizes) == 268435456
+for name, update in [
+    ('automatic-mode-missing', lambda d: d.pop('budget_mode')),
+    ('automatic-mode-invalid', lambda d: d.update(budget_mode='unknown')),
+    ('automatic-cap-invalid', lambda d: d.update(budget_bytes=34359738368)),
+    ('automatic-phase-mode-mismatch', lambda d: d['before'].update(budget_mode='fixed')),
+]:
+    rejected(name, automatic, update)
+print('PASS: automatic budget mode and cap must agree across the summary and measurements')
+
+too_many_sizes = [2 * 1048576] * 2047 + [1048576, 1048576]
+assert len(too_many_sizes) == 2049 and sum(too_many_sizes) == 4294967296
 folder = root / 'too-many-summary-requests' / 'run.fixture'
 folder.mkdir(parents=True)
-write_measurements(folder, 536870912, too_many_sizes, timeout=120)
+write_measurements(folder, 8589934592, too_many_sizes, parallel=True)
 result = subprocess.run(['bash', '-c', 'source "$1"; auto_report summary "${@:2}"', '_', script,
-                         str(folder), 'completed', 'completed', '0', '1073741824', 'balanced',
+                         str(folder), 'completed', 'completed', '0', '17179869184', 'balanced',
                          '0', '0', '0', 'not-needed', 'not-needed', ''],
                         capture_output=True, text=True)
 assert result.returncode != 0 and not (folder / 'summary.json').exists(), result.stdout
@@ -157,8 +193,9 @@ def oversized_schedules(value):
     for phase in ('before', 'after'):
         for direction in ('download', 'upload'):
             value[phase][direction]['request_sizes'] = too_many_sizes
-rejected('129-requests-per-direction', maximum, oversized_schedules)
-print('PASS: summary generation and both report readers reject 129 chunks with otherwise valid maximum-budget totals')
+            value[phase][direction]['request_batches'] = [too_many_sizes[i:i+4] for i in range(0, len(too_many_sizes), 4)]
+rejected('2049-requests-per-direction', automatic, oversized_schedules)
+print('PASS: summary generation and both report readers reject 2049 chunks with otherwise valid maximum-budget totals')
 
 for name, original, update in [
     ('restoration-marked-verified', failure, lambda d: d.update(configuration_state='verified')),

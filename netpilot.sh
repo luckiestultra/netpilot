@@ -1047,7 +1047,7 @@ show_menu() {
   np_msg '%b                    快捷命令: netpilot                    %b\n' '%b                  Shortcut: netpilot                  %b\n' "$GREEN" "$NC"
   printf '%b==================================================%b\n' "$YELLOW" "$NC"
   np_msg '\n常用操作\n' '\nCommon tasks\n'
-  np_msg '  9. 一键调优（自动前测/调优/复测/对比，默认128MiB）\n' '  9. One-click tuning (measure/tune/retest/compare; default 128MiB)\n'
+  np_msg '  9. 一键调优（自动采样/调优/复测，整轮最多16GiB）\n' '  9. One-click tuning (automatic sampling/tuning/retest; up to 16GiB)\n'
   np_msg ' 10. 查看最新报告\n' ' 10. View latest report\n'
   np_msg '  8. 诊断与独立测速\n' '  8. Diagnostics and separate benchmarks\n'
   np_msg '\n维护\n' '\nMaintenance\n'
@@ -1972,8 +1972,9 @@ def positive(value, high=float('inf')):
 
 # Client resource policy, not a claim about any provider's service limit.
 MAX_REQUEST_BYTES = 4 * 1048576
-MAX_REQUESTS_PER_DIRECTION = 128
+MAX_REQUESTS_PER_DIRECTION = 2048
 PARALLELISM = 4
+AUTO_PHASE_BUDGET = 8 * 1024 ** 3
 
 def publish(value):
     # Link a complete private temporary file into place without replacing any
@@ -2007,6 +2008,7 @@ def read_before(path):
             type(value.get('version')) is not int or value['version'] != 1 or
             value.get('ok') is not True or value.get('phase') != 'before' or
             value.get('endpoint') != endpoint or value.get('budget_bytes') != budget or
+            value.get('budget_mode', 'fixed') != budget_mode or
             type(value.get('budget_bytes')) is not int or
             type(value.get('timeout_seconds')) is not int or value.get('timeout_seconds') != int(raw_timeout) or
             value.get('latency_method') != 'tcp-connect-estimate' or
@@ -2239,8 +2241,9 @@ try:
     if phase not in ('before', 'after') or not re.fullmatch(r'[0-9]+', raw_budget):
         raise ValueError('invalid measurement phase or budget')
     budget = int(raw_budget)
-    if not integer(budget, 131072, 536870912):
+    if not integer(budget, 131072, AUTO_PHASE_BUDGET) or budget > 536870912 and budget != AUTO_PHASE_BUDGET:
         raise ValueError('measurement phase budget is out of range')
+    budget_mode = 'auto' if budget == AUTO_PHASE_BUDGET else 'fixed'
     if not output_name or os.path.lexists(output) or not os.path.isdir(os.path.dirname(output)):
         raise ValueError('report output must not exist and its directory must already exist')
     if (any(ord(char) < 33 or ord(char) > 126 for char in raw_endpoint) or
@@ -2266,7 +2269,7 @@ try:
         netloc += ':' + str(port)
     endpoint = scheme + '://' + netloc
     slots = {'download': budget // 2, 'upload': budget // 2}
-    report.update(endpoint=endpoint, budget_bytes=budget, timeout_seconds=int(raw_timeout),
+    report.update(endpoint=endpoint, budget_bytes=budget, budget_mode=budget_mode, timeout_seconds=int(raw_timeout),
                   latency_method='tcp-connect-estimate', connection_policy='pinned-parallel',
                   measurement_policy='parallel-http-v1', parallelism=PARALLELISM,
                   provider='cloudflare' if cloudflare else 'custom')
@@ -2395,7 +2398,8 @@ english = sys.argv[-1] == 'en'
 def text(zh, en): return en if english else zh
 # Older reports can contain larger requests; offline readers retain that
 # compatibility while keeping the number of requests bounded.
-MAX_REQUESTS_PER_DIRECTION = 128
+MAX_REQUESTS_PER_DIRECTION = 2048
+AUTO_TOTAL_BUDGET = 16 * 1024 ** 3
 def number(value, upper=1e15):
     if type(value) not in (int, float) or not math.isfinite(value) or not 0 < value <= upper:
         raise ValueError('invalid positive measurement')
@@ -2403,6 +2407,13 @@ def number(value, upper=1e15):
 def integer(value, minimum=0, maximum=2**40):
     if type(value) is not int or not minimum <= value <= maximum: raise ValueError('invalid integer')
     return value
+def budget_value(value, mode, phase=False):
+    divisor = 2 if phase else 1
+    if mode == 'auto':
+        return integer(value, AUTO_TOTAL_BUDGET // divisor, AUTO_TOTAL_BUDGET // divisor)
+    if mode == 'fixed':
+        return integer(value, 1 if phase else 1048576, 1073741824 // divisor)
+    raise ValueError('invalid measurement budget mode')
 def load(path):
     p = Path(path)
     if p.is_symlink() or p.stat().st_size > 1048576: raise ValueError('unsafe report')
@@ -2447,7 +2458,7 @@ def measurement_data(d, phase, expected_endpoint=None, budget=None, timeout=None
         raise ValueError('invalid node identity')
     if d.get('latency_method') != 'tcp-connect-estimate': raise ValueError('unexpected latency method')
     number(d['latency_ms'], 60000)
-    integer(d['budget_bytes'], 1)
+    budget_value(d['budget_bytes'], d.get('budget_mode', 'fixed'), phase=True)
     if budget is not None and d['budget_bytes'] != budget: raise ValueError('measurement budget changed')
     integer(d['reserved_bytes'], 0, d['budget_bytes'])
     parallel = 'measurement_policy' in d
@@ -2496,6 +2507,8 @@ def summary_configuration_state(data):
     if data['verified'] and data['applied']: return 'verified'
     return 'applied' if data['applied'] else 'unchanged'
 def compare(before, after):
+    if before.get('budget_mode', 'fixed') != after.get('budget_mode', 'fixed'):
+        raise ValueError('measurement budget mode changed')
     for key in ('endpoint', 'address', 'port', 'node', 'latency_method', 'budget_bytes', 'timeout_seconds'):
         if before[key] != after[key]: raise ValueError('test condition changed: ' + key)
     for key in ('family', 'connection_policy', 'node_verified', 'measurement_policy', 'parallelism'):
@@ -2512,6 +2525,14 @@ def compare(before, after):
         'causal_claim': False,
         'budget_limited': any(d[k]['quality'] == 'budget-limited' for d in (before, after) for k in ('download', 'upload')),
     }
+def print_budget(data):
+    if data.get('budget_mode', 'fixed') == 'auto':
+        print(text('预算模式：自动采样，整轮上限16GiB。', 'Budget: automatic sampling, whole-run cap 16GiB.'))
+    else:
+        print(text('预算模式：固定，整轮上限 %.0f MiB。', 'Budget: fixed, whole-run cap %.0f MiB.') % (data['budget_bytes'] / 1048576))
+    if data['status'] == 'completed':
+        payload = sum(data[p][d]['payload_bytes'] for p in ('before', 'after') for d in ('download', 'upload'))
+        print(text('已完成测试数据：%.2f MiB（协议开销另计）。', 'Completed test payload: %.2f MiB (protocol overhead is additional).') % (payload / 1048576))
 SUMMARY_CHOICES = {
     'stage': ('before', 'apply', 'verify', 'after', 'completed'),
     'profile': ('balanced', 'proxy', 'bulk'),
@@ -2561,13 +2582,15 @@ def validate_summary(data):
     elif code not in (130, 143):
         raise ValueError('cancelled flow must contain a cancellation exit code')
     comparison = data.get('comparison')
+    total = budget_value(data.get('budget_bytes'), data.get('budget_mode', 'fixed'))
     if status != 'completed':
         if comparison is not None: raise ValueError('unfinished summary cannot contain a comparison')
         return
     if not isinstance(comparison, dict): raise ValueError('completed summary has no comparison')
-    total = integer(data.get('budget_bytes'), 1048576, 1073741824)
     before = measurement_data(data.get('before'), 'before', budget=total // 2)
     after = measurement_data(data.get('after'), 'after', before['endpoint'], total // 2)
+    if before.get('budget_mode', 'fixed') != data.get('budget_mode', 'fixed'):
+        raise ValueError('summary budget mode disagrees with measurements')
     if before['reserved_bytes'] + after['reserved_bytes'] > total:
         raise ValueError('run budget exceeded')
     expected = compare(before, after)
@@ -2792,6 +2815,7 @@ try:
                 print(text('最新报告：', 'Latest report: ') + display(str(root / name / 'summary.json')))
                 print(text('报告更新：', 'Report updated: ') + datetime.fromtimestamp(info.st_mtime).astimezone().isoformat(timespec='seconds'))
                 print(text('以下为历史运行记录，不代表当前实时状态。', 'Historical run record; not the current live state.'))
+                print_budget(data)
                 for key, label in [('status', text('流程', 'Flow')), ('stage', text('阶段', 'Stage')),
                                    ('configuration_state', text('配置', 'Configuration')), ('verify_status', text('核验', 'Verification')),
                                    ('rollback_status', text('回滚', 'Rollback'))]:
@@ -2806,7 +2830,7 @@ try:
                     print(text('观测上传：%.2f → %.2f Mbps', 'Observed upload: %.2f -> %.2f Mbps') % (b['upload_bps']/1e6, a['upload_bps']/1e6))
                     print(text('TCP 建连延迟：%.3f → %.3f ms', 'TCP-connect latency: %.3f -> %.3f ms') % (b['latency_ms'], a['latency_ms']))
                     if comparison['budget_limited']:
-                        print(text('短样本受测试预算限制，不能据此判断线路峰值。', 'Short samples are budget-limited and do not establish peak bandwidth.'))
+                        print(text('部分样本时长不足3秒，不能据此判断线路峰值。', 'Some samples are shorter than 3 seconds and do not establish peak bandwidth.'))
                     if not data['changed']:
                         print(text('本轮没有修改参数，测量波动不能归因于调优。', 'No parameters changed; measurement differences cannot be attributed to tuning.'))
                 if data.get('error'):
@@ -2838,6 +2862,7 @@ try:
                     verify_status=verify_status, rollback_status=rollback_status, error=error or None,
                     before_report=str(root / 'before.json'), after_report=str(root / 'after.json'))
         data['configuration_state'] = summary_configuration_state(data)
+        data['budget_mode'] = 'auto' if int(budget) == AUTO_TOTAL_BUDGET else 'fixed'
         for phase in ('before', 'after'):
             try: data[phase] = load(root / (phase + '.json'))
             except (OSError, ValueError): data[phase] = None
@@ -2847,14 +2872,16 @@ try:
             after = measurement(root / 'after.json', 'after', before['endpoint'], before['budget_bytes'])
             if before['reserved_bytes'] + after['reserved_bytes'] > int(budget): raise ValueError('run budget exceeded')
             data['comparison'] = compare(before, after)
+        validate_summary(data)
         atomic(root / 'summary.json', data)
+        print_budget(data)
         if data['comparison'] is not None:
             c = data['comparison']; b = data['before']; a = data['after']
             print(text('观测下载：%.2f → %.2f Mbps（%+.2f%%）', 'Observed download: %.2f -> %.2f Mbps (%+.2f%%)') % (b['download_bps']/1e6, a['download_bps']/1e6, c['download_change_pct']))
             print(text('观测上传：%.2f → %.2f Mbps（%+.2f%%）', 'Observed upload: %.2f -> %.2f Mbps (%+.2f%%)') % (b['upload_bps']/1e6, a['upload_bps']/1e6, c['upload_change_pct']))
             print(text('TCP 建连延迟估计：%.3f → %.3f ms', 'TCP-connect latency estimate: %.3f -> %.3f ms') % (b['latency_ms'], a['latency_ms']))
             if not data['changed']: print(text('本轮没有修改参数，测量变化不能归因于调优。', 'No parameters changed; measurement differences cannot be attributed to tuning.'))
-            if c['budget_limited']: print(text('样本受流量预算限制，观测速率不代表线路峰值。', 'Samples are budget-limited; observed rates do not establish peak bandwidth.'))
+            if c['budget_limited']: print(text('部分样本时长不足3秒，观测速率不代表线路峰值。', 'Some samples are shorter than 3 seconds; observed rates do not establish peak bandwidth.'))
         print(text('自动报告：', 'Automatic report: ') + str(root / 'summary.json'))
     else:
         raise ValueError('unknown report operation')
@@ -2866,7 +2893,7 @@ PY
 }
 
 auto_tune() {
-  local profile=balanced budget=128 seconds=30 endpoint="$AUTO_DEFAULT_ENDPOINT" report_root="$AUTO_REPORT_ROOT" option dep
+  local profile=balanced budget=auto seconds=30 endpoint="$AUTO_DEFAULT_ENDPOINT" report_root="$AUTO_REPORT_ROOT" option dep
   local run_dir before after values bandwidth rtt total phase_budget status=failed stage=before error=''
   local changed=0 applied=0 verified=0 verify_status=not-needed rollback_status=not-needed auto_cancel_code=0 saved_traps
   local -a measured_options=()
@@ -2887,17 +2914,19 @@ auto_tune() {
     esac
   done
   case "$profile" in balanced|proxy|bulk) ;; *) warn "$(np_msg 'profile 必须是 balanced、proxy 或 bulk。' 'profile must be balanced, proxy or bulk.')"; return 2 ;; esac
-  bench_integer "$budget" 1 1024 && bench_integer "$seconds" 5 120 || {
-    warn "$(np_msg '自动调优预算须为1–1024MiB，阶段超时须为5–120秒。' 'Automatic tuning requires a 1-1024MiB budget and a 5-120 second phase timeout.')"
+  { [[ "$budget" == auto ]] || bench_integer "$budget" 1 1024; } && bench_integer "$seconds" 5 120 || {
+    warn "$(np_msg '预算须为 auto 或1–1024MiB，阶段超时须为5–120秒。' 'Budget must be auto or 1-1024MiB; phase timeout must be 5-120 seconds.')"
     return 2
   }
+  if [[ "$budget" == auto ]]; then total=$((16 * 1024 * 1048576))
+  else total=$((10#$budget * 1048576)); fi
   for dep in python3 timeout mktemp install; do
     command -v "$dep" >/dev/null 2>&1 || { warn "$(np_msg '自动调优缺少依赖：%s。' 'Missing automatic tuning dependency: %s.' "$dep")"; return 1; }
   done
   endpoint="$(auto_report endpoint "$endpoint")" || return 2
   run_dir="$(auto_report prepare "$report_root" "$STATE_DIR")" || return 1
   before="$run_dir/before.json"; after="$run_dir/after.json"
-  total=$((10#$budget * 1048576)); phase_budget=$((total / 2)); seconds=$((10#$seconds))
+  phase_budget=$((total / 2)); seconds=$((10#$seconds))
   AUTO_TUNE_ENDPOINT="$endpoint"
   saved_traps="$(trap -p INT TERM HUP)"
   trap 'auto_cancel_code=130; if [[ -n "${http_measure_pid:-}" ]]; then kill -TERM "$http_measure_pid" 2>/dev/null || true; fi' INT
@@ -2929,7 +2958,11 @@ auto_tune() {
     [[ -z "$error" ]] || warn "$error"
     return "$result"
   }
-  np_msg '自动测速目标：%s；整轮合成数据预算：%s MiB（含前后双向测试，协议开销另计）。\n' 'Automatic test endpoint: %s; whole-run synthetic payload budget: %s MiB (both directions before/after; protocol overhead is additional).\n' "$endpoint" "$budget"
+  if [[ "$budget" == auto ]]; then
+    np_msg '自动测速目标：%s；按采样时长自动确定用量，整轮测试数据最多16GiB（含前后双向，协议开销另计，并非必耗）。\n' 'Automatic test endpoint: %s; data volume follows sample duration, up to 16GiB for the complete before/after run (both directions; overhead is additional; this is a cap, not a required transfer).\n' "$endpoint"
+  else
+    np_msg '自动测速目标：%s；整轮固定预算：%s MiB（含前后双向测试，协议开销另计）。\n' 'Automatic test endpoint: %s; whole-run fixed payload budget: %s MiB (both directions before/after; protocol overhead is additional).\n' "$endpoint" "$budget"
+  fi
   np_msg '[1/4] 保存调优前测量…\n' '[1/4] Measuring the baseline...\n'
   if ! http_measure_path before "$endpoint" "$phase_budget" "$seconds" "$before" || ((auto_cancel_code)); then
     error="$(np_msg '前测失败，未修改配置。' 'Baseline measurement failed; configuration was not changed.')"
@@ -3017,7 +3050,7 @@ Usage: netpilot [--lang zh|en] [command] [options] (or bash netpilot.sh [command
   plan [--profile balanced|proxy|bulk] [--bandwidth Mbps]
        [--rtt ms | --rtt-target HOST]
                        Generate a plan without system changes; an explicit target measures latency
-  tune [--profile balanced|proxy|bulk] [--budget-mib 128] [--timeout 30]
+  tune [--profile balanced|proxy|bulk] [--budget-mib auto|1..1024] [--timeout 30]
        [--endpoint URL] [--report-dir DIR]
                        Automatically measure, back up, apply, verify, retest and compare
   apply [plan options] [--yes]  Preview, confirm, apply and persist; --yes explicitly skips confirmation
@@ -3036,7 +3069,7 @@ Usage: netpilot [--lang zh|en] [command] [options] (or bash netpilot.sh [command
   help                 Show this help
 Basic commands require Linux/Bash 4+. Benchmark dependencies are installed separately.
 Profiles: balanced = general (default); proxy = proxies/many connections, more conservative buffers; bulk = a few large transfers, larger buffer recommendations.
-Automatic tune requires Python 3 and GNU timeout; its default 128MiB payload budget covers the complete before/after run.
+Automatic tune requires Python 3 and GNU timeout. Default auto sampling stops after reaching the target duration, with a 16GiB whole-run payload cap; a numeric budget sets a fixed cap in MiB.
 Measurements start small, then use up to 4 connections; short samples retain existing buffers while basic tuning proceeds.
 Manual --rtt-target probing requires --bandwidth, ping and GNU timeout. --rtt and --rtt-target are mutually exclusive.
 First menu startup from a downloaded copy requires root; then use netpilot to reopen. Read-only commands never install automatically.
@@ -3051,7 +3084,7 @@ NetPilot — Linux VPS 网络诊断与调优
   plan [--profile balanced|proxy|bulk] [--bandwidth Mbps]
        [--rtt ms | --rtt-target HOST]
                        生成参数计划，不修改系统；指定目标时自动测延迟
-  tune [--profile balanced|proxy|bulk] [--budget-mib 128] [--timeout 30]
+  tune [--profile balanced|proxy|bulk] [--budget-mib auto|1..1024] [--timeout 30]
        [--endpoint URL] [--report-dir DIR]
                        自动前测、备份调优、核验、复测和对比，无需手填数值
   apply [同plan参数] [--yes]  预览、确认后应用并持久化；--yes显式跳过确认
@@ -3070,7 +3103,7 @@ NetPilot — Linux VPS 网络诊断与调优
   help                 显示帮助
 基础命令需要Linux/Bash4+。测速依赖按需安装，脚本不自动安装测速工具。
 配置档：balanced 通用（默认）；proxy 代理/多连接，缓冲建议更保守；bulk 少量大文件传输，缓冲建议更大。
-一键调优需 Python 3 和 GNU timeout；默认 128MiB 测试数据预算覆盖整轮前后双向测量。
+一键调优需 Python 3 和 GNU timeout；默认按采样时长自动确定用量，整轮测试数据最多16GiB；填写数字预算则按 MiB 固定限制。
 先小请求探测，再使用最多 4 个连接；样本不足时保留缓冲区，仅做基础调优。
 手动使用 --rtt-target 测延迟需同时提供 --bandwidth，并安装 ping 和 GNU timeout；--rtt 与 --rtt-target 互斥。
 从下载副本首次打开菜单需要 root；保存后用 netpilot 再次打开。只读命令不会自动安装。

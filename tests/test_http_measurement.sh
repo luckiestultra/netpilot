@@ -61,6 +61,10 @@ def tracked(method):
                 # serial collector cannot pass this rendezvous.
                 barrier.wait(timeout=2)
                 time.sleep(.3)
+            elif mode == 'auto-delay':
+                # Real requests spend time on a controlled peer; the collector
+                # must keep sampling past the former 32 MiB direction budget.
+                time.sleep(.5)
             return method(self)
         finally:
             with lock:
@@ -175,6 +179,7 @@ def valid_report(report, phase, expected_endpoint=endpoint, expected_address='12
     assert report['latency_method'] == 'tcp-connect-estimate'
     assert report['measurement_policy'] == 'parallel-http-v1'
     assert report['connection_policy'] == 'pinned-parallel' and report['parallelism'] == 4
+    assert report['budget_mode'] == ('auto' if budget == 8 * 1024**3 else 'fixed')
     assert 0 < report['latency_ms'] <= 60000
     assert 0 < report['reserved_bytes'] <= report['budget_bytes'] == budget
     for direction in ('download', 'upload'):
@@ -196,6 +201,7 @@ try:
     valid_report(before, 'before')
     assert stat.S_IMODE(before_path.stat().st_mode) == 0o600
     assert before['download']['quality'] == 'budget-limited'
+    assert before['upload']['quality'] == 'budget-limited' and before['reserved_bytes'] == budget
     assert sum(size for method, size, _ in state['requests']) <= budget
     assert state['accepted'] == before['upload']['payload_bytes']
     schedule = {d: before[d]['request_sizes'] for d in ('download', 'upload')}
@@ -274,7 +280,7 @@ try:
 
     reset('max-4mib')
     small_budget = budget
-    budget = 64 * 1048576  # The default 128 MiB run allocates 64 MiB to each phase.
+    budget = 64 * 1048576  # An explicit 128 MiB run allocates 64 MiB to each phase.
     result, capped, capped_path = run('default-phase-before')
     assert result.returncode == 0, (result.stderr.decode(), state['requests'])
     valid_report(capped, 'before')
@@ -298,7 +304,33 @@ try:
         assert capped_after[direction]['request_sizes'] == capped[direction]['request_sizes']
         assert capped_after[direction]['request_batches'] == capped[direction]['request_batches']
     budget = small_budget
-    print('PASS: default 64 MiB phases succeed against a real 4 MiB request limit with identical bidirectional schedules')
+    print('PASS: fixed 64 MiB phases succeed against a real 4 MiB request limit with identical bidirectional schedules')
+
+    reset('auto-delay')
+    budget = 8 * 1024**3
+    result, automatic, automatic_path = run('automatic-before', limit=15)
+    assert result.returncode == 0, result.stderr.decode()
+    valid_report(automatic, 'before')
+    automatic_requests = collections.Counter((method, size) for method, size, _ in state['requests'])
+    for direction in ('download', 'upload'):
+        item = automatic[direction]
+        assert item['payload_bytes'] > 32 * 1048576, item
+        assert 3 <= item['duration_seconds'] < 7 and item['quality'] == 'sampled', item
+        assert item['request_sizes'].count(65536) == 1, 'automatic sampling restarted its pilot'
+        assert item['request_batches'][0] == [65536]
+    assert automatic['reserved_bytes'] < budget // 8
+    assert 2 <= state['max_active'] <= 4
+    reset('auto-delay')
+    result, automatic_after, _ = run('automatic-after', 'after', automatic_path, limit=15)
+    assert result.returncode == 0, result.stderr.decode()
+    valid_report(automatic_after, 'after')
+    for direction in ('download', 'upload'):
+        assert automatic_after[direction]['request_batches'] == automatic[direction]['request_batches']
+    assert collections.Counter((method, size) for method, size, _ in state['requests']) == automatic_requests
+    assert automatic_after['reserved_bytes'] == automatic['reserved_bytes']
+    assert 128 * 1048576 < automatic['reserved_bytes'] + automatic_after['reserved_bytes'] < 16 * 1024**3
+    budget = small_budget
+    print('PASS: automatic sampling continues online past former limits, stops by duration and replays without restarting or consuming its full cap')
 
     # Validate a maximum-budget baseline without transferring a GiB: the local
     # server denies the first accepted request, after baseline validation.
@@ -320,17 +352,44 @@ try:
     assert denied['reserved_bytes'] == 8 * 1048576
     assert denied['download']['request_sizes'] == [2 * 1048576] * 4
     assert denied['http_error']['status'] == 403 and denied['http_error']['direction'] == 'download'
-    too_many = copy.deepcopy(maximum)
+    expanded_fixed = copy.deepcopy(maximum)
     for direction in ('download', 'upload'):
-        too_many[direction]['request_sizes'] = [2 * 1048576] * 127 + [1048576, 1048576]
-        too_many[direction]['request_batches'] = [too_many[direction]['request_sizes'][i:i+4] for i in range(0, 129, 4)]
+        expanded_fixed[direction]['request_sizes'] = [2 * 1048576] * 127 + [1048576, 1048576]
+        expanded_fixed[direction]['request_batches'] = [expanded_fixed[direction]['request_sizes'][i:i+4] for i in range(0, 129, 4)]
+    expanded_fixed_path = root / 'expanded-fixed-baseline.json'
+    expanded_fixed_path.write_text(json.dumps(expanded_fixed))
+    reset('forbidden')
+    result, expanded_denied, _ = run('expanded-fixed-baseline-after', 'after', expanded_fixed_path)
+    assert result.returncode != 0 and expanded_denied['http_error']['status'] == 403 and state['requests']
+    print('PASS: fixed-budget baseline reader retains 128 records and accepts expanded 129-record plans without transferring their payload')
+
+    budget = 8 * 1024**3
+    maximum_auto = copy.deepcopy(before)
+    maximum_auto.update(budget_mode='auto', budget_bytes=budget, reserved_bytes=budget)
+    for direction in ('download', 'upload'):
+        item = maximum_auto[direction]
+        item.update(request_sizes=[2 * 1048576] * 2048,
+                    request_batches=[[2 * 1048576] * 4 for _ in range(512)], payload_bytes=budget // 2,
+                    duration_seconds=2.0, bits_per_second=budget * 2, quality='budget-limited')
+        maximum_auto[direction + '_bps'] = item['bits_per_second']
+    maximum_auto_path = root / 'maximum-auto-baseline.json'
+    maximum_auto_path.write_text(json.dumps(maximum_auto))
+    reset('forbidden')
+    result, auto_denied, _ = run('maximum-auto-baseline-after', 'after', maximum_auto_path)
+    assert result.returncode != 0 and auto_denied['ok'] is False and state['requests']
+    assert auto_denied['http_error']['status'] == 403 and auto_denied['reserved_bytes'] == 8 * 1048576
+    assert all(method == 'GET' and size == 2 * 1048576 for method, size, _ in state['requests'])
+    too_many = copy.deepcopy(maximum_auto)
+    for direction in ('download', 'upload'):
+        too_many[direction]['request_sizes'] = [2 * 1048576] * 2047 + [1048576, 1048576]
+        too_many[direction]['request_batches'] = [too_many[direction]['request_sizes'][i:i+4] for i in range(0, 2049, 4)]
     too_many_path = root / 'too-many-baseline.json'
     too_many_path.write_text(json.dumps(too_many))
-    reset()
+    reset('forbidden')
     result, invalid, _ = run('too-many-baseline-after', 'after', too_many_path)
     assert result.returncode != 0 and invalid['ok'] is False and not state['requests']
     budget = small_budget
-    print('PASS: maximum-budget baseline reader accepts 128 requests per direction and rejects 129 before any HTTP traffic')
+    print('PASS: automatic maximum-budget baseline accepts 2048 requests per direction and rejects 2049 before any HTTP traffic')
 
     data = after_path.read_bytes()
     reset()

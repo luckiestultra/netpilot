@@ -18,7 +18,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/luckiestultra/netpilot/main/
 
 The script saves itself and opens the English menu. **Choose `9` to tune and `10` to view results.** `L` switches languages; `0` exits.
 
-Tuning measures, backs up, applies, verifies and retests automatically. No manual bandwidth, latency or report names are needed. The default whole-run payload budget is **128MiB**; protocol overhead is additional. A small initial probe is followed by measurements using up to 4 connections. Short samples trigger basic tuning while retaining existing buffers.
+Tuning measures, backs up, applies, verifies and retests automatically. No manual bandwidth, latency, data budget or report names are needed. A small probe is followed by measurements using up to 4 connections. Faster paths transfer more data until the target sample duration is reached. The **whole-run cap is 16GiB**, not a required transfer; protocol overhead is additional.
 
 Next time on the same server, run:
 
@@ -34,7 +34,7 @@ Choose main-menu `10`, or run:
 netpilot --lang en report
 ```
 
-The summary shows configuration state, measurements and the report's update time. It reads `/tmp/netpilot-reports` by default; system cleanup or a reboot may remove these temporary reports. If the latest attempt has no report yet, this may be an older record. For a custom directory, use `netpilot --lang en report --report-dir DIR`.
+The summary shows configuration state, measurements, budget mode, completed test payload and the report's update time. It reads `/tmp/netpilot-reports` by default; system cleanup or a reboot may remove these temporary reports. If the latest attempt has no report yet, this may be an older record. For a custom directory, use `netpilot --lang en report --report-dir DIR`.
 
 | Status | Meaning |
 |---|---|
@@ -117,16 +117,18 @@ Chinese is the default; menu `L` switches the current session. Use `netpilot --l
 | Option | Default | Purpose |
 |---|---|---|
 | `--profile` | `balanced` | [Choose a workload](#parameter-recommendations). |
-| `--budget-mib` | `128` | Whole-run payload; integer 1–1024MiB. |
+| `--budget-mib` | `auto` | Sample as needed, up to 16GiB for the whole run; an integer 1–1024 sets a fixed cap in MiB. |
 | `--timeout` | `30` | Per-phase timeout; integer 5–120 seconds. |
 | `--endpoint` | `https://speed.cloudflare.com` | HTTPS origin with compatible download/upload APIs; HTTP is limited to loopback addresses. |
 | `--report-dir` | `/tmp/netpilot-reports` | Must not allow other users to write; cannot be inside `/var/lib/netpilot/`. |
 
 Tests start with a **64KiB** request, then increase in batches up to **4 connections and 4MiB per request**. These are client policies, not claimed service limits. Each phase gets half the budget, split between download and upload. Each batch is reserved before sending, with no refund on failure. HTTP rejection stops new batches without automatic retry.
 
-Rates are total bytes divided by elapsed wall time, representing observed multi-connection HTTP throughput. Each baseline direction stops after reaching 3 seconds of sampling or exhausting its budget; the budget never increases automatically. Buffer estimates use measurements only when both baseline directions reach 3 seconds. Short samples remain observational, with basic tuning still applied. Sufficient duration does not prove link saturation. Latency is the average of three TCP connection times.
+Default automatic sampling progressively increases data within the same run. Each baseline direction stops after reaching 3 seconds or its directional cap, without restarting the test. The whole-run cap covers both directions before and after tuning; actual use depends on the measured path. An explicit numeric budget always remains a fixed cap.
 
-Retests reuse the baseline IP, node, parallelism, batch plan and timeout. Reports are saved automatically as `before.json`, `after.json` when available, and `summary.json`. Older serial reports remain readable but cannot be compared with parallel reports.
+Rates are total bytes divided by elapsed wall time, representing observed multi-connection HTTP throughput. Buffer estimates use measurements only when both baseline directions reach 3 seconds. If samples remain short at the cap, basic tuning proceeds while retaining buffers. Sufficient duration does not prove link saturation. Latency is the average of three TCP connection times.
+
+Retests reuse the baseline IP, node, parallelism, batch plan and timeout without extra payload. A faster retest lasting less than 3 seconds is still marked short. Reports are saved automatically as `before.json`, `after.json` when available, and `summary.json`. Older serial reports remain readable but cannot be compared with parallel reports.
 
 Baseline failure leaves settings unchanged. Apply or verification failures after this run starts writing attempt to restore the original baseline; retest failures retain verified settings. HTTP errors show the status code, download or upload direction, request size and reserved budget; menu `10` shows them again. On cancellation, check configuration and rollback states in the report.
 

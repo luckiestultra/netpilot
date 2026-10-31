@@ -59,7 +59,7 @@ chmod 0755 "$TMP/bin/sysctl"
 export PATH="$TMP/bin:$PATH"
 
 cat > "$TMP/server.py" <<'SERVER'
-import http.server, json, pathlib, sys
+import http.server, json, pathlib, sys, time
 from urllib.parse import parse_qs, urlsplit
 root = pathlib.Path(sys.argv[1])
 class Server(http.server.ThreadingHTTPServer):
@@ -89,6 +89,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.record('GET', size, mode)
             self.headers_for(0, 429)
             return
+        if mode == 'auto':
+            time.sleep(3.1)
         self.headers_for(size)
         remaining = size
         while remaining:
@@ -99,6 +101,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.record('GET', size, mode, sent=size)
     def do_POST(self):
         size = int(parse_qs(urlsplit(self.path).query)['bytes'][0])
+        mode = (root / 'mode').read_text().strip()
         assert int(self.headers['Content-Length']) == size
         received = 0
         while received < size:
@@ -106,7 +109,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if not chunk: raise RuntimeError('incomplete test upload')
             assert not chunk.strip(b'\0'), 'only synthetic data may be uploaded'
             received += len(chunk)
-        self.record('POST', size, 'ok', received=received)
+        if mode == 'auto':
+            time.sleep(3.1)
+        self.record('POST', size, mode, received=received)
         self.headers_for(0, uploaded=received)
 server = Server(('127.0.0.1', 0), Handler)
 (root / 'port').write_text(str(server.server_address[1]))
@@ -174,6 +179,7 @@ assert summary['changed'] and summary['applied'] and summary['verified']
 assert summary['configuration_state']=='verified' and summary['comparison'] is not None
 assert summary['comparison']['causal_claim'] is False
 assert summary['comparison']['budget_limited'] is True
+assert summary['budget_mode']=='fixed'
 assert stat.S_IMODE(reports.stat().st_mode)==0o700
 assert stat.S_IMODE(path.parent.stat().st_mode)==0o700
 for name in ['before.json','after.json','summary.json']:
@@ -203,6 +209,43 @@ cmp -s /etc/sysctl.d/99-netpilot.conf "$TMP/original.conf" || fail 'rollback did
 [[ ! -e /usr/local/bin/netpilot.sh && ! -e /usr/local/bin/netpilot && ! -L /usr/local/bin/netpilot ]] || fail 'automatic tune unexpectedly installed the script'
 [[ "$(sha256sum "$SCRIPT" | awk '{print $1}')" == "$source_hash" ]] || fail 'CLI changed source bytes'
 printf 'PASS: full CLI rollback restores actual parameters/configuration and preserves private automatic reports\n'
+
+printf 'auto\n' > "$TMP/mode"
+bash "$SCRIPT" --lang en tune --endpoint "$endpoint" < /dev/null > "$TMP/auto.log" 2>&1 || {
+  cat "$TMP/auto.log" >&2; fail 'default automatic-budget CLI required input or failed';
+}
+[[ "$(cat "$TMP/kernel/net.core.rmem_max")" -gt 212992 ]] || fail 'long automatic samples did not reach buffer planning'
+python3 - "$TMP" "$REPORT_ROOT" <<'PY'
+import json, pathlib, sys
+root=pathlib.Path(sys.argv[1]); reports=pathlib.Path(sys.argv[2])
+all_reports=[(path,json.loads(path.read_text())) for path in reports.glob('run.*/summary.json')]
+automatic=[(path,data) for path,data in all_reports if data.get('budget_mode')=='auto']
+assert len(automatic)==1 and len(all_reports)==3
+path,summary=automatic[0]
+assert summary['status']=='completed' and summary['stage']=='completed' and summary['exit_code']==0
+assert summary['budget_bytes']==16*1024**3 and summary['comparison']['budget_limited'] is False
+assert summary['configuration_state']=='verified' and summary['applied'] and summary['verified']
+before,after=summary['before'],summary['after']
+for measurement in (before,after):
+    assert measurement['budget_mode']=='auto' and measurement['budget_bytes']==8*1024**3
+    assert measurement['reserved_bytes']==2*65536
+    for direction in ('download','upload'):
+        assert measurement[direction]['request_batches']==[[65536]]
+        assert measurement[direction]['quality']=='sampled' and measurement[direction]['duration_seconds']>=3
+assert before['reserved_bytes']+after['reserved_bytes']==262144 < summary['budget_bytes']
+requests=[json.loads(line) for line in (root/'http-requests.jsonl').read_text().splitlines()]
+automatic_requests=[item for item in requests if item['mode']=='auto']
+assert len(automatic_requests)==4 and all(item['requested']==65536 for item in automatic_requests)
+assert sum(item['sent']+item['received'] for item in automatic_requests)==262144
+(root/'auto-completed-report').write_text(str(path))
+PY
+report_path="$(cat "$TMP/auto-completed-report")"
+report_hash="$(sha256sum "$report_path" | awk '{print $1}')"
+bash "$SCRIPT" --lang en rollback > "$TMP/auto-rollback.log" 2>&1 || fail 'automatic-budget run could not roll back'
+diff -r "$TMP/kernel" "$TMP/original-kernel" > "$TMP/auto-rollback.diff" || fail 'automatic-budget rollback changed original kernel values'
+cmp -s /etc/sysctl.d/99-netpilot.conf "$TMP/original.conf" || fail 'automatic-budget rollback did not restore the original file'
+[[ ! -e /var/lib/netpilot && -f "$report_path" && "$(sha256sum "$report_path" | awk '{print $1}')" == "$report_hash" ]] || fail 'automatic-budget recovery lost its report or retained rollback state'
+printf 'PASS: default automatic-budget CLI uses only the payload needed for real samples and preserves exact recovery\n'
 
 bash "$SCRIPT" --lang en report --json > "$TMP/default-report.json"
 python3 - "$TMP/default-report.json" "$report_path" <<'PY'

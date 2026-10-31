@@ -127,14 +127,18 @@ if scenario == 'short_sample': down, up = 400e6, 100e6
 if scenario == 'short_download': down = 400e6
 if scenario == 'short_upload': up = 400e6
 address, node = '1.1.1.1', 'NRT'
-size = budget // 2
+size = min(budget // 2, 32 * 1048576)
 report = dict(type='netpilot-http-measurement', version=1, ok=not failed,
               phase=phase, endpoint=endpoint, address=address, port=443,
-              node=node, latency_ms=latency, latency_method='tcp-connect-estimate',
+              node=node, family='IPv4', node_verified=True,
+              measurement_policy='parallel-http-v1', parallelism=4, connection_policy='pinned-parallel',
+              budget_mode='auto' if budget > 512 * 1048576 else 'fixed',
+              latency_ms=latency, latency_method='tcp-connect-estimate',
               download_bps=down, upload_bps=up, budget_bytes=budget,
-              reserved_bytes=budget, timeout_seconds=seconds)
+              reserved_bytes=size * 2, timeout_seconds=seconds)
+sizes = [min(4 * 1048576, size - offset) for offset in range(0, size, 4 * 1048576)]
 for direction, rate in [('download', down), ('upload', up)]:
-    report[direction] = dict(request_sizes=[size], payload_bytes=size,
+    report[direction] = dict(request_sizes=sizes, request_batches=[sizes[i:i+4] for i in range(0, len(sizes), 4)], payload_bytes=size,
                              duration_seconds=size*8/rate, bits_per_second=rate,
                              quality='sampled' if size*8/rate >= 3 else 'budget-limited')
 if failed: report['error'] = 'fixture measurement failure'
@@ -213,8 +217,10 @@ assert data['applied'] is True and data['verified'] is True, data
 before=json.loads(path.with_name('before.json').read_text())
 after=json.loads(path.with_name('after.json').read_text())
 assert before['ok'] is True and after['ok'] is True
-assert data['budget_bytes']==128*1048576, data
+assert data['budget_bytes']==16*1024**3 and data['budget_mode']=='auto', data
 assert before['reserved_bytes']+after['reserved_bytes']<=data['budget_bytes']
+assert before['budget_mode']==after['budget_mode']=='auto'
+assert before['reserved_bytes']+after['reserved_bytes']==128*1048576
 comparison=data['comparison']
 def field(primary, alternative):
     return comparison.get(primary,comparison.get(alternative))
@@ -225,7 +231,7 @@ lines=Path(sys.argv[2]).read_text().splitlines()
 probes=[line.split('\t') for line in lines if line.startswith('probe\t')]
 assert [p[1] for p in probes]==['before','after'],probes
 assert probes[0][2]==probes[1][2]=='https://speed.cloudflare.com',probes
-assert int(probes[0][3])==int(probes[1][3])==64*1048576,probes
+assert int(probes[0][3])==int(probes[1][3])==8*1024**3,probes
 assert probes[0][4]==probes[1][4]=='30',probes
 assert Path(probes[1][6])==path.with_name('before.json'),probes
 assert lines.index(next(x for x in lines if x.startswith('write\t')))<lines.index('verify')<lines.index(next(x for x in lines if x.startswith('probe\tafter'))),lines
@@ -246,10 +252,14 @@ test_manual_fixture_and_rollback() (
 test_automatic_command_and_bilingual_menu() (
   require_auto
   local mode
-  for mode in command zh en; do
+  for mode in command explicit-auto zh en; do
     setup_case "$mode"
-    if [[ "$mode" == command ]]; then
-      main --lang en tune < /dev/null > "$CASE_DIR/output" 2>&1 || fail 'automatic command required input or failed'
+    if [[ "$mode" == command || "$mode" == explicit-auto ]]; then
+      if [[ "$mode" == explicit-auto ]]; then
+        main --lang en tune --budget-mib auto < /dev/null > "$CASE_DIR/output" 2>&1 || fail 'explicit automatic budget failed'
+      else
+        main --lang en tune < /dev/null > "$CASE_DIR/output" 2>&1 || fail 'automatic command required input or failed'
+      fi
       [[ ! -s "$CASE_DIR/prompts" ]] || fail 'automatic command prompted for numbers or reports'
     else
       np_set_language "$mode"
@@ -283,7 +293,7 @@ test_short_samples_keep_buffers_and_apply_basic_tuning() (
         cmp -s "$KERNEL_DIR/$key" "$CASE_DIR/original-kernel/$key" || fail "short samples changed an existing buffer: $key"
       done
       before="$(summary_file)"; before="${before%/*}/before.json"
-      plan="$(auto_report plan "$before" "$AUTO_DEFAULT_ENDPOINT" 67108864 30)" || fail 'valid short samples were treated as invalid measurements'
+      plan="$(auto_report plan "$before" "$AUTO_DEFAULT_ENDPOINT" 8589934592 30)" || fail 'valid short samples were treated as invalid measurements'
       [[ -z "$plan" ]] || fail 'report planner returned path values from a short sample'
       grep -Eiq 'short|budget-limited|样本|预算受限' "$CASE_DIR/output" || fail 'short sample reason was omitted'
       grep -Eiq 'buffers|缓冲' "$CASE_DIR/output" || fail 'preserved buffers were not explained'
@@ -313,7 +323,7 @@ summary=json.loads(Path(sys.argv[1]).read_text())
 probes=[s.split('\t')for s in Path(sys.argv[2]).read_text().splitlines()if s.startswith('probe\t')]
 assert len(probes)==2 and sum(int(x[3])for x in probes)==3*1048576,probes
 assert all(x[4]=='8' for x in probes),probes
-assert summary['budget_bytes']==3*1048576
+assert summary['budget_bytes']==3*1048576 and summary['budget_mode']=='fixed'
 PY
 )
 
