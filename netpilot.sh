@@ -211,6 +211,8 @@ backup_file_once() {
 
 restore_file() {
   local path="$1" name="$2" tmp
+  # Never remove or replace an administrator's module file, even on rollback.
+  if [[ "$name" == bbr-module-file ]]; then owned_config_target "$path" || return 1; fi
   if [[ -e "$BACKUP_DIR/$name" || -L "$BACKUP_DIR/$name" ]]; then
     mkdir -p -- "$(dirname "$path")" || return 1
     tmp="$(mktemp "${path}.restore.XXXXXX")" || return 1
@@ -272,6 +274,10 @@ write_sysctl_file() {
 
 owned_config_target() {
   local path="$1"
+  if [[ -f "$path" && ! -L "$path" && "$(stat -c %h -- "$path")" != 1 ]]; then
+    warn "$(np_msg '拒绝替换有多个硬链接的配置：%s' 'Refusing to replace a configuration with multiple hard links: %s' "$path")"
+    return 1
+  fi
   if [[ -L "$path" ]] || { [[ -e "$path" ]] && { [[ ! -f "$path" ]] || ! grep -Fqx '# Managed by netpilot.sh.' "$path"; }; }; then
     warn "$(np_msg '拒绝覆盖非本工具管理的配置：%s' 'Refusing to replace unowned configuration: %s' "$path")"
     return 1
@@ -288,7 +294,9 @@ write_bbr_file() {
 
 write_bbr_module_file() {
   owned_config_target "$BBR_MODULE_FILE" || return 1
-  install -d -m 0755 "$(dirname "$BBR_MODULE_FILE")" || return 1
+  if [[ ! -d "$(dirname "$BBR_MODULE_FILE")" ]]; then
+    install -d -m 0755 "$(dirname "$BBR_MODULE_FILE")" || return 1
+  fi
   write_lines "$BBR_MODULE_FILE" 0644 '# Managed by netpilot.sh.' 'tcp_bbr'
 }
 
@@ -677,30 +685,58 @@ rollback_internal() {
 
 
 apply_tuning() {
-  local answer yes=0 arg
-  local -a plan_args=()
+  local answer yes=0 arg reprint=0 persist_bbr=0 rtt_target
+  local -a plan_args=() state_files=(sysctl-file)
   for arg in "$@"; do
     if [[ "$arg" == --yes ]]; then yes=1; else plan_args+=("$arg"); fi
   done
   adaptive_plan "${plan_args[@]}" || return $?
-  adaptive_print_plan
+  if ((yes == 0)); then
+    adaptive_print_plan
+    if ((${#SYSCTL_KEYS[@]} == 0)) && bbr_available; then
+      log "$(np_msg '当前支持的参数已满足建议，无需改动。' 'Supported parameters already meet the recommendations; no changes are needed.')"
+      return 0
+    fi
+    read -r -p "$(np_msg '按以上计划应用并持久化？[y/N] ' 'Apply and persist the plan above? [y/N] ')" answer || return 1
+    [[ "$answer" =~ ^[Yy]$ ]] || { log "$(np_msg '已取消。' Cancelled.)"; return 0; }
+  fi
+  if [[ "${AUTO_TUNE_ACTIVE:-0}" == 1 ]] && ((${auto_cancel_code:-0})); then return "$auto_cancel_code"; fi
+  if ! bbr_available; then
+    log "$(np_msg '正在尝试加载当前内核已有的 BBR 模块…' 'Trying to load the BBR module supplied with the current kernel...')"
+    if load_bbr_module; then
+      # Rebuild from resolved inputs without repeating an RTT probe.
+      rtt_target="$PLAN_RTT_TARGET"
+      plan_args=(--profile "$PLAN_PROFILE")
+      if [[ -n "$PLAN_BANDWIDTH" ]]; then plan_args+=(--bandwidth "$PLAN_BANDWIDTH" --rtt "$PLAN_RTT"); fi
+      adaptive_plan "${plan_args[@]}" || return $?
+      PLAN_RTT_TARGET="$rtt_target"
+      reprint=1
+    else
+      warn "$(np_msg 'BBR 未启用，继续处理其他受支持参数；不安装或更换内核。' 'BBR was not enabled; continuing with other supported parameters without installing or replacing the kernel.')"
+    fi
+  fi
+  if ((yes || reprint)); then adaptive_print_plan applying; fi
   if [[ "${AUTO_TUNE_ACTIVE:-0}" == 1 ]] && ((${auto_cancel_code:-0})); then return "$auto_cancel_code"; fi
   if ((${#SYSCTL_KEYS[@]} == 0)); then
     log "$(np_msg '当前支持的参数已满足建议，无需改动。' 'Supported parameters already meet the recommendations; no changes are needed.')"
     return 0
   fi
-  if ((yes == 0)); then
-    read -r -p "$(np_msg '按以上计划应用并持久化？[y/N] ' 'Apply and persist the plan above? [y/N] ')" answer || return 1
-    [[ "$answer" =~ ^[Yy]$ ]] || { log "$(np_msg '已取消。' Cancelled.)"; return 0; }
+  if [[ "${SYSCTL_TARGETS[net.ipv4.tcp_congestion_control]:-}" == bbr ]]; then
+    owned_config_target "$BBR_MODULE_FILE" || return 1
+    persist_bbr=1
+    state_files+=(bbr-module-file)
   fi
   NIC_IFACE="$(default_interface || true)"
-  prepare_state sysctl-file || return 1
+  prepare_state "${state_files[@]}" || return 1
   if [[ "${AUTO_TUNE_ACTIVE:-0}" == 1 ]]; then
     ((${auto_cancel_code:-0} == 0)) || return "$auto_cancel_code"
     AUTO_TUNE_WRITING=1
   fi
   install -d -m 0755 /etc/sysctl.d || { transaction_failed "$(np_msg '无法创建 sysctl 目录。' 'Cannot create sysctl directory.')"; return 1; }
   write_sysctl_file || { transaction_failed "$(np_msg '无法保存计划参数。' 'Cannot persist planned parameters.')"; return 1; }
+  if ((persist_bbr)); then
+    write_bbr_module_file || { transaction_failed "$(np_msg '无法保存 BBR 模块配置。' 'Cannot persist BBR module.')"; return 1; }
+  fi
   apply_sysctl_values || { transaction_failed "$(np_msg '无法应用或核验计划参数。' 'Cannot apply or verify planned parameters.')"; return 1; }
   log "$(np_msg '计划已应用且读回一致；后续可用 verify 检查配置漂移。' 'Plan applied and read back consistently; use verify to check for later configuration drift.')"
 }
@@ -718,6 +754,9 @@ apply_ipv4_preference_only() {
 }
 
 apply_bbr_only() {
+  owned_config_target "$BBR_FILE" || return 1
+  owned_config_target "$BBR_MODULE_FILE" || return 1
+  owned_config_target "$SYSCTL_FILE" || return 1
   load_bbr_module || return 1
   SYSCTL_KEYS=(net.core.default_qdisc net.ipv4.tcp_congestion_control)
   SYSCTL_TARGETS=([net.core.default_qdisc]=fq [net.ipv4.tcp_congestion_control]=bbr)
@@ -1314,7 +1353,7 @@ adaptive_plan() {
     adaptive_add_change net.ipv4.tcp_congestion_control bbr "$(np_msg '当前内核已提供 BBR；代际版本未确认。' 'BBR is available in this kernel; its generation is not established.')"
     adaptive_add_change net.core.default_qdisc fq "$(np_msg '设置新建队列的默认值；不会替换当前网卡队列。' 'Set the default for new queues; existing interface queues are not replaced.')"
   else
-    PLAN_NOTES+=("$(np_msg '当前内核尚未提供 BBR；只读规划不加载模块或安装内核。' 'BBR is not currently available; read-only planning does not load modules or install kernels.')")
+    PLAN_NOTES+=("$(np_msg 'BBR 尚未出现在已加载算法中；应用仅尝试内核自带模块，不安装或更换内核。' 'BBR is absent from loaded algorithms; applying only tries the kernel-supplied module, without installing or replacing kernels.')")
   fi
   adaptive_add_change net.ipv4.tcp_moderate_rcvbuf 1 "$(np_msg '保留接收缓冲区自动调节能力。' 'Preserve receive-buffer autotuning.')"
   if [[ -z "$PLAN_BANDWIDTH" ]]; then
@@ -1347,7 +1386,7 @@ adaptive_plan() {
 }
 
 adaptive_print_plan() {
-  local key note
+  local key note mode="${1:-preview}"
   np_msg '配置档：%s | 有效内存：%s bytes\n' 'Profile: %s | Effective memory: %s bytes\n' "$PLAN_PROFILE" "$PLAN_MEMORY_BYTES"
   if [[ -n "$PLAN_BANDWIDTH" ]]; then
     if [[ "${AUTO_TUNE_ACTIVE:-0}" == 1 ]]; then
@@ -1364,7 +1403,7 @@ adaptive_print_plan() {
   done
   if (( ${#SYSCTL_KEYS[@]} == 0 )); then np_msg '没有需要修改的支持参数。\n' 'No supported parameters need changes.\n'; fi
   for note in "${PLAN_NOTES[@]}"; do np_msg '说明：%s\n' 'Note: %s\n' "$note"; done
-  np_msg '以上仅为计划，尚未应用。\n' 'This is a plan only; not applied.\n'
+  if [[ "$mode" == preview ]]; then np_msg '以上仅为计划，尚未应用。\n' 'This is a plan only; not applied.\n'; fi
 }
 
 adaptive_show_plan() {

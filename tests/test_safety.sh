@@ -37,6 +37,7 @@ test_rollback_retains_failed_backup() (
 
 test_failed_apply_never_succeeds() (
   STATE_DIR="$TEST_DIR/apply"; mkdir -p "$STATE_DIR"
+  BBR_FILE="$STATE_DIR/bbr.conf"; BBR_MODULE_FILE="$STATE_DIR/modules.conf"; SYSCTL_FILE="$STATE_DIR/sysctl.conf"
   load_bbr_module() { :; }; build_targets() { :; }; default_interface() { printf eth0; }
   prepare_state() { :; }; install() { :; }; write_bbr_file() { return 1; }
   write_bbr_module_file() { :; }; sysctl_supported() { return 0; }; sysctl() { :; }

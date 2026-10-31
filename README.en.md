@@ -20,6 +20,8 @@ The script saves itself and opens the English menu. **Choose `9` to tune and `10
 
 Tuning measures, backs up, applies, verifies and retests automatically. No manual bandwidth, latency, data budget or report names are needed. A small probe is followed by measurements using up to 4 connections. Faster paths transfer more data until the target sample duration is reached. The **whole-run cap is 16GiB**, not a required transfer; protocol overhead is additional.
 
+Applying tries the BBR module supplied with the current kernel. If loading succeeds, it enables BBR and default FQ; it does not install or replace kernels. If loading fails, it reports the reason and continues with other supported parameters.
+
 Next time on the same server, run:
 
 ```bash

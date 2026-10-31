@@ -5,7 +5,7 @@ SCRIPT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)/netpilot.sh"
 source <(sed -n '/^# BEGIN I18N$/,/^# END I18N$/p' "$SCRIPT")
 TMP="$(mktemp -d)"
 trap 'rm -rf -- "$TMP"' EXIT
-for fn in backup_file backup_file_once restore_file; do
+for fn in backup_file backup_file_once restore_file owned_config_target; do
   # shellcheck disable=SC1090
   source <(sed -n "/^${fn}() {/,/^}/p" "$SCRIPT")
 done

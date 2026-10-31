@@ -78,8 +78,47 @@ test_existing_ipv4_preference_does_not_claim_file() (
   [[ ! -e "$STATE_DIR" ]] || fail 'already-configured no-op created a rollback claim'
 )
 
+
+test_bbr_module_restore_preserves_new_admin_file() (
+  setup concurrent-module
+  prepare_state bbr-module-file
+  printf '# Administrator file created after the snapshot\n' > "$BBR_MODULE_FILE"
+  if restore_file "$BBR_MODULE_FILE" bbr-module-file; then fail 'rollback accepted deletion of a new administrator file'; fi
+  [[ "$(cat "$BBR_MODULE_FILE")" == '# Administrator file created after the snapshot' ]] || fail 'rollback removed a concurrent administrator file'
+  [[ -f "$BACKUP_DIR/bbr-module-file.missing" ]] || fail 'failed restore lost its recovery record'
+)
+
+test_bbr_module_restore_rejects_unowned_hardlink() (
+  setup identical-module
+  printf '# Administrator module configuration\n' > "$TMP/identical-module/admin"
+  ln "$TMP/identical-module/admin" "$BBR_MODULE_FILE"
+  prepare_state bbr-module-file
+  local inode
+  inode="$(stat -c %i "$BBR_MODULE_FILE")"
+  if restore_file "$BBR_MODULE_FILE" bbr-module-file; then fail 'rollback claimed ownership of an unowned hardlink'; fi
+  [[ "$(stat -c %i "$BBR_MODULE_FILE")" == "$inode" ]] || fail 'restore unnecessarily replaced an unchanged hardlink'
+)
+
+test_existing_module_directory_permissions_are_preserved() (
+  setup module-permissions
+  chmod 0700 "$(dirname "$BBR_MODULE_FILE")"
+  write_bbr_module_file || fail 'could not write module configuration'
+  [[ "$(stat -c %a "$(dirname "$BBR_MODULE_FILE")")" == 700 ]] || fail 'writing module configuration reset existing directory permissions'
+)
+
+
+test_managed_module_hardlink_is_rejected() (
+  setup managed-hardlink
+  printf '# Managed by netpilot.sh.\ntcp_bbr\n' > "$TMP/managed-hardlink/admin"
+  ln "$TMP/managed-hardlink/admin" "$BBR_MODULE_FILE"
+  local inode
+  inode="$(stat -c %i "$BBR_MODULE_FILE")"
+  if write_bbr_module_file; then fail 'a multiply-linked managed module file was replaced'; fi
+  [[ "$(stat -c %i "$BBR_MODULE_FILE")" == "$inode" ]] || fail 'managed module file lost its hardlink'
+)
+
 failures=0
-for test in test_existing_ipv4_preference_does_not_claim_file test_sysctl_only_never_restores_untouched_files test_no_file_operation_never_takes_config_ownership test_recorded_metadata_restores_owned_file test_unowned_bbr_file_is_preserved test_bbr_module_symlink_is_preserved; do
+for test in test_existing_ipv4_preference_does_not_claim_file test_sysctl_only_never_restores_untouched_files test_no_file_operation_never_takes_config_ownership test_recorded_metadata_restores_owned_file test_unowned_bbr_file_is_preserved test_bbr_module_symlink_is_preserved test_bbr_module_restore_preserves_new_admin_file test_bbr_module_restore_rejects_unowned_hardlink test_existing_module_directory_permissions_are_preserved test_managed_module_hardlink_is_rejected; do
   if "$test"; then printf 'PASS: %s\n' "$test"; else failures=$((failures + 1)); fi
 done
 [[ "$failures" == 0 ]]

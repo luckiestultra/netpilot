@@ -199,13 +199,15 @@ test_apply_command_rejects_invalid_options() (
   local variant
   local -a args=()
   for variant in profile path unknown; do
-    setup_case "invalid-$variant"
+    setup_unloaded_bbr_case "invalid-$variant"
+    modprobe() { printf 'called\n' >> "$CASE_DIR/module-calls"; }
     case "$variant" in
       profile) args=(--profile magic) ;;
       path) args=(--bandwidth 100) ;;
       unknown) args=(--unknown) ;;
     esac
     if main --lang en apply --yes "${args[@]}" < /dev/null > "$CASE_DIR/output" 2>&1; then fail "apply accepted invalid $variant options"; fi
+    [[ ! -s "$CASE_DIR/module-calls" ]] || fail 'invalid input loaded a kernel module'
     grep -Eq 'profile must be|Provide both|Unknown option' "$CASE_DIR/output" || fail 'invalid tune options did not reach the plan validator'
     [[ ! -s "$CASE_DIR/prompts" && ! -s "$CASE_DIR/writes" && ! -e "$STATE_DIR" ]] || fail 'invalid tune options prompted or changed state'
     diff -r "$KERNEL_DIR" "$CASE_DIR/original-kernel" > "$CASE_DIR/kernel-diff" || fail 'invalid tune options changed kernel values'
@@ -213,8 +215,94 @@ test_apply_command_rejects_invalid_options() (
   done
 )
 
+
+# Match a stock VPS whose BBR module exists but is not loaded, and whose
+# buffers already exceed the measured recommendation.
+setup_unloaded_bbr_case() {
+  setup_case "$1"
+  printf 'reno cubic\n' > "$KERNEL_DIR/net.ipv4.tcp_available_congestion_control"
+  printf '1\n' > "$KERNEL_DIR/net.ipv4.tcp_moderate_rcvbuf"
+  printf '4194304\n' > "$KERNEL_DIR/net.core.rmem_max"
+  printf '4194304\n' > "$KERNEL_DIR/net.core.wmem_max"
+  cp -a "$KERNEL_DIR/." "$CASE_DIR/original-kernel/"
+  : > "$CASE_DIR/module-calls"
+}
+
+test_apply_loads_installed_bbr() (
+  local language
+  for language in zh en; do
+    setup_unloaded_bbr_case "unloaded-$language"
+    np_set_language "$language"
+    modprobe() {
+      [[ "$*" == tcp_bbr ]] || fail 'unexpected module requested'
+      printf 'called\n' >> "$CASE_DIR/module-calls"
+      printf 'reno cubic bbr\n' > "$KERNEL_DIR/net.ipv4.tcp_available_congestion_control"
+    }
+    apply_tuning --yes --bandwidth 1531 --rtt 1.224 < /dev/null > "$CASE_DIR/output" 2>&1 || fail 'application with an installed BBR module failed'
+    [[ "$(wc -l < "$CASE_DIR/module-calls")" == 1 ]] || fail 'apply skipped the installed BBR module'
+    [[ "$(cat "$KERNEL_DIR/net.ipv4.tcp_congestion_control")" == bbr ]] || fail 'apply did not enable newly available BBR'
+    [[ "$(cat "$KERNEL_DIR/net.core.default_qdisc")" == fq ]] || fail 'apply did not select default FQ'
+    grep -qx tcp_bbr "$BBR_MODULE_FILE" || fail 'BBR module is not persisted for boot'
+    grep -qx 'net.ipv4.tcp_congestion_control=cubic' "$STATE_DIR/original-values" || fail 'original algorithm was not backed up'
+    grep -qx 'net.core.default_qdisc=fq_codel' "$STATE_DIR/original-values" || fail 'original default queue was not backed up'
+    ! grep -Eq '以上仅为计划|This is a plan only' "$CASE_DIR/output" || fail 'application prints a preview-only footer'
+    verify_tuning > "$CASE_DIR/verify" || fail 'new BBR configuration failed read-back verification'
+    run_mutation rollback_tuning > "$CASE_DIR/rollback" 2>&1 || fail 'new BBR configuration could not be restored'
+    [[ "$(cat "$KERNEL_DIR/net.ipv4.tcp_congestion_control")" == cubic ]] || fail 'rollback did not restore cubic'
+    [[ "$(cat "$KERNEL_DIR/net.core.default_qdisc")" == fq_codel ]] || fail 'rollback did not restore the default queue'
+    [[ ! -e "$BBR_MODULE_FILE" ]] || fail 'rollback retained newly created module persistence'
+  done
+)
+
+test_cancel_does_not_load_bbr() (
+  setup_unloaded_bbr_case unloaded-cancel
+  modprobe() { printf 'called\n' >> "$CASE_DIR/module-calls"; }
+  apply_tuning <<< n > "$CASE_DIR/output" 2>&1 || fail 'cancel failed'
+  [[ ! -s "$CASE_DIR/module-calls" && ! -s "$CASE_DIR/writes" && ! -e "$STATE_DIR" ]] || fail 'cancel loaded a module or wrote settings'
+)
+
+test_unavailable_bbr_keeps_basic_tuning() (
+  setup_unloaded_bbr_case unloaded-unavailable
+  printf '0\n' > "$KERNEL_DIR/net.ipv4.tcp_moderate_rcvbuf"
+  modprobe() { printf 'called\n' >> "$CASE_DIR/module-calls"; return 1; }
+  apply_tuning --yes < /dev/null > "$CASE_DIR/output" 2>&1 || fail 'unavailable BBR blocked supported basic tuning'
+  [[ "$(wc -l < "$CASE_DIR/module-calls")" == 1 ]] || fail 'BBR was never attempted'
+  [[ "$(cat "$KERNEL_DIR/net.ipv4.tcp_congestion_control")" == cubic ]] || fail 'unavailable BBR changed the algorithm'
+  [[ "$(cat "$KERNEL_DIR/net.core.default_qdisc")" == fq_codel ]] || fail 'unavailable BBR changed the default queue'
+  [[ "$(cat "$KERNEL_DIR/net.ipv4.tcp_moderate_rcvbuf")" == 1 ]] || fail 'supported basic tuning was skipped'
+  [[ ! -e "$BBR_MODULE_FILE" ]] || fail 'unavailable module was persisted'
+  grep -Eq '无法加载|Cannot load' "$CASE_DIR/output" || fail 'module failure was hidden'
+)
+
+
+test_module_persistence_failure_restores() (
+  setup_unloaded_bbr_case unloaded-file-conflict
+  printf '# Administrator module configuration\n' > "$CASE_DIR/admin-module"
+  ln "$CASE_DIR/admin-module" "$BBR_MODULE_FILE"
+  local inode
+  inode="$(stat -c %i "$BBR_MODULE_FILE")"
+  modprobe() { printf 'reno cubic bbr\n' > "$KERNEL_DIR/net.ipv4.tcp_available_congestion_control"; }
+  if apply_tuning --yes > "$CASE_DIR/output" 2>&1; then fail 'unowned module configuration was overwritten'; fi
+  [[ "$(cat "$BBR_MODULE_FILE")" == '# Administrator module configuration' ]] || fail 'unowned module configuration was changed'
+  [[ "$(stat -c %i "$BBR_MODULE_FILE")" == "$inode" ]] || fail 'failed application replaced an unowned module inode'
+  [[ ! -e "$STATE_DIR" ]] || fail 'unowned module configuration was claimed by recovery state'
+  [[ "$(cat "$KERNEL_DIR/net.ipv4.tcp_congestion_control")" == cubic ]] || fail 'failed persistence changed the algorithm'
+  [[ "$(cat "$KERNEL_DIR/net.core.default_qdisc")" == fq_codel ]] || fail 'failed persistence changed the default queue'
+  cmp -s "$SYSCTL_FILE" "$CASE_DIR/original.conf" || fail 'failed module persistence left a rewritten sysctl file'
+)
+
+
+test_advanced_bbr_preflight_preserves_admin_symlink() (
+  setup_case advanced-admin-module
+  printf '# Administrator module configuration\n' > "$CASE_DIR/admin-module"
+  ln -s "$CASE_DIR/admin-module" "$BBR_MODULE_FILE"
+  if apply_bbr_only > "$CASE_DIR/output" 2>&1; then fail 'advanced BBR accepted an administrator symlink'; fi
+  [[ -L "$BBR_MODULE_FILE" && ! -e "$STATE_DIR" && ! -s "$CASE_DIR/writes" ]] || fail 'advanced BBR claimed or modified an unowned module file'
+  cmp -s "$SYSCTL_FILE" "$CASE_DIR/original.conf" || fail 'advanced BBR preflight changed sysctl configuration'
+)
+
 failures=0
-for test in test_bilingual_default_application test_manual_tuning_retained test_manual_failure_recovers test_apply_command_defaults_and_language test_apply_command_forwards_plan_options test_apply_command_rejects_invalid_options; do
+for test in test_bilingual_default_application test_manual_tuning_retained test_manual_failure_recovers test_apply_command_defaults_and_language test_apply_command_forwards_plan_options test_apply_command_rejects_invalid_options test_apply_loads_installed_bbr test_cancel_does_not_load_bbr test_unavailable_bbr_keeps_basic_tuning test_module_persistence_failure_restores test_advanced_bbr_preflight_preserves_admin_symlink; do
   if "$test"; then printf 'PASS: %s\n' "$test"; else failures=$((failures + 1)); fi
 done
 [[ "$failures" == 0 ]]

@@ -56,7 +56,7 @@ netpilot tune
 - 新测量的 `measurement_policy` 为 `parallel-http-v1`，`connection_policy` 为 `pinned-parallel`，`parallelism` 为 4；方向字段 `request_batches` 展平后必须与 `request_sizes` 一致。复测固定前测 IP、节点、并发数、分批计划及超时；条件不符拒绝比较。
 - 每方向最多 2048 条请求记录；离线读取兼容旧串行报告及较大的旧单次请求，但串并行不能混比。预算模式为 `budget_mode: auto|fixed`，旧报告缺少该字段按固定模式解释；自动模式仅接受上述固定安全上限。菜单 `10` 区分预算上限与测试数据，`budget_bytes` 始终是上限。未完成运行只显示有完整、非负整数指标的已记录数据，并注明可能不完整；指标缺失/损坏显示不可用，不填零。收到非 200 响应时，`http_error` 保存状态码、方向、请求字节数和阶段预扣预算；网络中断不猜测状态码。
 
-仅在内核已提供时建议 BBR，不能凭名称判断代际；默认 FQ 不代表所有当前网卡队列都已切换。基础调优保留 `tcp_mem`、ECN、TFO、重试、TIME_WAIT、地址策略和初始缓冲，不改 limits/MSS、Xray 或 3x-ui 入站。ring/RPS 是独立高级功能。
+`plan` 只查看已加载的算法，不加载模块；`apply` 和一键调优会尝试加载当前内核已有的 `tcp_bbr` 模块，成功后规划 BBR 与默认 FQ，并保存开机加载配置。加载失败时明确提示并继续其他支持的参数，不安装或更换内核。回滚恢复参数和受管文件，不强制卸载已加载模块。不能凭 BBR 名称判断代际；默认 FQ 不代表所有当前网卡队列都已切换。基础调优保留 `tcp_mem`、ECN、TFO、重试、TIME_WAIT、地址策略和初始缓冲，不改 limits/MSS、Xray 或 3x-ui 入站。ring/RPS 是独立高级功能。
 
 ## 命令与手动模式
 

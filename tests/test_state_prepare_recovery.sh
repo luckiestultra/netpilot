@@ -6,7 +6,7 @@ TMP="$(mktemp -d)"
 trap 'command rm -rf -- "$TMP"' EXIT
 # shellcheck source=/dev/null
 source <(sed -n '/^# BEGIN I18N$/,/^# END I18N$/p' "$SCRIPT")
-for fn in backup_file backup_file_once restore_file save_original_values managed_file_path prepare_state remove_state_files rollback_internal rollback_tuning restore_rps restore_nic_ring restore_original_values remove_mss_rule sysctl_matches normalize_sysctl_value; do
+for fn in backup_file backup_file_once restore_file owned_config_target save_original_values managed_file_path prepare_state remove_state_files rollback_internal rollback_tuning restore_rps restore_nic_ring restore_original_values remove_mss_rule sysctl_matches normalize_sysctl_value; do
   # shellcheck source=/dev/null
   source <(sed -n "/^${fn}() {/,/^}/p" "$SCRIPT")
 done
@@ -82,7 +82,12 @@ test_file_only_backups_work_with_normal_rollback() (
       setup
       mkdir -p "$BACKUP_DIR"
       target="$(managed_file_path "$name")" || return 1
-      printf '# changed configuration\n' > "$target"
+      # Module recovery targets a file actually written by NetPilot.
+      if [[ "$name" == bbr-module-file ]]; then
+        printf '# Managed by netpilot.sh.\ntcp_bbr\n' > "$target"
+      else
+        printf '# changed configuration\n' > "$target"
+      fi
       if [[ "$kind" == existing ]]; then
         printf '# original %s\n' "$name" > "$BACKUP_DIR/$name"
         cp -a "$BACKUP_DIR/$name" "$CASE_DIR/expected-file"

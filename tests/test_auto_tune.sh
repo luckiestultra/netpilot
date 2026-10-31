@@ -585,8 +585,48 @@ assert d.get('configuration_state') not in ('unchanged','restored','not-applied'
 PY
 )
 
+
+test_unloaded_bbr_in_bilingual_menu() (
+  local language
+  for language in zh en; do
+    setup_case "unloaded-menu-$language"
+    printf 'reno cubic\n' > "$KERNEL_DIR/net.ipv4.tcp_available_congestion_control"
+    printf '1\n' > "$KERNEL_DIR/net.ipv4.tcp_moderate_rcvbuf"
+    printf '4194304\n' > "$KERNEL_DIR/net.core.rmem_max"
+    printf '4194304\n' > "$KERNEL_DIR/net.core.wmem_max"
+    modprobe() {
+      [[ "$*" == tcp_bbr ]] || fail 'unexpected module'
+      [[ "$(grep -c '^probe' "$CASE_DIR/trace")" == 1 && ! -s "$CASE_DIR/writes" ]] || fail 'module loading must follow the baseline and precede application'
+      printf 'module\n' >> "$CASE_DIR/trace"
+      printf 'reno cubic bbr\n' > "$KERNEL_DIR/net.ipv4.tcp_available_congestion_control"
+    }
+    np_set_language "$language"
+    menu < <(printf '9\n10\n0\n') > "$CASE_DIR/output" 2>&1 || fail 'unloaded BBR broke the automatic menu workflow'
+    [[ "$(wc -l < "$CASE_DIR/prompts")" == 3 ]] || fail 'automatic tuning required an extra answer'
+    [[ "$(grep -c '^module$' "$CASE_DIR/trace")" == 1 ]] || fail 'automatic tuning skipped the BBR module'
+    assert_basic_applied
+    assert_completed_report
+    grep -qx tcp_bbr "$BBR_MODULE_FILE" || fail 'automatic tuning did not persist BBR loading'
+    ! grep -Eq '以上仅为计划|This is a plan only' "$CASE_DIR/output" || fail 'automatic menu prints a preview-only footer'
+    run_mutation rollback_tuning > "$CASE_DIR/rollback" 2>&1 || fail 'automatic BBR configuration could not be rolled back'
+    [[ "$(cat "$KERNEL_DIR/net.ipv4.tcp_congestion_control")" == cubic ]] || fail 'automatic rollback did not restore cubic'
+    [[ "$(cat "$KERNEL_DIR/net.core.default_qdisc")" == fq_codel ]] || fail 'automatic rollback did not restore default FQ-CoDel'
+    [[ ! -e "$BBR_MODULE_FILE" ]] || fail 'automatic rollback retained its module-loading file'
+  done
+)
+
+test_failed_baseline_does_not_load_bbr() (
+  setup_case unloaded-baseline-failure
+  printf 'reno cubic\n' > "$KERNEL_DIR/net.ipv4.tcp_available_congestion_control"
+  cp "$KERNEL_DIR/net.ipv4.tcp_available_congestion_control" "$CASE_DIR/original-kernel/net.ipv4.tcp_available_congestion_control"
+  AUTO_SCENARIO=before_failure
+  modprobe() { fail 'failed baseline must not load any module'; }
+  if main tune < /dev/null > "$CASE_DIR/output" 2>&1; then fail 'failed baseline claimed completion'; fi
+  assert_no_changes
+)
+
 failures=0
-for test in test_manual_fixture_and_rollback test_automatic_command_and_bilingual_menu test_short_samples_keep_buffers_and_apply_basic_tuning test_automatic_options_and_budget test_invalid_options_are_zero_traffic test_baseline_failures_never_apply test_application_and_verification_failures_restore test_post_failures_keep_verified_settings test_no_change_still_compares test_observed_regression_does_not_force_rollback test_repeated_runs_preserve_reports_and_first_backup test_report_paths_preserve_existing_data test_report_paths_cannot_enter_tuning_state test_cancel_does_not_report_success test_noop_cancellation_preserves_previous_tuning test_cancelled_apply_with_failed_rollback_reports_uncertainty; do
+for test in test_manual_fixture_and_rollback test_automatic_command_and_bilingual_menu test_short_samples_keep_buffers_and_apply_basic_tuning test_automatic_options_and_budget test_invalid_options_are_zero_traffic test_baseline_failures_never_apply test_application_and_verification_failures_restore test_post_failures_keep_verified_settings test_no_change_still_compares test_observed_regression_does_not_force_rollback test_repeated_runs_preserve_reports_and_first_backup test_report_paths_preserve_existing_data test_report_paths_cannot_enter_tuning_state test_cancel_does_not_report_success test_noop_cancellation_preserves_previous_tuning test_cancelled_apply_with_failed_rollback_reports_uncertainty test_unloaded_bbr_in_bilingual_menu test_failed_baseline_does_not_load_bbr; do
   if "$test"; then printf 'PASS: %s\n' "$test"
   else
     failures=$((failures+1))

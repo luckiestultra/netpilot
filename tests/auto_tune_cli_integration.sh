@@ -258,3 +258,47 @@ grep -qx 'Full data: netpilot --lang en report --json' "$TMP/menu-report.log" ||
 [[ "$(stat -c '%a:%u:%g' /var/log)" == "$log_identity" ]] || fail 'automatic tuning changed /var/log permissions or ownership'
 [[ "$(sha256sum /var/log/netpilot/legacy-report | awk '{print $1}')" == "$legacy_hash" ]] || fail 'automatic tuning changed a legacy report'
 printf 'PASS: default report and menu 10 work with group-writable /var/log; system permissions and legacy reports are preserved\n'
+
+
+# Exercise the real CLI with an installed-but-unloaded kernel capability.
+# Only the module/kernel boundary is simulated; HTTP, files, dispatcher,
+# planning, verification, reports and rollback use the production code.
+printf 'ok\n' > "$TMP/mode"
+printf 'reno cubic\n' > "$TMP/kernel/net.ipv4.tcp_available_congestion_control"
+cp -a "$TMP/kernel" "$TMP/cold-original-kernel"
+export NETPILOT_TEST_MODULE_LOG="$TMP/module-calls"
+cat > "$TMP/bin/modprobe" <<'MODPROBE'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+[[ "$*" == tcp_bbr ]] || exit 2
+printf 'tcp_bbr\n' >> "$NETPILOT_TEST_MODULE_LOG"
+printf 'reno cubic bbr\n' > "$NETPILOT_TEST_KERNEL/net.ipv4.tcp_available_congestion_control"
+MODPROBE
+chmod 0755 "$TMP/bin/modprobe"
+bash "$SCRIPT" --lang en tune --endpoint "$endpoint" --budget-mib 1 < /dev/null > "$TMP/cold-bbr.log" 2>&1 || {
+  cat "$TMP/cold-bbr.log" >&2; fail 'real CLI skipped or failed an installed but unloaded BBR module';
+}
+[[ "$(wc -l < "$NETPILOT_TEST_MODULE_LOG")" == 1 ]] || fail 'real CLI did not load exactly the required module'
+[[ "$(cat "$TMP/kernel/net.ipv4.tcp_congestion_control")" == bbr ]] || fail 'real CLI failed to enable BBR'
+[[ "$(cat "$TMP/kernel/net.core.default_qdisc")" == fq ]] || fail 'real CLI failed to select default FQ'
+grep -qx tcp_bbr /etc/modules-load.d/netpilot.conf || fail 'real CLI did not save module loading for boot'
+bash "$SCRIPT" --lang en verify > "$TMP/cold-bbr-verify.log" 2>&1 || fail 'real cold-BBR CLI configuration did not verify'
+bash "$SCRIPT" --lang en report --json > "$TMP/cold-bbr-summary.json"
+python3 - "$TMP/cold-bbr-summary.json" <<'PYREPORT'
+import json, sys
+with open(sys.argv[1]) as f: data=json.load(f)
+assert data['status']=='completed' and data['changed'] and data['applied'] and data['verified'], data
+assert data['comparison'] is not None, data
+PYREPORT
+bash "$SCRIPT" --lang en rollback > "$TMP/cold-bbr-rollback.log" 2>&1 || fail 'real cold-BBR CLI rollback failed'
+# Module availability is capability discovery, not a writable TCP setting.
+# Do not force-unload a module that active connections may already be using.
+[[ "$(cat "$TMP/cold-original-kernel/net.ipv4.tcp_available_congestion_control")" == 'reno cubic' ]] || fail 'cold fixture was not actually unloaded'
+[[ "$(cat "$TMP/kernel/net.ipv4.tcp_available_congestion_control")" == 'reno cubic bbr' ]] || fail 'rollback unexpectedly unloaded the BBR module'
+for original in "$TMP/cold-original-kernel"/*; do
+  key="${original##*/}"
+  [[ "$key" == net.ipv4.tcp_available_congestion_control ]] && continue
+  cmp -s "$TMP/kernel/$key" "$original" || fail "real cold-BBR CLI rollback changed original parameter: $key"
+done
+[[ ! -e /etc/modules-load.d/netpilot.conf ]] || fail 'real cold-BBR CLI rollback retained module persistence'
+printf 'PASS: real cold-BBR CLI loads, persists, verifies, compares and restores the original configuration\n'

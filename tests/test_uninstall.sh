@@ -8,7 +8,7 @@ SOURCE_HASH="$(sha256sum "$SCRIPT" | awk '{print $1}')"
 source <(sed -n '/^# BEGIN I18N$/,/^# END I18N$/p' "$SCRIPT")
 TEST_DIR="$(mktemp -d)"
 trap 'rm -rf -- "$TEST_DIR"' EXIT
-for name in installed_script_owned uninstall_own_script remove_automatic_reports uninstall_menu resolve_source_path need_root need_command main menu run_mutation rollback_internal restore_rps restore_nic_ring remove_mss_rule restore_original_values managed_file_path restore_file remove_state_files sysctl_matches sysctl_value normalize_sysctl_value; do
+for name in installed_script_owned uninstall_own_script remove_automatic_reports uninstall_menu resolve_source_path need_root need_command main menu run_mutation rollback_internal restore_rps restore_nic_ring remove_mss_rule restore_original_values managed_file_path restore_file owned_config_target remove_state_files sysctl_matches sysctl_value normalize_sysctl_value; do
   sed -n "/^${name}() {/,/^}/p" "$SCRIPT" >> "$TEST_DIR/functions.sh"
 done
 # The embedded Python contains unindented braces; delimit this function using
@@ -418,7 +418,12 @@ test_file_only_backups_are_restored_without_original_values_marker() (
       mkdir -p "$BACKUP_DIR" "$CASE_DIR/config" "$REPORT_ROOT/run.previous"
       printf 'cubic\n' > "$KERNEL_STATE"
       target="$(managed_file_path "$name")" || fail 'could not resolve canonical managed file'
-      printf '# current configuration\n' > "$target"
+      # Real NetPilot module writes always carry the managed marker.
+      if [[ "$name" == bbr-module-file ]]; then
+        printf '# Managed by netpilot.sh.\ntcp_bbr\n' > "$target"
+      else
+        printf '# current configuration\n' > "$target"
+      fi
       printf '{"status":"completed"}\n' > "$REPORT_ROOT/run.previous/summary.json"
       report_hash="$(sha256sum "$REPORT_ROOT/run.previous/summary.json" | awk '{print $1}')"
       if [[ "$kind" == existing ]]; then
@@ -537,8 +542,24 @@ test_bilingual_menu_cancellation_and_eof() (
   done
 )
 
+
+test_rollback_uninstall_preserves_new_admin_module_file() (
+  setup rollback-admin-module
+  mkdir -p "$BACKUP_DIR" "$CASE_DIR/config"
+  : > "$BACKUP_DIR/bbr-module-file.missing"
+  printf '# New administrator configuration\n' > "$BBR_MODULE_FILE"
+  local inode
+  inode="$(stat -c %i "$BBR_MODULE_FILE")"
+  rollback_internal() { fixture_canonical_rollback_internal "$@"; }
+  if invoke_cli y --rollback; then fail 'uninstall removed a newly created administrator module file'; fi
+  assert_installed
+  [[ "$(cat "$BBR_MODULE_FILE")" == '# New administrator configuration' && "$(stat -c %i "$BBR_MODULE_FILE")" == "$inode" ]] || fail 'administrator module file was replaced'
+  [[ -f "$BACKUP_DIR/bbr-module-file.missing" ]] || fail 'failed rollback removed its recovery metadata'
+  assert_no_success
+)
+
 failures=0
-for test in test_completion_assertion_rejects_actual_success test_download_uninstall_removes_installed_copy_only test_installed_path_uninstalls test_menu_uninstall_without_resolved_source test_process_substitution_resolves_then_uninstalls test_changed_owned_version_is_recognized test_unrelated_installed_file_is_preserved test_installed_symlink_is_preserved test_dangling_installed_symlink_is_preserved test_unrelated_shortcuts_are_preserved test_absent_installation_keeps_source test_failed_rollback_keeps_installation test_residual_state_failure_keeps_installation test_shortcut_remove_failure_is_reported test_install_remove_failure_is_reported test_cancel_does_not_mutate test_default_uninstall_keeps_configuration_backup_and_unrelated_files test_uninstall_cleans_only_managed_default_reports test_report_cleanup_does_not_follow_links_or_delete_user_files test_default_uninstall_does_not_validate_or_follow_damaged_state test_explicit_rollback_uninstall_runs_before_removal test_explicit_rollback_without_state_preserves_installation test_explicit_rollback_rejects_empty_and_unknown_only_state test_file_only_backups_are_restored_without_original_values_marker test_uninstall_rejects_unknown_options_before_confirmation test_uninstall_confirmation_defaults_to_cancel test_bilingual_menu_default_and_keep_choice_route test_bilingual_menu_rollback_choice_route test_bilingual_menu_cancellation_and_eof; do
+for test in test_completion_assertion_rejects_actual_success test_download_uninstall_removes_installed_copy_only test_installed_path_uninstalls test_menu_uninstall_without_resolved_source test_process_substitution_resolves_then_uninstalls test_changed_owned_version_is_recognized test_unrelated_installed_file_is_preserved test_installed_symlink_is_preserved test_dangling_installed_symlink_is_preserved test_unrelated_shortcuts_are_preserved test_absent_installation_keeps_source test_failed_rollback_keeps_installation test_residual_state_failure_keeps_installation test_shortcut_remove_failure_is_reported test_install_remove_failure_is_reported test_cancel_does_not_mutate test_default_uninstall_keeps_configuration_backup_and_unrelated_files test_uninstall_cleans_only_managed_default_reports test_report_cleanup_does_not_follow_links_or_delete_user_files test_default_uninstall_does_not_validate_or_follow_damaged_state test_explicit_rollback_uninstall_runs_before_removal test_explicit_rollback_without_state_preserves_installation test_explicit_rollback_rejects_empty_and_unknown_only_state test_file_only_backups_are_restored_without_original_values_marker test_uninstall_rejects_unknown_options_before_confirmation test_uninstall_confirmation_defaults_to_cancel test_bilingual_menu_default_and_keep_choice_route test_bilingual_menu_rollback_choice_route test_bilingual_menu_cancellation_and_eof test_rollback_uninstall_preserves_new_admin_module_file; do
   if "$test"; then printf 'PASS: %s\n' "$test"; else failures=$((failures + 1)); fi
 done
 [[ "$(sha256sum "$SCRIPT" | awk '{print $1}')" == "$SOURCE_HASH" ]] || fail 'uninstall tests modified source bytes'

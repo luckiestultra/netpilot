@@ -6,7 +6,7 @@ SCRIPT="${SCRIPT_OVERRIDE:-$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd
 source <(sed -n '/^# BEGIN I18N$/,/^# END I18N$/p' "$SCRIPT")
 TMP="$(mktemp -d)"
 trap 'rm -rf -- "$TMP"' EXIT
-for fn in backup_file backup_file_once restore_file save_original_values managed_file_path prepare_state remove_state_files rollback_internal apply_gai_preference gai_preference_active apply_ipv4_preference_only restore_rps restore_nic_ring restore_original_values remove_mss_rule transaction_failed sysctl_value sysctl_matches normalize_sysctl_value sysctl_supported rps_mask_for_cpus; do
+for fn in backup_file backup_file_once restore_file owned_config_target save_original_values managed_file_path prepare_state remove_state_files rollback_internal apply_gai_preference gai_preference_active apply_ipv4_preference_only restore_rps restore_nic_ring restore_original_values remove_mss_rule transaction_failed sysctl_value sysctl_matches normalize_sysctl_value sysctl_supported rps_mask_for_cpus; do
   # shellcheck source=/dev/null
   source <(sed -n "/^${fn}() {/,/^}/p" "$SCRIPT")
 done
