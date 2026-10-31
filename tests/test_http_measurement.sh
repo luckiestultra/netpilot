@@ -91,6 +91,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
         size = length if uploaded is None else uploaded
         forbidden = (mode == 'forbidden' or mode == 'forbidden-upload' and uploaded is not None or
                      mode == 'max-4mib' and size > 4 * 1048576)
+        if mode == 'delayed-upload-ack' and uploaded is not None:
+            time.sleep(1.6)
         self.send_response(429 if mode == 'limited' else 403 if forbidden else 302 if mode == 'redirect' else 200)
         self.send_header('Content-Length', str(length))
         self.send_header('Content-Type', 'application/octet-stream')
@@ -172,13 +174,13 @@ threading.Thread(target=server.serve_forever, daemon=True).start()
 endpoint = 'http://127.0.0.1:%d' % server.server_address[1]
 budget = 1048576
 
-def run(name, phase='before', previous='', limit=10, endpoint_override=None, extra_env=None):
+def run(name, phase='before', previous='', limit=10, endpoint_override=None, extra_env=None, cc='', direction=''):
     output = root / (name + '.json')
     env = dict(os.environ, NETPILOT_LANG='en', HTTP_PROXY='http://127.0.0.1:1', HTTPS_PROXY='http://127.0.0.1:1', ALL_PROXY='http://127.0.0.1:1')
     if extra_env:
         env.update(extra_env)
     args = ['bash', '-c', 'source "$1"; http_measure_path "${@:2}"', '_', fragment, phase,
-            endpoint_override or endpoint, str(budget), str(limit), str(output), str(previous)]
+            endpoint_override or endpoint, str(budget), str(limit), str(output), str(previous), cc, direction]
     result = subprocess.run(args, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=limit + 4)
     report = json.loads(output.read_text()) if output.exists() else None
     return result, report, output
@@ -232,6 +234,81 @@ try:
     assert {d: after[d]['request_batches'] for d in schedule} == {d: before[d]['request_batches'] for d in schedule}
     assert before['node'] == after['node'] and before['address'] == after['address']
     print('PASS: real HTTP bidirectional probes, exact phase budget, pinned peer and matched before/after schedules')
+
+    global_before = pathlib.Path('/proc/sys/net/ipv4/tcp_congestion_control').read_text().strip()
+    reset()
+    result, pinned_cc, _ = run('socket-cubic', 'after', before_path, cc='cubic')
+    assert result.returncode == 0, (result.stderr.decode(), pinned_cc)
+    valid_report(pinned_cc, 'after')
+    assert pinned_cc['congestion_algorithm'] == 'cubic'
+    assert len(pinned_cc['socket_congestion_algorithms']) >= 4
+    assert set(pinned_cc['socket_congestion_algorithms']) == {'cubic'}
+    assert pathlib.Path('/proc/sys/net/ipv4/tcp_congestion_control').read_text().strip() == global_before
+    assert isinstance(pinned_cc['upload']['tcp_info']['supported'], bool)
+    reset()
+    result, upload_cc, _ = run('upload-only-cubic', 'after', before_path, cc='cubic', direction='upload')
+    assert result.returncode == 0, (result.stderr.decode(), upload_cc)
+    assert upload_cc['upload']['request_batches'] == before['upload']['request_batches'] * 2
+    assert upload_cc['upload']['request_sizes'] == before['upload']['request_sizes'] * 2
+    assert upload_cc['reserved_bytes'] == before['upload']['payload_bytes'] * 2
+    assert state['requests'] and all(method == 'POST' for method, _, _ in state['requests'])
+    assert state['accepted'] == upload_cc['reserved_bytes']
+    assert set(upload_cc['socket_congestion_algorithms']) == {'cubic'}
+    print('PASS: real per-socket CUBIC readback, unchanged global algorithm and identical doubled upload-only batches')
+
+    # A slow service response can exceed 3 seconds while the sender's TCP busy
+    # counter stays short. It must never qualify an algorithm comparison.
+    reset('delayed-upload-ack')
+    selection_dir = root / 'real-selector'
+    selection_dir.mkdir(mode=0o700)
+    result = subprocess.run(['bash', '-c', 'source "$1"; http_select_congestion "$2" "$3" 67108864 10 "$4" cubic',
+        '_', fragment, str(before_path), endpoint, str(selection_dir)], capture_output=True, timeout=15)
+    selection = json.loads((selection_dir / 'algorithm.json').read_text())
+    assert result.returncode == 0 and selection['status'] == 'preserved', (result.stderr.decode(), selection)
+    assert selection['reason_code'] in ('short_sample', 'missing_tcp_info'), selection
+    assert len(selection['trials']) == 1 and selection['reserved_bytes'] == before['upload']['payload_bytes'] * 2
+    evidence = selection['trials'][0]['upload']
+    assert evidence['duration_seconds'] >= 3, evidence
+    if selection['reason_code'] == 'short_sample':
+        assert evidence['tcp_info']['busy_time_seconds'] < 3, evidence
+    assert all(method == 'POST' for method, _, _ in state['requests'])
+    assert pathlib.Path('/proc/sys/net/ipv4/tcp_congestion_control').read_text().strip() == global_before
+    print('PASS: real delayed service responses cannot pass the TCP active-sending duration guard')
+
+    reset('delayed-upload-ack')
+    cancel_dir = root / 'selector-cancel'
+    cancel_dir.mkdir(mode=0o700)
+    process = subprocess.Popen(['bash', '-c', 'source "$1"; http_select_congestion "$2" "$3" 67108864 10 "$4" cubic',
+        '_', fragment, str(before_path), endpoint, str(cancel_dir)], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        start_new_session=True)
+    descendants = {process.pid}
+    try:
+        for _ in range(100):
+            if state['requests'] or process.poll() is not None:
+                break
+            time.sleep(.02)
+        assert process.poll() is None and state['requests'], process.communicate() if process.poll() is not None else state
+        listing = subprocess.check_output(['ps', '-eo', 'pid=,ppid='], text=True)
+        hierarchy = [tuple(map(int, row.split())) for row in listing.splitlines()]
+        for _ in range(8):
+            descendants.update(pid for pid, parent in hierarchy if parent in descendants)
+        os.killpg(process.pid, signal.SIGINT)
+        process.communicate(timeout=3)
+        assert process.returncode != 0
+        cancelled_selection = json.loads((cancel_dir / 'algorithm.json').read_text())
+        assert cancelled_selection['reason_code'] == 'cancelled' and cancelled_selection['reserved_bytes'] == before['upload']['payload_bytes'] * 2
+        time.sleep(.05)
+        listing = subprocess.check_output(['ps', '-eo', 'pid=,stat='], text=True)
+        alive = [row for row in listing.splitlines() if int(row.split()[0]) in descendants and not row.split()[1].startswith('Z')]
+        assert not alive, alive
+        requests_at_exit = list(state['requests'])
+        time.sleep(.15)
+        assert state['requests'] == requests_at_exit
+    finally:
+        if process.poll() is None:
+            os.killpg(process.pid, signal.SIGKILL)
+            process.communicate()
+    print('PASS: cancelling a real algorithm trial reaps the separate worker process group and retains its full payload charge')
 
     reset('slow-pilot')
     original_budget = budget

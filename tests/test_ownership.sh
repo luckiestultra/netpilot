@@ -3,6 +3,7 @@ set -Eeuo pipefail
 SCRIPT="${SCRIPT_OVERRIDE:-$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)/netpilot.sh}"
 # Extracted application functions share the language formatter.
 source <(sed -n '/^# BEGIN I18N$/,/^# END I18N$/p' "$SCRIPT")
+source <(sed -n '/^# BEGIN RUN RECOVERY$/,/^# END RUN RECOVERY$/p' "$SCRIPT")
 TMP="$(mktemp -d)"
 trap 'rm -rf -- "$TMP"' EXIT
 for name in backup_file backup_file_once restore_file write_lines write_bbr_file write_bbr_module_file owned_config_target save_original_values managed_file_path prepare_state rollback_internal remove_state_files gai_preference_active apply_gai_preference apply_ipv4_preference_only; do

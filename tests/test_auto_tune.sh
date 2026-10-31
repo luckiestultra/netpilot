@@ -45,7 +45,10 @@ setup_case() {
   GAI_FILE="$CASE_DIR/gai.conf"
   INSTALL_PATH="$CASE_DIR/install/netpilot.sh"; SHORTCUT_PATH="$CASE_DIR/install/netpilot"
   AUTO_REPORT_ROOT="$CASE_DIR/reports"
-  AUTO_SCENARIO=success; FAIL_SYSCTL_KEY=''; VERIFY_FAILURE=0
+  AUTO_SCENARIO=success; AUTO_SELECTION=preserved; VERIFY_FAILURE=0
+  AUTO_EXPECT_CC=cubic; AUTO_EXPECT_QDISC=fq_codel
+  export CASE_DIR KERNEL_DIR
+  export FAIL_SYSCTL_KEY='' FAIL_SYSCTL_VALUE=1
   SYSCTL_KEYS=(); SYSCTL_TARGETS=()
   mkdir -p "$KERNEL_DIR" "$(dirname "$SYSCTL_FILE")"
   printf 'reno cubic bbr\n' > "$KERNEL_DIR/net.ipv4.tcp_available_congestion_control"
@@ -63,29 +66,35 @@ setup_case() {
   printf '# Original address selection\n' > "$GAI_FILE"
   : > "$CASE_DIR/prompts"; : > "$CASE_DIR/writes"; : > "$CASE_DIR/trace"
   : > "$CASE_DIR/verify-calls"
+  mkdir "$CASE_DIR/bin"
+  cat > "$CASE_DIR/bin/sysctl" <<'SYSCTL'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+case "${1:-}" in
+  -n) [[ $# == 2 && -f "$KERNEL_DIR/$2" ]] || exit 1; cat "$KERNEL_DIR/$2" ;;
+  -w)
+    [[ $# == 2 && "$2" == *=* ]] || exit 1
+    key="${2%%=*}"; value="${2#*=}"
+    [[ "$key" =~ ^net\.[a-zA-Z0-9_.]+$ && -f "$KERNEL_DIR/$key" ]] || exit 1
+    printf '%s\n' "$2" >> "$CASE_DIR/writes"
+    printf 'write\t%s\n' "$key" >> "$CASE_DIR/trace"
+    [[ "$key" != "$FAIL_SYSCTL_KEY" || "$value" != "$FAIL_SYSCTL_VALUE" ]] || exit 1
+    printf '%s\n' "$value" > "$KERNEL_DIR/$key"
+    printf '%s = %s\n' "$key" "$value" ;;
+  *) exit 1 ;;
+esac
+SYSCTL
+  chmod 0755 "$CASE_DIR/bin/sysctl"
+  export PATH="$CASE_DIR/bin:$PATH"
   np_set_language en
 }
 
 adaptive_physical_memory_bytes() { printf '2147483648\n'; }
 adaptive_cgroup_values() { return 0; }
 
-# File-backed kernel values make real read-back, transaction recovery and
-# rollback observable without writing the container's kernel.
+# Bash application and Python restoration share one observable kernel boundary.
 sysctl() {
-  local key value
-  case "${1:-}" in
-    -n) [[ $# == 2 && -f "$KERNEL_DIR/$2" ]] || return 1; cat "$KERNEL_DIR/$2" ;;
-    -w)
-      [[ $# == 2 && "$2" == *=* ]] || return 1
-      key="${2%%=*}"; value="${2#*=}"
-      [[ "$key" =~ ^net\.[a-zA-Z0-9_.]+$ && -f "$KERNEL_DIR/$key" ]] || return 1
-      printf '%s\n' "$2" >> "$CASE_DIR/writes"
-      printf 'write\t%s\n' "$key" >> "$CASE_DIR/trace"
-      if [[ "$key" == "$FAIL_SYSCTL_KEY" && "$value" == fq ]]; then return 1; fi
-      printf '%s\n' "$value" > "$KERNEL_DIR/$key"
-      printf '%s = %s\n' "$key" "$value" ;;
-    *) return 1 ;;
-  esac
+  "$CASE_DIR/bin/sysctl" "$@"
 }
 
 verify_tuning() {
@@ -104,7 +113,7 @@ read() {
   builtin read "$@"
 }
 
-# The only test double in the closed loop is the transport boundary. Reports
+# Test doubles stop at measurement and algorithm-selection boundaries. Reports
 # contain measured data; all planning, backup, application and restoration run
 # the production implementations sourced above.
 http_measure_path() {
@@ -122,12 +131,15 @@ phase, endpoint, budget, seconds, output, scenario = sys.argv[1:]
 budget, seconds = int(budget), int(seconds)
 failed = (phase == 'before' and scenario in ('before_failure','cancel_before')) or (phase == 'after' and scenario in ('after_failure','cancel_after'))
 down, up, latency = (80e6, 40e6, 50.0) if phase == 'before' else (100e6, 50e6, 40.0)
-if phase == 'after' and scenario == 'regression': down, up, latency = 40e6, 20e6, 70.0
+if phase == 'after' and scenario in ('regression','transient_regression'):
+    if scenario == 'regression' or not output.endswith('confirmation.json'):
+        down, up, latency = 40e6, 20e6, 70.0
 if scenario == 'short_sample': down, up = 400e6, 100e6
 if scenario == 'short_download': down = 400e6
 if scenario == 'short_upload': up = 400e6
 address, node = '1.1.1.1', 'NRT'
-size = min(budget // 2, 32 * 1048576)
+size = min(budget // 4, 32 * 1048576)
+if scenario == 'baseline_budget_high': size = budget // 2
 report = dict(type='netpilot-http-measurement', version=1, ok=not failed,
               phase=phase, endpoint=endpoint, address=address, port=443,
               node=node, family='IPv4', node_verified=True,
@@ -161,13 +173,61 @@ PY
   [[ "$AUTO_SCENARIO" != after_failure || "$phase" != after ]] || return 1
 }
 
+http_select_congestion() {
+  local before="$1" endpoint="$2" total="$3" seconds="$4" directory="$5" original="$6"
+  [[ "$(sysctl_value net.ipv4.tcp_congestion_control)" == "$original" ]] || fail 'selection began after a global algorithm change'
+  [[ ! -s "$CASE_DIR/writes" ]] || fail 'configuration changed before algorithm comparison'
+  printf 'selection\t%s\n' "$original" >> "$CASE_DIR/trace"
+  [[ "$AUTO_SELECTION" != missing ]] || return 1
+  python3 - "$before" "$endpoint" "$total" "$seconds" "$directory" "$original" "$AUTO_SELECTION" <<'PY' || return 1
+import json,os,pathlib,sys
+before,endpoint,total,seconds,directory,original,mode=sys.argv[1:]
+b=json.loads(pathlib.Path(before).read_text()); root=pathlib.Path(directory)
+assert endpoint==b['endpoint'] and int(seconds)==b['timeout_seconds']
+allowance=2*b['upload']['payload_bytes']; candidate='bbr' if original=='cubic' else 'cubic'
+r=dict(type='netpilot-algorithm-selection',version=1,original=original,selected=original,
+       status='preserved',reason_code='no_consistent_gain',reserved_bytes=0,trials=[],
+       timeout_seconds=int(seconds),total_timeout_seconds=6*int(seconds),duration_seconds=.1,
+       budget_bytes=int(total),baseline_reserved_bytes=b['reserved_bytes'],
+       final_reserved_bytes=2*b['reserved_bytes'],trial_allowance_bytes=allowance,
+       planned_trial_bytes=6*allowance,endpoint=endpoint,address=b['address'],node=b['node'],
+       parallelism=4,policy='three-paired-upload-v1',candidate=candidate)
+if mode=='selected':
+    assert 6*allowance<=int(total)-3*b['reserved_bytes']
+    for i,cc in enumerate([original,candidate,candidate,original,original,candidate]):
+        duration=4.8 if cc==original else 4.0
+        upload=dict(request_sizes=b['upload']['request_sizes']*2,
+                    request_batches=b['upload']['request_batches']*2,payload_bytes=allowance,
+                    duration_seconds=duration,bits_per_second=allowance*8/duration,quality='sampled',
+                    tcp_info=dict(supported=True,srtt_ms=1. if cc==original else 1.1,
+                                  busy_time_seconds=3.2,connection_busy_seconds=[3.2,.1,.1,.1],
+                                  total_retransmissions=0))
+        r['trials'].append(dict(index=i+1,pair=i//2+1,algorithm=cc,reserved_bytes=allowance,
+            report_file='algorithm-trial-%d.json'%(i+1),exit_code=0,upload=upload,
+            process_cpu_seconds=.1,endpoint=endpoint,address=b['address'],node=b['node'],congestion_algorithm=cc))
+    r.update(selected=candidate,status='selected',reason_code='consistent_gain',reserved_bytes=6*allowance,
+             paired_throughput_ratios=[1.2]*3,paired_srtt_delta_ms=.1,
+             original_srtt_median_ms=1.,allowed_srtt_delta_ms=1.)
+target=root/'algorithm.json'
+fd=os.open(target,os.O_WRONLY|os.O_CREAT|os.O_EXCL,0o600)
+with os.fdopen(fd,'w') as stream:json.dump(r,stream)
+PY
+  if [[ "$AUTO_SCENARIO" == drift_sysctl ]]; then
+    printf '1\n' > "$KERNEL_DIR/net.ipv4.tcp_moderate_rcvbuf"
+  elif [[ "$AUTO_SCENARIO" == drift_file ]]; then
+    printf '# Managed by netpilot.sh.\n# External administrator update\nnet.ipv4.tcp_ecn = 0\n' > "$SYSCTL_FILE"
+  fi
+  if [[ "$AUTO_SELECTION" == cancel ]]; then kill -INT "$BASHPID"; return 130; fi
+  [[ "$(sysctl_value net.ipv4.tcp_congestion_control)" == "$original" ]] || fail 'candidate comparison changed the global algorithm'
+}
+
 network_interfaces() { fail 'automatic tuning adjusted unrelated NIC hardware'; }
 modprobe() { fail 'automatic tuning loaded a kernel module'; }
 iptables() { fail 'automatic tuning changed firewall rules'; }
 curl() { fail 'transport-boundary tests unexpectedly invoked curl'; }
 
 summary_file() {
-  python3 - "$AUTO_REPORT_ROOT" <<'PY'
+  python3 - "$AUTO_REPORT_ROOT" <<'PY' || return 1
 from pathlib import Path
 import sys
 files=list(Path(sys.argv[1]).rglob('summary.json'))
@@ -183,12 +243,15 @@ assert_no_changes() {
 }
 
 assert_basic_applied() {
-  [[ "$(cat "$KERNEL_DIR/net.ipv4.tcp_congestion_control")" == bbr ]] || fail 'measured plan did not select BBR'
-  [[ "$(cat "$KERNEL_DIR/net.core.default_qdisc")" == fq ]] || fail 'measured plan did not select default FQ'
+  [[ "$(cat "$KERNEL_DIR/net.ipv4.tcp_congestion_control")" == "$AUTO_EXPECT_CC" ]] || fail 'application did not respect the selected or retained algorithm'
+  [[ "$(cat "$KERNEL_DIR/net.core.default_qdisc")" == "$AUTO_EXPECT_QDISC" ]] || fail 'application changed the queue without selecting BBR'
   [[ "$(cat "$KERNEL_DIR/net.ipv4.tcp_moderate_rcvbuf")" == 1 ]] || fail 'basic plan did not enable receive-buffer autotuning'
   [[ -f "$STATE_DIR/original-values" && -f "$BACKUP_DIR/sysctl-file" ]] || fail 'automatic application omitted original state or configuration backup'
   cmp -s "$BACKUP_DIR/sysctl-file" "$CASE_DIR/original.conf" || fail 'automatic application did not preserve the original file'
-  grep -qx 'net.ipv4.tcp_congestion_control=cubic' "$STATE_DIR/original-values" || fail 'original kernel value was not recorded'
+  [[ -s "$STATE_DIR/original-values" ]] || fail 'changed kernel values have no first-ever baseline'
+  if [[ "$AUTO_SELECTION" == selected ]]; then
+    grep -qx "net.ipv4.tcp_congestion_control=$(cat "$CASE_DIR/original-kernel/net.ipv4.tcp_congestion_control")" "$STATE_DIR/original-values" || fail 'selected algorithm lost the first-ever original value'
+  fi
   fixture_verify_tuning > "$CASE_DIR/final-verify" || fail 'automatic application is inconsistent with its saved values'
 }
 
@@ -203,10 +266,17 @@ assert_restored() {
   [[ ! -e "$STATE_DIR" ]] || fail 'successful recovery retained its state'
 }
 
+assert_run_restored() {
+  diff -r "$KERNEL_DIR" "$CASE_DIR/original-kernel" > "$CASE_DIR/kernel-diff" || fail 'automatic recovery did not restore this run kernel values'
+  cmp -s "$SYSCTL_FILE" "$CASE_DIR/original.conf" || fail 'automatic recovery did not restore this run file bytes'
+  [[ -f "$STATE_DIR/original-values" && -f "$BACKUP_DIR/sysctl-file" ]] || fail 'automatic recovery deleted first-ever backup state'
+  cmp -s "$BACKUP_DIR/sysctl-file" "$CASE_DIR/original.conf" || fail 'automatic recovery altered first-ever file backup'
+}
+
 assert_completed_report() {
   local summary
   summary="$(summary_file)" || fail 'automatic summary was not generated'
-  python3 - "$summary" "$CASE_DIR/trace" "$CASE_DIR/writes" <<'PY'
+  python3 - "$summary" "$CASE_DIR/trace" "$CASE_DIR/writes" <<'PY' || return 1
 from pathlib import Path
 import json, math, os, stat, sys
 path=Path(sys.argv[1]); data=json.loads(path.read_text())
@@ -221,6 +291,10 @@ assert data['budget_bytes']==16*1024**3 and data['budget_mode']=='auto', data
 assert before['reserved_bytes']+after['reserved_bytes']<=data['budget_bytes']
 assert before['budget_mode']==after['budget_mode']=='auto'
 assert before['reserved_bytes']+after['reserved_bytes']==128*1048576
+algorithm=json.loads(path.with_name('algorithm.json').read_text())
+assert data['algorithm']==algorithm and data['restoration_scope']=='run',data
+assert data['accounted_bytes']==before['reserved_bytes']+after['reserved_bytes']+algorithm['reserved_bytes'],data
+assert data['accounting_conservative'] is False,data
 comparison=data['comparison']
 def field(primary, alternative):
     return comparison.get(primary,comparison.get(alternative))
@@ -234,6 +308,9 @@ assert probes[0][2]==probes[1][2]=='https://speed.cloudflare.com',probes
 assert int(probes[0][3])==int(probes[1][3])==8*1024**3,probes
 assert probes[0][4]==probes[1][4]=='30',probes
 assert Path(probes[1][6])==path.with_name('before.json'),probes
+selection=next(i for i,line in enumerate(lines) if line.startswith('selection\t'))
+assert lines.index(next(x for x in lines if x.startswith('probe\tbefore'))) < selection
+assert selection < lines.index(next(x for x in lines if x.startswith('write\t'))),lines
 assert lines.index(next(x for x in lines if x.startswith('write\t')))<lines.index('verify')<lines.index(next(x for x in lines if x.startswith('probe\tafter'))),lines
 assert stat.S_IMODE(path.parent.stat().st_mode)==0o700
 for report in path.parent.rglob('*.json'):
@@ -266,7 +343,7 @@ test_automatic_command_and_bilingual_menu() (
       menu < <(printf '9\n0\n') > "$CASE_DIR/output" 2>&1 || fail 'menu automatic workflow failed'
       [[ "$(wc -l < "$CASE_DIR/prompts")" == 2 ]] || fail 'automatic menu requested more than choice and exit'
     fi
-    python3 - "$PLAN_BANDWIDTH" "$PLAN_RTT" <<'PY'
+    python3 - "$PLAN_BANDWIDTH" "$PLAN_RTT" <<'PY' || return 1
 import math,sys
 assert math.isclose(float(sys.argv[1]),80.0)
 assert math.isclose(float(sys.argv[2]),50.0)
@@ -297,7 +374,7 @@ test_short_samples_keep_buffers_and_apply_basic_tuning() (
       [[ -z "$plan" ]] || fail 'report planner returned path values from a short sample'
       grep -Eiq 'short|budget-limited|样本|预算受限' "$CASE_DIR/output" || fail 'short sample reason was omitted'
       grep -Eiq 'buffers|缓冲' "$CASE_DIR/output" || fail 'preserved buffers were not explained'
-      python3 - "$(summary_file)" <<'PY'
+      python3 - "$(summary_file)" <<'PY' || return 1
 import json, sys
 d=json.load(open(sys.argv[1]))
 assert d['status']=='completed' and d['changed'] and d['applied'] and d['verified'],d
@@ -316,7 +393,7 @@ test_automatic_options_and_budget() (
   [[ "$(auto_report endpoint 'HTTPS://LOCALHOST:443/')" == 'https://localhost:443' ]] || fail 'custom endpoint normalization changed its identity'
   main --lang en tune --profile proxy --budget-mib 3 --timeout 8 < /dev/null > "$CASE_DIR/output" 2>&1 || fail 'valid automatic options failed'
   [[ "$PLAN_PROFILE" == proxy ]] || fail 'automatic profile selection was ignored'
-  python3 - "$(summary_file)" "$CASE_DIR/trace" <<'PY'
+  python3 - "$(summary_file)" "$CASE_DIR/trace" <<'PY' || return 1
 from pathlib import Path
 import json,sys
 summary=json.loads(Path(sys.argv[1]).read_text())
@@ -360,7 +437,7 @@ test_baseline_failures_never_apply() (
     if main --lang en tune < /dev/null > "$CASE_DIR/output" 2>&1; then fail "bad baseline was accepted: $scenario"; fi
     [[ "$(grep -c '^probe' "$CASE_DIR/trace")" == 1 ]] || fail 'failed baseline was retried or followed by a post-test'
     assert_no_changes
-    python3 - "$(summary_file)" <<'PY'
+    python3 - "$(summary_file)" <<'PY' || return 1
 import json,sys
 d=json.load(open(sys.argv[1]))
 assert d['status']=='failed' and d['applied'] is False,d
@@ -373,12 +450,12 @@ test_application_and_verification_failures_restore() (
   local mode
   for mode in apply verify; do
     setup_case "failure-$mode"
-    if [[ "$mode" == apply ]]; then FAIL_SYSCTL_KEY=net.core.default_qdisc
+    if [[ "$mode" == apply ]]; then FAIL_SYSCTL_KEY=net.ipv4.tcp_moderate_rcvbuf
     else VERIFY_FAILURE=1; fi
     if main --lang en tune < /dev/null > "$CASE_DIR/output" 2>&1; then fail "$mode failure reported completion"; fi
     [[ "$(grep -c '^probe' "$CASE_DIR/trace")" == 1 ]] || fail 'failed configuration was measured as if it had succeeded'
     [[ -s "$CASE_DIR/writes" ]] || fail 'failure test did not reach a real partial application'
-    assert_restored
+    assert_run_restored
     python3 - "$(summary_file)" "$mode" <<'PY' || return 1
 import json,sys
 d=json.load(open(sys.argv[1]));assert d['status']=='failed',d
@@ -389,18 +466,20 @@ PY
   done
 )
 
-test_post_failures_keep_verified_settings() (
+test_post_failures_restore_current_run() (
   require_auto
   local scenario
   for scenario in after_failure node_change address_change sizes_change; do
     setup_case "$scenario"; AUTO_SCENARIO="$scenario"
     if main --lang en tune < /dev/null > "$CASE_DIR/output" 2>&1; then fail "invalid post-test produced a successful comparison: $scenario"; fi
     [[ "$(grep -c '^probe' "$CASE_DIR/trace")" == 2 ]] || fail 'post-test failure caused a fresh budget or retry'
-    assert_applied
-    python3 - "$(summary_file)" <<'PY'
+    assert_run_restored
+    python3 - "$(summary_file)" <<'PY' || return 1
 import json,sys
 d=json.load(open(sys.argv[1]))
-assert d['status']=='partial' and d['applied'] is True and d['verified'] is True,d
+assert d['status']=='failed' and d['stage']=='after',d
+assert d['applied'] is False and d['verified'] is False,d
+assert d['rollback_status']=='completed' and d['configuration_state']=='restored',d
 assert not d.get('comparison'),d
 PY
   done
@@ -416,28 +495,156 @@ test_no_change_still_compares() (
   printf '134217728\n' > "$KERNEL_DIR/net.core.wmem_max"
   printf '4096 131072 134217728\n' > "$KERNEL_DIR/net.ipv4.tcp_rmem"
   printf '4096 16384 134217728\n' > "$KERNEL_DIR/net.ipv4.tcp_wmem"
+  AUTO_SCENARIO=regression
   main --lang en tune < /dev/null > "$CASE_DIR/output" 2>&1 || fail 'no-change automatic workflow failed'
   [[ ! -s "$CASE_DIR/writes" && ! -e "$STATE_DIR" ]] || fail 'no-change automatic workflow forced writes'
   [[ "$(grep -c '^probe' "$CASE_DIR/trace")" == 2 ]] || fail 'no-change workflow omitted automatic comparison'
-  python3 - "$(summary_file)" <<'PY'
+  python3 - "$(summary_file)" <<'PY' || return 1
 import json,sys
 d=json.load(open(sys.argv[1]))
 assert d['status']=='completed' and d['changed'] is False and d.get('comparison'),d
+assert d['rollback_status']=='not-needed' and d['comparison']['causal_claim'] is False,d
 PY
 )
 
-test_observed_regression_does_not_force_rollback() (
+test_confirmed_regression_restores_current_run() (
   require_auto
   setup_case regression; AUTO_SCENARIO=regression
-  main --lang en tune < /dev/null > "$CASE_DIR/output" 2>&1 || fail 'valid post-test variation was treated as an execution failure'
-  assert_applied
-  python3 - "$(summary_file)" <<'PY'
-import json,math,sys
-d=json.load(open(sys.argv[1]));c=d['comparison']
-assert d['status']=='completed' and d['changed'] is True,d
+  if main --lang en tune < /dev/null > "$CASE_DIR/output" 2>&1; then fail 'confirmed throughput loss was reported as success'; fi
+  [[ "$(grep -c '^probe' "$CASE_DIR/trace")" == 3 ]] || fail 'regression did not receive exactly one confirmation'
+  assert_run_restored
+  python3 - "$(summary_file)" <<'PY' || return 1
+import json,math,pathlib,sys
+p=pathlib.Path(sys.argv[1]);d=json.loads(p.read_text());c=d['comparison']
+assert d['status']=='failed' and d['stage']=='confirm' and d['changed'] is True,d
+assert d['rollback_status']=='completed' and d['configuration_state']=='restored',d
 assert math.isclose(c.get('download_change_pct',c.get('download_percent')),-50.0),c
 assert math.isclose(c.get('upload_change_pct',c.get('upload_percent')),-50.0),c
 assert math.isclose(c['latency_delta_ms'],20.0),c
+assert d['confirmation']['ok'] and d['confirmation_comparison']==c,d
+assert d['accounted_bytes']==sum(json.loads((p.parent/name).read_text())['reserved_bytes'] for name in ('before.json','after.json','confirmation.json')),d
+PY
+)
+
+test_transient_regression_is_confirmed_only_once() (
+  setup_case transient-regression; AUTO_SCENARIO=transient_regression
+  main --lang en tune < /dev/null > "$CASE_DIR/output" 2>&1 || fail 'a recovered confirmation was treated as a confirmed regression'
+  [[ "$(grep -c '^probe' "$CASE_DIR/trace")" == 3 ]] || fail 'transient regression received the wrong number of confirmations'
+  assert_applied
+  python3 - "$(summary_file)" <<'PY' || return 1
+import json,pathlib,sys
+p=pathlib.Path(sys.argv[1]);d=json.loads(p.read_text())
+assert d['status']=='completed' and d['rollback_status']=='not-needed',d
+assert (p.parent/'confirmation.json').is_file()
+assert d['confirmation']['ok'] and d['confirmation_comparison']['download_change_pct']>0,d
+assert d['comparison']['causal_claim'] is False,d
+PY
+)
+
+seed_previous_tuning() {
+  local path key
+  install -d -m 0700 "$STATE_DIR" "$BACKUP_DIR"
+  : > "$STATE_DIR/original-values"
+  for path in "$CASE_DIR/original-kernel/"*; do
+    key="${path##*/}"
+    case "$key" in net.ipv4.tcp_available_congestion_control|net.ipv4.tcp_ecn) continue ;; esac
+    printf '%s=%s\n' "$key" "$(cat "$path")" >> "$STATE_DIR/original-values"
+  done
+  chmod 0600 "$STATE_DIR/original-values"
+  cp "$SYSCTL_FILE" "$BACKUP_DIR/sysctl-file"
+  printf 'bbr\n' > "$KERNEL_DIR/net.ipv4.tcp_congestion_control"
+  printf 'fq\n' > "$KERNEL_DIR/net.core.default_qdisc"
+  printf '# Managed by netpilot.sh.\nnet.ipv4.tcp_ecn = 0\nnet.ipv4.tcp_congestion_control = bbr\nnet.core.default_qdisc = fq\n' > "$SYSCTL_FILE"
+  cp -a "$KERNEL_DIR" "$CASE_DIR/previous-kernel"
+  cp -a "$STATE_DIR" "$CASE_DIR/previous-state"
+  cp "$SYSCTL_FILE" "$CASE_DIR/previous.conf"
+}
+
+test_existing_tuning_restores_this_run_not_first_backup() (
+  local scenario
+  for scenario in after_failure cancel_after; do
+    setup_case "previous-$scenario"; seed_previous_tuning; AUTO_SCENARIO="$scenario"
+    if main --lang en tune < /dev/null > "$CASE_DIR/output" 2>&1; then fail "failed repeat run reported completion: $scenario"; fi
+    [[ -s "$CASE_DIR/writes" ]] || fail 'repeat-run recovery case never applied a new parameter'
+    diff -r "$KERNEL_DIR" "$CASE_DIR/previous-kernel" > "$CASE_DIR/previous-kernel.diff" || fail 'repeat-run recovery restored the first algorithm instead of current BBR'
+    cmp -s "$SYSCTL_FILE" "$CASE_DIR/previous.conf" || fail 'repeat-run recovery lost current managed file bytes'
+    cmp -s "$STATE_DIR/original-values" "$CASE_DIR/previous-state/original-values" || fail 'repeat-run recovery changed the first-ever original values'
+    cmp -s "$BACKUP_DIR/sysctl-file" "$CASE_DIR/previous-state/backup/sysctl-file" || fail 'repeat-run recovery changed the first-ever file backup'
+    [[ "$(cat "$KERNEL_DIR/net.ipv4.tcp_congestion_control")" == bbr ]] || fail 'repeat-run recovery reverted current BBR to first-ever CUBIC'
+    python3 - "$(summary_file)" <<'PY' || return 1
+import json,sys
+d=json.load(open(sys.argv[1]))
+assert d['status'] in ('failed','cancelled') and d['rollback_status']=='completed',d
+assert d['configuration_state']=='restored' and d['changed'] is True and d['applied'] is False,d
+PY
+  done
+)
+
+test_preapply_external_drift_stops_without_overwrite() (
+  local mode
+  for mode in sysctl file; do
+    setup_case "external-drift-$mode"; AUTO_SCENARIO="drift_$mode"
+    if main --lang en tune < /dev/null > "$CASE_DIR/output" 2>&1; then fail 'external drift was silently overwritten'; fi
+    [[ ! -s "$CASE_DIR/writes" && ! -e "$STATE_DIR" ]] || fail 'preapply drift still reached application or recovery'
+    [[ "$(grep -c '^probe' "$CASE_DIR/trace")" == 1 ]] || fail 'drift triggered a post-test'
+    if [[ "$mode" == sysctl ]]; then
+      [[ "$(cat "$KERNEL_DIR/net.ipv4.tcp_moderate_rcvbuf")" == 1 ]] || fail 'preapply drift restored over an external sysctl change'
+      cmp -s "$SYSCTL_FILE" "$CASE_DIR/original.conf" || fail 'sysctl drift unexpectedly altered the managed file'
+    else
+      grep -qx '# External administrator update' "$SYSCTL_FILE" || fail 'preapply drift overwrote an external file update'
+      diff -r "$KERNEL_DIR" "$CASE_DIR/original-kernel" > "$CASE_DIR/drift-kernel.diff" || fail 'file drift unexpectedly altered a kernel parameter'
+    fi
+    python3 - "$(summary_file)" <<'PY' || return 1
+import json,sys
+d=json.load(open(sys.argv[1]))
+assert d['status']=='failed' and d['changed'] is False and d['rollback_status']=='not-needed',d
+PY
+  done
+)
+
+test_selected_candidate_applies_only_after_comparison() (
+  local original
+  for original in cubic bbr; do
+    setup_case "selected-candidate-$original"; AUTO_SELECTION=selected
+    printf '%s\n' "$original" > "$KERNEL_DIR/net.ipv4.tcp_congestion_control"
+    cp "$KERNEL_DIR/net.ipv4.tcp_congestion_control" "$CASE_DIR/original-kernel/net.ipv4.tcp_congestion_control"
+    if [[ "$original" == cubic ]]; then AUTO_EXPECT_CC=bbr; AUTO_EXPECT_QDISC=fq
+    else AUTO_EXPECT_CC=cubic; AUTO_EXPECT_QDISC=fq_codel; fi
+    main --lang en tune < /dev/null > "$CASE_DIR/output" 2>&1 || fail 'valid candidate evidence could not reach application'
+    assert_applied
+    assert_completed_report
+    python3 - "$(summary_file)" "$CASE_DIR/trace" "$original" "$AUTO_EXPECT_CC" <<'PY' || return 1
+import json,pathlib,sys
+p=pathlib.Path(sys.argv[1]);a=json.loads((p.parent/'algorithm.json').read_text())
+assert a['status']=='selected' and a['original']==sys.argv[3] and a['selected']==sys.argv[4],a
+assert len(a['trials'])==6 and a['reserved_bytes']==sum(t['reserved_bytes'] for t in a['trials']),a
+lines=pathlib.Path(sys.argv[2]).read_text().splitlines()
+assert lines.index('selection\t'+sys.argv[3]) < lines.index('write\tnet.ipv4.tcp_congestion_control'),lines
+PY
+  done
+)
+
+test_retained_bbr_preserves_existing_queue() (
+  setup_case retained-bbr-queue
+  AUTO_EXPECT_CC=bbr
+  printf 'bbr\n' > "$KERNEL_DIR/net.ipv4.tcp_congestion_control"
+  main --lang en tune < /dev/null > "$CASE_DIR/output" 2>&1 || fail 'inconclusive comparison of current BBR failed'
+  assert_applied
+  ! grep -q '^net.ipv4.tcp_congestion_control=\|^net.core.default_qdisc=' "$CASE_DIR/writes" || fail 'retaining BBR rewrote the algorithm or forced default FQ'
+)
+
+test_missing_algorithm_report_cannot_reach_application() (
+  setup_case missing-selection; AUTO_SELECTION=missing
+  if main --lang en tune < /dev/null > "$CASE_DIR/output" 2>&1; then fail 'missing selector report became a preserved-success decision'; fi
+  [[ "$(grep -c '^probe' "$CASE_DIR/trace")" == 1 ]] || fail 'missing selector report reached a post-test'
+  assert_no_changes
+  python3 - "$(summary_file)" <<'PY' || return 1
+import json,pathlib,sys
+p=pathlib.Path(sys.argv[1]);d=json.loads(p.read_text())
+assert d['status']=='failed' and d['stage']=='selection' and not d['changed'],d
+b=json.loads((p.parent/'before.json').read_text())
+assert d['accounting_conservative'] is True and d['algorithm'] is None,d
+assert d['accounted_bytes']==b['reserved_bytes']+12*b['upload']['payload_bytes'],d
 PY
 )
 
@@ -455,7 +662,7 @@ test_repeated_runs_preserve_reports_and_first_backup() (
   [[ "$(sha256sum "$first_report" | awk '{print $1}')" == "$first_hash" ]] || fail 'repeat run overwrote its previous report'
   [[ "$(sha256sum "$STATE_DIR/original-values" | awk '{print $1}')" == "$original_hash" ]] || fail 'repeat run replaced the original parameter baseline'
   [[ "$(sha256sum "$BACKUP_DIR/sysctl-file" | awk '{print $1}')" == "$backup_hash" ]] || fail 'repeat run replaced its first configuration backup'
-  python3 - "$AUTO_REPORT_ROOT" <<'PY'
+  python3 - "$AUTO_REPORT_ROOT" <<'PY' || return 1
 from pathlib import Path
 import json,sys
 reports=list(Path(sys.argv[1]).rglob('summary.json'))
@@ -507,17 +714,18 @@ test_report_paths_cannot_enter_tuning_state() (
 test_cancel_does_not_report_success() (
   require_auto
   local phase status
-  for phase in before after; do
+  for phase in before selection after; do
     setup_case "cancel-$phase"; AUTO_SCENARIO="cancel_$phase"
+    [[ "$phase" != selection ]] || AUTO_SELECTION=cancel
     status=0
     main --lang en tune < /dev/null > "$CASE_DIR/output" 2>&1 || status=$?
     [[ "$status" != 0 ]] || fail 'cancelled workflow returned success'
-    python3 - "$(summary_file)" <<'PY'
+    python3 - "$(summary_file)" <<'PY' || return 1
 import json,sys
 d=json.load(open(sys.argv[1]));assert d['status']=='cancelled',d
 PY
-    if [[ "$phase" == before ]]; then assert_no_changes
-    else assert_applied; fi
+    if [[ "$phase" == after ]]; then assert_run_restored
+    else assert_no_changes; fi
   done
 )
 
@@ -547,7 +755,7 @@ test_noop_cancellation_preserves_previous_tuning() (
   [[ -d "$STATE_DIR" ]] || fail 'cancelled no-op run deleted historical rollback state'
   diff -r "$STATE_DIR" "$CASE_DIR/pre-cancel-state" > "$CASE_DIR/cancel-state-diff" || fail 'cancelled no-op run changed historical rollback records'
   cmp -s "$SYSCTL_FILE" "$CASE_DIR/pre-cancel.conf" || fail 'cancelled no-op run changed the previously tuned configuration'
-  python3 - "$AUTO_REPORT_ROOT" <<'PY'
+  python3 - "$AUTO_REPORT_ROOT" <<'PY' || return 1
 from pathlib import Path
 import json,sys
 reports=[json.loads(p.read_text()) for p in Path(sys.argv[1]).rglob('summary.json')]
@@ -569,13 +777,13 @@ test_cancelled_apply_with_failed_rollback_reports_uncertainty() (
     fixture_apply_before_cancel "$@" || return $?
     kill -INT "$BASHPID"
   }
-  rollback_tuning() { return 1; }
+  tuning_run_restore() { return 1; }
   local status=0
   main --lang en tune < /dev/null > "$CASE_DIR/output" 2>&1 || status=$?
   [[ "$status" != 0 ]] || fail 'cancelled application with failed recovery returned success'
-  [[ "$(cat "$KERNEL_DIR/net.ipv4.tcp_congestion_control")" == bbr ]] || fail 'cancellation fixture did not leave a real applied setting after failed recovery'
+  [[ "$(cat "$KERNEL_DIR/net.ipv4.tcp_moderate_rcvbuf")" == 1 ]] || fail 'cancellation fixture did not leave a real applied setting after failed recovery'
   [[ -s "$CASE_DIR/writes" && -f "$STATE_DIR/original-values" && -f "$BACKUP_DIR/sysctl-file" ]] || fail 'failed recovery lost its real writes or rollback records'
-  python3 - "$(summary_file)" <<'PY'
+  python3 - "$(summary_file)" <<'PY' || return 1
 import json,sys
 d=json.load(open(sys.argv[1]))
 assert d['status']=='cancelled',d
@@ -590,6 +798,7 @@ test_unloaded_bbr_in_bilingual_menu() (
   local language
   for language in zh en; do
     setup_case "unloaded-menu-$language"
+    AUTO_SELECTION=selected; AUTO_EXPECT_CC=bbr; AUTO_EXPECT_QDISC=fq
     printf 'reno cubic\n' > "$KERNEL_DIR/net.ipv4.tcp_available_congestion_control"
     printf '1\n' > "$KERNEL_DIR/net.ipv4.tcp_moderate_rcvbuf"
     printf '4194304\n' > "$KERNEL_DIR/net.core.rmem_max"
@@ -615,6 +824,17 @@ test_unloaded_bbr_in_bilingual_menu() (
   done
 )
 
+test_retest_reserve_required_before_apply() (
+  setup_case retest-reserve
+  AUTO_SCENARIO=baseline_budget_high
+  if main --lang en tune --budget-mib 128 < /dev/null > "$CASE_DIR/output" 2>&1; then
+    fail 'configuration application started without reserving both retests'
+  fi
+  assert_no_changes
+  grep -q 'Remaining budget cannot cover' "$CASE_DIR/output" || fail 'budget shortfall was not explained'
+  [[ "$(grep -c '^probe' "$CASE_DIR/trace")" == 1 ]] || fail 'budget failure initiated more measurement'
+)
+
 test_failed_baseline_does_not_load_bbr() (
   setup_case unloaded-baseline-failure
   printf 'reno cubic\n' > "$KERNEL_DIR/net.ipv4.tcp_available_congestion_control"
@@ -626,7 +846,8 @@ test_failed_baseline_does_not_load_bbr() (
 )
 
 failures=0
-for test in test_manual_fixture_and_rollback test_automatic_command_and_bilingual_menu test_short_samples_keep_buffers_and_apply_basic_tuning test_automatic_options_and_budget test_invalid_options_are_zero_traffic test_baseline_failures_never_apply test_application_and_verification_failures_restore test_post_failures_keep_verified_settings test_no_change_still_compares test_observed_regression_does_not_force_rollback test_repeated_runs_preserve_reports_and_first_backup test_report_paths_preserve_existing_data test_report_paths_cannot_enter_tuning_state test_cancel_does_not_report_success test_noop_cancellation_preserves_previous_tuning test_cancelled_apply_with_failed_rollback_reports_uncertainty test_unloaded_bbr_in_bilingual_menu test_failed_baseline_does_not_load_bbr; do
+if test_retest_reserve_required_before_apply; then printf 'PASS: test_retest_reserve_required_before_apply\n'; else failures=$((failures+1)); fi
+for test in test_manual_fixture_and_rollback test_automatic_command_and_bilingual_menu test_short_samples_keep_buffers_and_apply_basic_tuning test_automatic_options_and_budget test_invalid_options_are_zero_traffic test_baseline_failures_never_apply test_application_and_verification_failures_restore test_post_failures_restore_current_run test_no_change_still_compares test_confirmed_regression_restores_current_run test_transient_regression_is_confirmed_only_once test_existing_tuning_restores_this_run_not_first_backup test_preapply_external_drift_stops_without_overwrite test_selected_candidate_applies_only_after_comparison test_retained_bbr_preserves_existing_queue test_missing_algorithm_report_cannot_reach_application test_repeated_runs_preserve_reports_and_first_backup test_report_paths_preserve_existing_data test_report_paths_cannot_enter_tuning_state test_cancel_does_not_report_success test_noop_cancellation_preserves_previous_tuning test_cancelled_apply_with_failed_rollback_reports_uncertainty test_unloaded_bbr_in_bilingual_menu test_failed_baseline_does_not_load_bbr; do
   if "$test"; then printf 'PASS: %s\n' "$test"
   else
     failures=$((failures+1))

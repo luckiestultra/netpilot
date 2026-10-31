@@ -63,10 +63,12 @@ adaptive_cgroup_values() {
 }
 adaptive_online_cpus() { printf '%s\n' "${ONLINE_CPUS:-8}"; }
 
+modprobe() { fail 'read-only planning must not load kernel modules'; }
 adaptive_plan || fail 'a default plan should succeed without measurement'
 [[ -z "${SYSCTL_TARGETS[net.core.rmem_max]+exists}" ]] || fail 'missing path input must preserve buffers'
 [[ -z "$PLAN_BUFFER_BYTES" ]] || fail 'unmeasured plan must not retain stale measured ceilings'
-[[ "${SYSCTL_TARGETS[net.ipv4.tcp_congestion_control]}" == bbr ]] || fail 'advertised BBR should be proposed'
+[[ -z "${SYSCTL_TARGETS[net.ipv4.tcp_congestion_control]+exists}" ]] || fail 'manual plan must preserve the current algorithm even when BBR is available'
+[[ -z "${SYSCTL_TARGETS[net.core.default_qdisc]+exists}" ]] || fail 'manual plan must preserve the current default queue'
 [[ -z "${SYSCTL_TARGETS[net.ipv4.tcp_mem]+exists}" ]] || fail 'default TCP memory budget must be preserved'
 [[ -z "${SYSCTL_TARGETS[net.ipv4.tcp_retries2]+exists}" ]] || fail 'retries must be preserved'
 
@@ -100,5 +102,26 @@ adaptive_plan --profile proxy --bandwidth 100 --rtt 10 || fail 'existing larger 
 CURRENT[net.ipv4.tcp_available_congestion_control]='reno cubic'
 adaptive_plan || fail 'missing BBR should be a capability note'
 [[ -z "${SYSCTL_TARGETS[net.ipv4.tcp_congestion_control]+exists}" ]] || fail 'unadvertised BBR must not be proposed or loaded'
+
+CURRENT[net.ipv4.tcp_available_congestion_control]='reno cubic bbr'
+for algorithm in cubic bbr reno; do
+  CURRENT[net.ipv4.tcp_congestion_control]="$algorithm"
+  adaptive_plan --profile proxy --bandwidth 100 --rtt 50 || fail 'manual measured plan should preserve the current algorithm'
+  [[ -z "${SYSCTL_TARGETS[net.ipv4.tcp_congestion_control]+exists}" ]] || fail "manual plan proposed replacing current $algorithm"
+  [[ -z "${SYSCTL_TARGETS[net.core.default_qdisc]+exists}" ]] || fail "manual plan changed default queue for current $algorithm"
+done
+CURRENT[net.ipv4.tcp_congestion_control]=cubic
+AUTO_SELECTED_CC=bbr; AUTO_TUNE_ACTIVE=0
+adaptive_plan || fail 'manual plan with stale selection context'
+[[ -z "${SYSCTL_TARGETS[net.ipv4.tcp_congestion_control]+exists}" ]] || fail 'manual plan used a stale automatic algorithm selection'
+AUTO_TUNE_ACTIVE=1
+adaptive_plan || fail 'confirmed automatic BBR plan'
+[[ "${SYSCTL_TARGETS[net.ipv4.tcp_congestion_control]:-}" == bbr ]] || fail 'automatic plan ignored the measured BBR selection'
+[[ "${SYSCTL_TARGETS[net.core.default_qdisc]:-}" == fq ]] || fail 'selected BBR must include default FQ'
+CURRENT[net.ipv4.tcp_congestion_control]=bbr; AUTO_SELECTED_CC=cubic
+adaptive_plan || fail 'confirmed automatic CUBIC plan'
+[[ "${SYSCTL_TARGETS[net.ipv4.tcp_congestion_control]:-}" == cubic ]] || fail 'automatic plan ignored the measured CUBIC selection'
+[[ -z "${SYSCTL_TARGETS[net.core.default_qdisc]+exists}" ]] || fail 'selecting CUBIC must preserve the default queue'
+AUTO_SELECTED_CC=''; AUTO_TUNE_ACTIVE=0
 
 printf 'PASS: adaptive planning, memory/CPU limits, input validation and conservative defaults\n'

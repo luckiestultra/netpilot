@@ -6,7 +6,7 @@
 
 NetPilot provides network diagnostics and TCP tuning for Linux VPS servers, with automatic measurements, backups and before/after comparisons.
 
-[Get started](#get-started) · [View results](#view-results) · [Maintenance and recovery](#maintenance-and-recovery) · [Use with AI](#use-with-ai) · [Full reference](#full-reference)
+[Get started](#get-started) · [One-click tuning](#one-click-tuning) · [View results](#view-results) · [Maintenance and recovery](#maintenance-and-recovery) · [Use with AI](#use-with-ai) · [Full reference](#full-reference)
 
 ## Get started
 
@@ -18,15 +18,17 @@ bash <(curl -fsSL https://raw.githubusercontent.com/luckiestultra/netpilot/main/
 
 The script saves itself and opens the English menu. **Choose `9` to tune and `10` to view results.** `L` switches languages; `0` exits.
 
-Tuning measures, backs up, applies, verifies and retests automatically. No manual bandwidth, latency, data budget or report names are needed. A small probe is followed by measurements using up to 4 connections. Faster paths transfer more data until the target sample duration is reached. The **whole-run cap is 16GiB**, not a required transfer; protocol overhead is additional.
-
-Applying tries the BBR module supplied with the current kernel. If loading succeeds, it enables BBR and default FQ; it does not install or replace kernels. If loading fails, it reports the reason and continues with other supported parameters.
-
 Next time on the same server, run:
 
 ```bash
 netpilot --lang en
 ```
+
+## One-click tuning
+
+Menu `9` or `netpilot --lang en tune` measures the path, compares algorithms, applies a plan and retests without manual bandwidth, latency or report names. When starting with CUBIC or BBR, it tests the other algorithm. It switches only when upload comparisons meet the decision rules; inconclusive results retain the algorithm present at the start of this run. Other algorithms are retained and reported as unevaluated.
+
+The **whole-run payload cap is 16GiB**, including algorithm comparisons, failed requests and before/after tests. Usage follows the samples needed; protocol overhead is additional. NetPilot captures this run's starting state and checks for external changes before applying. Failures, cancellation, incomparable retests or confirmed regression after application trigger restoration of this run's changes. Menu `2` is a separate, explicit request to enable BBR and default FQ.
 
 ## View results
 
@@ -36,12 +38,12 @@ Choose main-menu `10`, or run:
 netpilot --lang en report
 ```
 
-The summary shows configuration state, measurements, budget mode, test payload and the report's update time. Unfinished runs show recorded payload, which may omit in-flight requests; missing or invalid metrics are marked unavailable. It reads `/tmp/netpilot-reports` by default; system cleanup or a reboot may remove these temporary reports. If the latest attempt has no report yet, this may be an older record. For a custom directory, use `netpilot --lang en report --report-dir DIR`.
+The summary first shows the retained or selected algorithm and reason, whether this run changed settings, the final retained or restored state, and payload charged to the budget. Missing or invalid metrics are marked unavailable. It reads `/tmp/netpilot-reports` by default; system cleanup or a reboot may remove these temporary reports. If the latest attempt has no report yet, this may be an older record; check its update time. For a custom directory, use `netpilot --lang en report --report-dir DIR`.
 
 | Status | Meaning |
 |---|---|
-| Completed | The workflow and comparison finished. |
-| Partial | Retest or comparison did not finish; verified settings remain. |
+| Completed | The workflow finished; the algorithm may be unchanged. This does not establish a speed gain. |
+| Partial | Retest or comparison did not finish; check the reason and restoration state. |
 | Failed | Check the stage and reason; restore failures retain backups. |
 | Cancelled | Check configuration and rollback states to confirm restoration. |
 
@@ -87,7 +89,7 @@ Hide IP addresses, domains or other private details in a copy before sharing; ke
 | `6` | Update NetPilot. |
 | `7` | Uninstall; keep settings by default. |
 | `1` | Prefer IPv4 by editing `/etc/gai.conf`. |
-| `2` | Enable kernel-provided BBR and default FQ. |
+| `2` | Explicitly enable kernel-provided BBR and default FQ. |
 | `3` | Manual tuning with a preview and confirmation. |
 | `4` | NIC ring / RPS; skip RPS on a single CPU. |
 | `L` / `0` | Switch session language / exit. |
@@ -120,19 +122,19 @@ Chinese is the default; menu `L` switches the current session. Use `netpilot --l
 |---|---|---|
 | `--profile` | `balanced` | [Choose a workload](#parameter-recommendations). |
 | `--budget-mib` | `auto` | Sample as needed, up to 16GiB for the whole run; an integer 1–1024 sets a fixed cap in MiB. |
-| `--timeout` | `30` | Per-phase timeout; integer 5–120 seconds. |
+| `--timeout` | `30` | Per-phase timeout; integer 5–120 seconds. Measurement phases total at most 9 times this value; local application, restoration and cleanup take additional time. |
 | `--endpoint` | `https://speed.cloudflare.com` | HTTPS origin with compatible download/upload APIs; HTTP is limited to loopback addresses. |
 | `--report-dir` | `/tmp/netpilot-reports` | Must not allow other users to write; cannot be inside `/var/lib/netpilot/`. |
 
-Tests start with a **64KiB** request, then increase in batches up to **4 connections and 4MiB per request**. These are client policies, not claimed service limits. Each phase gets half the budget, split between download and upload. Each batch is reserved before sending, with no refund on failure. HTTP rejection stops new batches without automatic retry.
+Tests start with **64KiB**, then increase in batches up to **4 connections and 4MiB per request**. These are client policies. One ledger covers the baseline, algorithm comparisons, post-test and one regression confirmation. Each batch is charged before sending; failures, partial transfers and cancellation receive no refund. HTTP rejection stops new batches without switching sources and restarting. Comparisons leave two baseline-sized allowances for the normal post-test and a possible confirmation; settings cannot be applied after spending that allowance.
 
-Default automatic sampling progressively increases data within the same run. Each baseline direction stops after reaching 3 seconds or its byte or time allowance, without restarting the test. Baseline downloads reserve time for uploads; a batch predicted to overrun its window is reduced, or sampling ends with a short sample. The whole-run cap covers both directions before and after tuning; actual use depends on the measured path. An explicit numeric budget always remains a fixed cap.
+Algorithm comparisons fix the endpoint, IP, verifiable node, connection count, request batches and timeout, alternating algorithm order. Only uploads sent by the VPS count. Selection needs 3 valid pairs: candidate throughput is at least 110% of the original in every pair, both elapsed and actual TCP sender busy time reach 3 seconds for each sample, and the median paired upload TCP SRTT increase is no more than `max(1ms, 20% of the original median)`. Each test socket's algorithm is set and read back; comparisons leave the global default and persistent files unchanged. Missing data, unsupported options, short samples or insufficient budget retain the starting algorithm. These are conservative product rules, not proof of statistical significance.
 
-Rates are total bytes divided by elapsed wall time, representing observed multi-connection HTTP throughput. Buffer estimates use measurements only when both baseline directions reach 3 seconds. If byte or time limits leave samples short, basic tuning proceeds while retaining buffers. Sufficient duration does not prove link saturation. Latency is the average of three TCP connection times.
+Rates are total bytes divided by elapsed time, representing observed HTTP throughput. Buffer estimates require both baseline directions to reach 3 seconds; otherwise existing buffers remain. Path latency is the average of three TCP connection times; algorithm selection separately uses upload TCP SRTT. Downloads cannot establish a benefit from the local sender algorithm, and sample duration alone cannot establish peak bandwidth.
 
-Retests reuse the baseline IP, node, parallelism, batch plan and timeout without extra payload. A faster retest lasting less than 3 seconds is still marked short. Reports are saved automatically as `before.json`, `after.json` when available, and `summary.json`. Older serial reports remain readable but cannot be compared with parallel reports.
+Retests reuse the baseline IP, node, parallelism, batch plan and timeout, without adding payload to reach a duration target. Faster retests lasting less than 3 seconds are marked short. A throughput loss above 10% in either direction triggers one same-condition confirmation within the reserved budget. Two losses in the same direction, or no available confirmation, restore this run's changes and report that benefit was not confirmed.
 
-Baseline failure leaves settings unchanged. Apply or verification failures after this run starts writing attempt to restore the original baseline; retest failures retain verified settings. HTTP errors show the status code, download or upload direction, request size and reserved budget; menu `10` shows them again. On cancellation, check configuration and rollback states in the report.
+Baseline failure leaves settings unchanged. After writes begin, apply, verification or retest failures, cancellation and incomparable conditions attempt to restore the parameters and files present at this run's start, preserving the existing first-ever backup. External changes produce a conflict report and retained recovery materials; restoration failure is explicit. An unchanged run triggers no restoration. Reports retain before/after samples, algorithm decisions and the budget ledger; menu `10` shows the reasons again. Older reports remain readable.
 
 ### Parameter recommendations
 
@@ -161,7 +163,7 @@ netpilot --lang en plan --profile proxy --bandwidth 500 --rtt 80
 netpilot --lang en apply --profile proxy --bandwidth 500 --rtt 80
 ```
 
-`plan` previews; `apply` asks for confirmation. Omitting path inputs retains existing buffers. In the menu, press Enter if bandwidth is unknown. After entering bandwidth, press Enter at the latency prompt and provide a target to measure it. Latency-probe failure stops the operation.
+`plan` previews; `apply` asks for confirmation. Both retain the current congestion algorithm and do not load modules implicitly. Omitting path inputs retains existing buffers. In the menu, press Enter if bandwidth is unknown. After entering bandwidth, press Enter at the latency prompt and provide a target to measure it. Latency-probe failure stops the operation.
 
 ### Benchmarks and comparisons
 
@@ -195,6 +197,8 @@ Budgets exclude protocol overhead, retransmissions and optional ICMP. Short samp
 ### Configuration files and backups
 
 Original values and files are saved before their first change; repeated runs preserve that baseline. Successful rollback clears recovery records, and the next change creates a new baseline. Measurement reports are stored separately.
+
+Automatic tuning uses a separate snapshot to restore only this run's changes. Menu `5` / `rollback` always restores the first saved values. A new default algorithm mainly affects subsequent connections; NetPilot does not restart proxy services or existing business connections. Selecting BBR sets default FQ; the current interface queue is displayed separately.
 
 | Path | Content |
 |---|---|

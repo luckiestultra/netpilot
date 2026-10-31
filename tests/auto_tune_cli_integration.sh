@@ -85,12 +85,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
         size = int(parse_qs(urlsplit(self.path).query)['bytes'][0])
         mode = (root / 'mode').read_text().strip()
-        if mode == 'limited':
+        if mode == 'limited' or mode == 'reject-after-apply' and (root / 'kernel/net.ipv4.tcp_moderate_rcvbuf').read_text().strip() == '1':
             self.record('GET', size, mode)
-            self.headers_for(0, 429)
+            self.headers_for(0, 429 if mode == 'limited' else 403)
             return
         if mode == 'auto':
             time.sleep(3.1)
+        elif mode in ('ok', 'reject-after-apply'):
+            time.sleep(1.6)
         self.headers_for(size)
         remaining = size
         while remaining:
@@ -111,6 +113,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             received += len(chunk)
         if mode == 'auto':
             time.sleep(3.1)
+        elif mode in ('ok', 'reject-after-apply'):
+            time.sleep(1.6)
         self.record('POST', size, mode, received=received)
         self.headers_for(0, uploaded=received)
 server = Server(('127.0.0.1', 0), Handler)
@@ -130,7 +134,7 @@ endpoint="http://127.0.0.1:$(cat "$TMP/port")"
 
 # A real rejection must stop the full command before any managed configuration
 # or kernel write, while preserving its private failure report for inspection.
-if bash "$SCRIPT" --lang en tune --endpoint "$endpoint" --budget-mib 1 < /dev/null > "$TMP/rejected.log" 2>&1; then
+if bash "$SCRIPT" --lang en tune --endpoint "$endpoint" --budget-mib 1 --timeout 5 < /dev/null > "$TMP/rejected.log" 2>&1; then
   fail 'the real CLI accepted a 429 baseline'
 fi
 [[ ! -e /var/lib/netpilot && ! -e /etc/sysctl.d/99-netpilot.conf && ! -s "$NETPILOT_TEST_WRITES" ]] || fail 'baseline rejection reached configuration changes'
@@ -154,13 +158,14 @@ printf 'PASS: full CLI rejects a real HTTP 429 baseline before creating configur
 printf 'ok\n' > "$TMP/mode"
 printf '# Managed by netpilot.sh.\nnet.ipv4.tcp_ecn = 0\n' > /etc/sysctl.d/99-netpilot.conf
 cp -a /etc/sysctl.d/99-netpilot.conf "$TMP/original.conf"
-bash "$SCRIPT" --lang en tune --endpoint "$endpoint" --budget-mib 1 < /dev/null > "$TMP/success.log" 2>&1 || {
+bash "$SCRIPT" --lang en tune --endpoint "$endpoint" --budget-mib 1 --timeout 5 < /dev/null > "$TMP/success.log" 2>&1 || {
   cat "$TMP/success.log" >&2; fail 'complete automatic tuning CLI failed';
 }
 [[ -f /var/lib/netpilot/original-values && -f /var/lib/netpilot/backup/sysctl-file ]] || fail 'CLI did not create its original-values and file backup'
 cmp -s /var/lib/netpilot/backup/sysctl-file "$TMP/original.conf" || fail 'CLI backup differs from the actual original configuration'
-grep -qx 'net.ipv4.tcp_congestion_control=cubic' /var/lib/netpilot/original-values || fail 'original algorithm was not recorded'
-[[ "$(cat "$TMP/kernel/net.ipv4.tcp_congestion_control")" == bbr && "$(cat "$TMP/kernel/net.core.default_qdisc")" == fq && "$(cat "$TMP/kernel/net.ipv4.tcp_moderate_rcvbuf")" == 1 ]] || fail 'real CLI did not apply the basic plan'
+grep -qx 'net.ipv4.tcp_moderate_rcvbuf=0' /var/lib/netpilot/original-values || fail 'original changed receive setting was not recorded'
+[[ "$(cat "$TMP/kernel/net.ipv4.tcp_congestion_control")" == cubic && "$(cat "$TMP/kernel/net.core.default_qdisc")" == fq_codel && "$(cat "$TMP/kernel/net.ipv4.tcp_moderate_rcvbuf")" == 1 ]] || fail 'real CLI did not preserve the algorithm/default queue while applying receive autotuning'
+[[ ! -e /etc/modules-load.d/netpilot.conf ]] || fail 'preserved CUBIC unexpectedly created BBR module persistence'
 for key in net.core.rmem_max net.core.wmem_max net.ipv4.tcp_rmem net.ipv4.tcp_wmem; do
   cmp -s "$TMP/kernel/$key" "$TMP/original-kernel/$key" || fail "short local measurements changed buffer values: $key"
 done
@@ -182,7 +187,7 @@ assert summary['comparison']['budget_limited'] is True
 assert summary['budget_mode']=='fixed'
 assert stat.S_IMODE(reports.stat().st_mode)==0o700
 assert stat.S_IMODE(path.parent.stat().st_mode)==0o700
-for name in ['before.json','after.json','summary.json']:
+for name in ['before.json','after.json','algorithm.json','summary.json','run-snapshot.json']:
     assert stat.S_IMODE((path.parent/name).stat().st_mode)==0o600
 before,after=summary['before'],summary['after']
 for key in ['endpoint','address','port','node','latency_method','budget_bytes','timeout_seconds','connection_policy','node_verified']:
@@ -191,7 +196,9 @@ assert before['address']=='127.0.0.1' and before['node']=='LAB'
 assert before['node_verified'] is True
 for direction in ['download','upload']:
     assert before[direction]['request_sizes']==after[direction]['request_sizes']
-assert before['reserved_bytes']+after['reserved_bytes']<=summary['budget_bytes']==1048576
+assert summary['algorithm']['status']=='preserved' and summary['algorithm']['selected']=='cubic'
+assert summary['algorithm']['reason_code']=='insufficient_budget' and summary['algorithm']['reserved_bytes']==0
+assert summary['accounted_bytes']==before['reserved_bytes']+after['reserved_bytes']<=summary['budget_bytes']==1048576
 requests=[json.loads(line) for line in (root/'http-requests.jsonl').read_text().splitlines()]
 successful=[item for item in requests if item['mode']=='ok']
 assert sum(item['requested'] for item in successful)<=1048576
@@ -210,6 +217,37 @@ cmp -s /etc/sysctl.d/99-netpilot.conf "$TMP/original.conf" || fail 'rollback did
 [[ "$(sha256sum "$SCRIPT" | awk '{print $1}')" == "$source_hash" ]] || fail 'CLI changed source bytes'
 printf 'PASS: full CLI rollback restores actual parameters/configuration and preserves private automatic reports\n'
 
+# A failed retest must restore this run, retaining a previous tuning and its
+# first-ever rollback records. The HTTP source observes the actual apply write
+# and rejects the first post-apply download; it cannot fail the baseline.
+bash "$SCRIPT" --lang en apply --yes --profile proxy --bandwidth 100 --rtt 50 > "$TMP/prior-apply.log" 2>&1 || fail 'could not prepare a previous valid tuning'
+sysctl -w net.ipv4.tcp_moderate_rcvbuf=0 > /dev/null
+cp -a "$TMP/kernel" "$TMP/run-start-kernel"
+cp -p /etc/sysctl.d/99-netpilot.conf "$TMP/run-start.conf"
+find /var/lib/netpilot -type f -print0 | sort -z | xargs -0 sha256sum > "$TMP/run-start-state.sha256"
+printf 'reject-after-apply\n' > "$TMP/mode"
+if bash "$SCRIPT" --lang en tune --endpoint "$endpoint" --budget-mib 1 --timeout 5 < /dev/null > "$TMP/failed-retest.log" 2>&1; then
+  fail 'CLI claimed success after a real post-apply HTTP rejection'
+fi
+diff -r "$TMP/kernel" "$TMP/run-start-kernel" > "$TMP/run-restore.diff" || fail 'failed retest restored first-ever values instead of this run'
+cmp -s /etc/sysctl.d/99-netpilot.conf "$TMP/run-start.conf" || fail 'failed retest discarded previous managed configuration'
+sha256sum --check --status "$TMP/run-start-state.sha256" || fail 'failed retest changed prior applied state or first-ever backups'
+bash "$SCRIPT" --lang en report --json > "$TMP/restored-summary.json"
+python3 - "$TMP/restored-summary.json" <<'PYRESTORE'
+import json,sys
+with open(sys.argv[1]) as stream:data=json.load(stream)
+assert data['status']=='failed' and data['stage']=='after' and data['exit_code']==1,data
+assert data['configuration_state']=='restored' and data['rollback_status']=='completed',data
+assert data['restoration_scope']=='run' and data['verify_status']=='restored',data
+assert data['applied'] is False and data['verified'] is False and data['changed'] is True,data
+assert data['before']['ok'] is True and data['after']['http_error']['status']==403,data
+assert data['accounted_bytes']>data['before']['reserved_bytes'],data
+PYRESTORE
+bash "$SCRIPT" --lang en rollback > "$TMP/prior-rollback.log" 2>&1 || fail 'first-ever rollback did not survive run restoration'
+diff -r "$TMP/kernel" "$TMP/original-kernel" > "$TMP/prior-rollback.diff" || fail 'first-ever rollback failed after per-run recovery'
+cmp -s /etc/sysctl.d/99-netpilot.conf "$TMP/original.conf" || fail 'first-ever configuration was lost after per-run recovery'
+printf 'PASS: complete CLI restores this run after a real HTTP403 retest and preserves earlier applied state and first-ever backups\n'
+
 printf 'auto\n' > "$TMP/mode"
 bash "$SCRIPT" --lang en tune --endpoint "$endpoint" < /dev/null > "$TMP/auto.log" 2>&1 || {
   cat "$TMP/auto.log" >&2; fail 'default automatic-budget CLI required input or failed';
@@ -220,7 +258,7 @@ import json, pathlib, sys
 root=pathlib.Path(sys.argv[1]); reports=pathlib.Path(sys.argv[2])
 all_reports=[(path,json.loads(path.read_text())) for path in reports.glob('run.*/summary.json')]
 automatic=[(path,data) for path,data in all_reports if data.get('budget_mode')=='auto']
-assert len(automatic)==1 and len(all_reports)==3
+assert len(automatic)==1 and len(all_reports)==4
 path,summary=automatic[0]
 assert summary['status']=='completed' and summary['stage']=='completed' and summary['exit_code']==0
 assert summary['budget_bytes']==16*1024**3 and summary['comparison']['budget_limited'] is False
@@ -232,11 +270,14 @@ for measurement in (before,after):
     for direction in ('download','upload'):
         assert measurement[direction]['request_batches']==[[65536]]
         assert measurement[direction]['quality']=='sampled' and measurement[direction]['duration_seconds']>=3
-assert before['reserved_bytes']+after['reserved_bytes']==262144 < summary['budget_bytes']
+assert summary['algorithm']['status']=='preserved' and summary['algorithm']['selected']=='cubic'
+assert summary['algorithm']['reason_code']=='short_sample' and len(summary['algorithm']['trials'])==1
+assert summary['algorithm']['reserved_bytes']==131072
+assert summary['accounted_bytes']==before['reserved_bytes']+after['reserved_bytes']+summary['algorithm']['reserved_bytes']==393216 < summary['budget_bytes']
 requests=[json.loads(line) for line in (root/'http-requests.jsonl').read_text().splitlines()]
 automatic_requests=[item for item in requests if item['mode']=='auto']
-assert len(automatic_requests)==4 and all(item['requested']==65536 for item in automatic_requests)
-assert sum(item['sent']+item['received'] for item in automatic_requests)==262144
+assert len(automatic_requests)==6 and all(item['requested']==65536 for item in automatic_requests)
+assert sum(item['sent']+item['received'] for item in automatic_requests)==393216
 (root/'auto-completed-report').write_text(str(path))
 PY
 report_path="$(cat "$TMP/auto-completed-report")"
@@ -260,13 +301,14 @@ grep -qx 'Full data: netpilot --lang en report --json' "$TMP/menu-report.log" ||
 printf 'PASS: default report and menu 10 work with group-writable /var/log; system permissions and legacy reports are preserved\n'
 
 
-# Exercise the real CLI with an installed-but-unloaded kernel capability.
+# An insufficient candidate budget must not implicitly load an unmeasured BBR module.
 # Only the module/kernel boundary is simulated; HTTP, files, dispatcher,
 # planning, verification, reports and rollback use the production code.
 printf 'ok\n' > "$TMP/mode"
 printf 'reno cubic\n' > "$TMP/kernel/net.ipv4.tcp_available_congestion_control"
 cp -a "$TMP/kernel" "$TMP/cold-original-kernel"
 export NETPILOT_TEST_MODULE_LOG="$TMP/module-calls"
+: > "$NETPILOT_TEST_MODULE_LOG"
 cat > "$TMP/bin/modprobe" <<'MODPROBE'
 #!/usr/bin/env bash
 set -Eeuo pipefail
@@ -275,13 +317,13 @@ printf 'tcp_bbr\n' >> "$NETPILOT_TEST_MODULE_LOG"
 printf 'reno cubic bbr\n' > "$NETPILOT_TEST_KERNEL/net.ipv4.tcp_available_congestion_control"
 MODPROBE
 chmod 0755 "$TMP/bin/modprobe"
-bash "$SCRIPT" --lang en tune --endpoint "$endpoint" --budget-mib 1 < /dev/null > "$TMP/cold-bbr.log" 2>&1 || {
-  cat "$TMP/cold-bbr.log" >&2; fail 'real CLI skipped or failed an installed but unloaded BBR module';
+bash "$SCRIPT" --lang en tune --endpoint "$endpoint" --budget-mib 1 --timeout 5 < /dev/null > "$TMP/cold-bbr.log" 2>&1 || {
+  cat "$TMP/cold-bbr.log" >&2; fail 'real CLI failed with an installed but unloaded BBR module';
 }
-[[ "$(wc -l < "$NETPILOT_TEST_MODULE_LOG")" == 1 ]] || fail 'real CLI did not load exactly the required module'
-[[ "$(cat "$TMP/kernel/net.ipv4.tcp_congestion_control")" == bbr ]] || fail 'real CLI failed to enable BBR'
-[[ "$(cat "$TMP/kernel/net.core.default_qdisc")" == fq ]] || fail 'real CLI failed to select default FQ'
-grep -qx tcp_bbr /etc/modules-load.d/netpilot.conf || fail 'real CLI did not save module loading for boot'
+[[ ! -s "$NETPILOT_TEST_MODULE_LOG" ]] || fail 'real CLI implicitly loaded an algorithm without candidate budget'
+[[ "$(cat "$TMP/kernel/net.ipv4.tcp_congestion_control")" == cubic ]] || fail 'real CLI failed to preserve the current algorithm'
+[[ "$(cat "$TMP/kernel/net.core.default_qdisc")" == fq_codel ]] || fail 'real CLI failed to preserve the default queue'
+[[ ! -e /etc/modules-load.d/netpilot.conf ]] || fail 'real CLI persisted an unselected BBR module'
 bash "$SCRIPT" --lang en verify > "$TMP/cold-bbr-verify.log" 2>&1 || fail 'real cold-BBR CLI configuration did not verify'
 bash "$SCRIPT" --lang en report --json > "$TMP/cold-bbr-summary.json"
 python3 - "$TMP/cold-bbr-summary.json" <<'PYREPORT'
@@ -289,16 +331,16 @@ import json, sys
 with open(sys.argv[1]) as f: data=json.load(f)
 assert data['status']=='completed' and data['changed'] and data['applied'] and data['verified'], data
 assert data['comparison'] is not None, data
+assert data['algorithm']['reason_code']=='insufficient_budget' and data['algorithm']['reserved_bytes']==0,data
 PYREPORT
 bash "$SCRIPT" --lang en rollback > "$TMP/cold-bbr-rollback.log" 2>&1 || fail 'real cold-BBR CLI rollback failed'
-# Module availability is capability discovery, not a writable TCP setting.
-# Do not force-unload a module that active connections may already be using.
+# No module is loaded or unloaded when the complete comparison cannot fit.
 [[ "$(cat "$TMP/cold-original-kernel/net.ipv4.tcp_available_congestion_control")" == 'reno cubic' ]] || fail 'cold fixture was not actually unloaded'
-[[ "$(cat "$TMP/kernel/net.ipv4.tcp_available_congestion_control")" == 'reno cubic bbr' ]] || fail 'rollback unexpectedly unloaded the BBR module'
+[[ "$(cat "$TMP/kernel/net.ipv4.tcp_available_congestion_control")" == 'reno cubic' ]] || fail 'automatic tuning or rollback unexpectedly changed module availability'
 for original in "$TMP/cold-original-kernel"/*; do
   key="${original##*/}"
   [[ "$key" == net.ipv4.tcp_available_congestion_control ]] && continue
   cmp -s "$TMP/kernel/$key" "$original" || fail "real cold-BBR CLI rollback changed original parameter: $key"
 done
 [[ ! -e /etc/modules-load.d/netpilot.conf ]] || fail 'real cold-BBR CLI rollback retained module persistence'
-printf 'PASS: real cold-BBR CLI loads, persists, verifies, compares and restores the original configuration\n'
+printf 'PASS: real cold-BBR CLI preserves the current algorithm/module state when comparison budget is insufficient\n'
