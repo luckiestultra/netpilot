@@ -248,11 +248,31 @@ diff -r "$TMP/kernel" "$TMP/original-kernel" > "$TMP/prior-rollback.diff" || fai
 cmp -s /etc/sysctl.d/99-netpilot.conf "$TMP/original.conf" || fail 'first-ever configuration was lost after per-run recovery'
 printf 'PASS: complete CLI restores this run after a real HTTP403 retest and preserves earlier applied state and first-ever backups\n'
 
+# Only the kernel activity counters are controlled in this case. HTTP requests,
+# response waits, the complete CLI, planning and file writes remain real.
+mkdir "$TMP/zero-tcp"
+cat > "$TMP/zero-tcp/sitecustomize.py" <<'ZEROTCP'
+import socket, struct
+original = socket.socket
+class ZeroActivitySocket(original):
+    def getsockopt(self, level, option, *args):
+        value = super().getsockopt(level, option, *args)
+        if level == socket.IPPROTO_TCP and option == socket.TCP_INFO and args:
+            data = bytearray(value)
+            if len(data) < 176: data.extend(bytes(176-len(data)))
+            struct.pack_into('=I', data, 68, 1000)
+            struct.pack_into('=I', data, 100, 0)
+            struct.pack_into('=Q', data, 168, 0)
+            return bytes(data)
+        return value
+socket.socket = ZeroActivitySocket
+ZEROTCP
 printf 'auto\n' > "$TMP/mode"
-bash "$SCRIPT" --lang en tune --endpoint "$endpoint" < /dev/null > "$TMP/auto.log" 2>&1 || {
+PYTHONPATH="$TMP/zero-tcp" bash "$SCRIPT" --lang en tune --endpoint "$endpoint" < /dev/null > "$TMP/auto.log" 2>&1 || {
   cat "$TMP/auto.log" >&2; fail 'default automatic-budget CLI required input or failed';
 }
 [[ "$(cat "$TMP/kernel/net.core.rmem_max")" -gt 212992 ]] || fail 'long automatic samples did not reach buffer planning'
+[[ "$(cat "$TMP/kernel/net.ipv4.tcp_congestion_control")" == cubic ]] || fail 'HTTP response waiting changed the global congestion algorithm'
 python3 - "$TMP" "$REPORT_ROOT" <<'PY'
 import json, pathlib, sys
 root=pathlib.Path(sys.argv[1]); reports=pathlib.Path(sys.argv[2])
@@ -272,49 +292,30 @@ for measurement in (before,after):
         assert measurement[direction]['quality']=='sampled' and measurement[direction]['duration_seconds']>=3
 # The peer delays its HTTP response after reading the entire small upload.
 # That wall time must never establish active sender time or select an algorithm.
-# Positive Linux busy counters can ask for work that fails preflight; zero or
-# unavailable counters retain a legacy attempt. Derive each branch from the
-# recorded input and independently verify the resulting request ledger.
-import math
-from fractions import Fraction
+# Explicit zero counters make this independent of host timer resolution. No
+# payload growth or algorithm switch may be inferred from response delay.
 algorithm=summary['algorithm']; upload=before['upload']; tcp=upload['tcp_info']
 assert algorithm['status']=='preserved' and algorithm['selected']=='cubic'
-amount,wall=upload['payload_bytes'],upload['duration_seconds']
-busy=tcp.get('busy_time_seconds')
-usable=(tcp.get('supported') is True and type(busy) in (int,float) and
-        math.isfinite(busy) and 0<busy<=wall+1)
-if tcp.get('supported') is True:
-    assert type(busy) in (int,float) and math.isfinite(busy) and 0<=busy<3,tcp
+amount=upload['payload_bytes']
+assert tcp['supported'] is True and tcp['busy_time_seconds']==0,tcp
+assert tcp['connection_busy_seconds']==[0,0,0,0],tcp
 expected_target=2*amount
-if usable:
-    expected_target=max(expected_target,math.ceil(Fraction(7*amount,2)/Fraction(busy)),
-                        math.ceil(Fraction(7*amount,2)/Fraction(wall)))
 assert algorithm['trial_allowance_bytes']==expected_target,algorithm
 assert algorithm['planned_trial_bytes']==6*expected_target,algorithm
-budget_fits=(expected_target<=before['budget_bytes'] and
-             6*expected_target<=summary['budget_bytes']-3*before['reserved_bytes'])
-wall_fits=wall*expected_target/amount<=before['timeout_seconds']
 requests=[json.loads(line) for line in (root/'http-requests.jsonl').read_text().splitlines()]
 automatic_requests=[item for item in requests if item['mode']=='auto']
 assert [(item['method'],item['requested']) for item in automatic_requests[:2]]==[('GET',65536),('POST',65536)]
 assert [(item['method'],item['requested']) for item in automatic_requests[-2:]]==[('GET',65536),('POST',65536)]
 candidate_requests=automatic_requests[2:-2]
-if not budget_fits or not wall_fits:
-    expected_reason='insufficient_budget' if not budget_fits else 'trial_timeout'
-    assert algorithm['reason_code']==expected_reason,algorithm
-    assert algorithm['trials']==[] and algorithm['reserved_bytes']==0,algorithm
-    assert candidate_requests==[],candidate_requests
-else:
-    assert len(algorithm['trials'])==1 and algorithm['reserved_bytes']==expected_target,algorithm
-    trial=algorithm['trials'][0]; evidence=trial['upload']; observed=evidence['tcp_info']
-    assert trial['exit_code']==0 and evidence['duration_seconds']>=3,trial
-    if observed.get('supported') is True:
-        assert observed['busy_time_seconds']<3 and algorithm['reason_code']=='short_sample',trial
-    else:
-        assert algorithm['reason_code']=='missing_tcp_info',trial
-    expected_sizes=[65536]*(expected_target//65536)+([expected_target%65536] if expected_target%65536 else [])
-    assert [(item['method'],item['requested']) for item in candidate_requests]==[('POST',size) for size in expected_sizes]
-    assert evidence['payload_bytes']==expected_target,trial
+assert algorithm['reason_code']=='missing_tcp_info',algorithm
+assert algorithm.get('discarded_trials',[])==[],algorithm
+assert len(algorithm['trials'])==1 and algorithm['reserved_bytes']==expected_target,algorithm
+trial=algorithm['trials'][0]; evidence=trial['upload']; observed=evidence['tcp_info']
+assert trial['exit_code']==0 and trial['algorithm']==trial['congestion_algorithm']=='cubic',trial
+assert evidence['duration_seconds']>=3 and observed['supported'] is True,trial
+assert observed['busy_time_seconds']==0 and observed['connection_busy_seconds']==[0,0,0,0],trial
+assert [(item['method'],item['requested']) for item in candidate_requests]==[('POST',65536),('POST',65536)]
+assert evidence['payload_bytes']==expected_target,trial
 assert summary['accounted_bytes']==before['reserved_bytes']+after['reserved_bytes']+algorithm['reserved_bytes'] < summary['budget_bytes']
 assert sum(item['sent']+item['received'] for item in automatic_requests)==summary['accounted_bytes']
 print('DETAIL: delayed-response algorithm=%s; trials=%d; candidate_requests=%d; accounted_bytes=%d' %
@@ -386,3 +387,5 @@ for original in "$TMP/cold-original-kernel"/*; do
 done
 [[ ! -e /etc/modules-load.d/netpilot.conf ]] || fail 'real cold-BBR CLI rollback retained module persistence'
 printf 'PASS: real cold-BBR CLI preserves the current algorithm/module state when comparison budget is insufficient\n'
+[[ "$(sha256sum "$SCRIPT" | awk '{print $1}')" == "$source_hash" ]] || fail 'source changed during CLI integration'
+printf 'SOURCE_SHA256: %s\n' "$source_hash"

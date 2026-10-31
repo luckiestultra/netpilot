@@ -2154,9 +2154,9 @@ PY
 # shellcheck shell=bash
 # HTTP probes use synthetic data only and never change network configuration.
 http_measure_path() {
-  local phase="${1:-}" endpoint="${2:-}" budget="${3:-}" deadline="${4:-}" output="${5:-}" before="${6:-}" congestion="${7:-}" direction="${8:-}" upload_target="${9:-}" dep
+  local phase="${1:-}" endpoint="${2:-}" budget="${3:-}" deadline="${4:-}" output="${5:-}" before="${6:-}" congestion="${7:-}" direction="${8:-}" upload_target="${9:-}" upload_limit="${10:-}" dep
   local http_measure_pid='' http_measure_status=0
-  if [[ $# -lt 5 || $# -gt 9 || ! "$deadline" =~ ^[0-9]{1,3}$ ]] || ((10#$deadline < 1 || 10#$deadline > 600)); then
+  if [[ $# -lt 5 || $# -gt 10 || ! "$deadline" =~ ^[0-9]{1,3}$ ]] || ((10#$deadline < 1 || 10#$deadline > 600)); then
     printf '%s\n' 'Invalid HTTP measurement arguments or timeout.' >&2
     return 2
   fi
@@ -2168,7 +2168,7 @@ http_measure_path() {
   done
   # Background the actual timeout monitor, so the caller's cancellation trap can
   # signal it while Bash waits. The monitor forwards TERM to its Python child.
-  LC_ALL=C timeout --foreground --kill-after=1 "${deadline}s" python3 - "$phase" "$endpoint" "$budget" "$deadline" "$output" "$before" "$congestion" "$direction" "$upload_target" <<'PY' &
+  LC_ALL=C timeout --foreground --kill-after=1 "${deadline}s" python3 - "$phase" "$endpoint" "$budget" "$deadline" "$output" "$before" "$congestion" "$direction" "$upload_target" "$upload_limit" <<'PY' &
 import http.client
 import ipaddress
 import json
@@ -2189,7 +2189,7 @@ import threading
 from concurrent.futures import ThreadPoolExecutor
 from urllib.parse import urlsplit
 
-phase, raw_endpoint, raw_budget, raw_timeout, output_name, before_name, requested_cc, only_direction, raw_upload_target = sys.argv[1:]
+phase, raw_endpoint, raw_budget, raw_timeout, output_name, before_name, requested_cc, only_direction, raw_upload_target, raw_upload_limit = sys.argv[1:]
 language = os.environ.get('NETPILOT_LANG', 'zh')
 report = {'type': 'netpilot-http-measurement', 'version': 1, 'ok': False,
           'phase': phase, 'endpoint': raw_endpoint, 'reserved_bytes': 0}
@@ -2603,6 +2603,10 @@ try:
     if raw_upload_target and (not only_direction or not re.fullmatch(r'[0-9]+', raw_upload_target) or
                               not integer(int(raw_upload_target), 1, budget)):
         raise ValueError('invalid explicit upload payload target')
+    if raw_upload_limit and (not raw_upload_target or not only_direction or
+                             not re.fullmatch(r'[0-9]+', raw_upload_limit) or
+                             not integer(int(raw_upload_limit), int(raw_upload_target), budget)):
+        raise ValueError('invalid adaptive upload payload limit')
     budget_mode = 'auto' if budget == AUTO_PHASE_BUDGET else 'fixed'
     if not output_name or os.path.lexists(output) or not os.path.isdir(os.path.dirname(output)):
         raise ValueError('report output must not exist and its directory must already exist')
@@ -2639,7 +2643,10 @@ try:
     if only_direction:
         slots['upload'] = budget
         upload_target = int(raw_upload_target) if raw_upload_target else previous['upload']['payload_bytes'] * 2
-        upload_batches = upload_replay(previous['upload']['request_batches'], upload_target)
+        upload_batches = upload_replay(previous['upload']['request_batches'],
+                                       int(raw_upload_limit) if raw_upload_limit else upload_target)
+        if raw_upload_limit:
+            report['adaptive_upload_limit'] = int(raw_upload_limit)
         report.update(requested_congestion_algorithm=requested_cc, measurement_direction='upload')
     elif requested_cc:
         report['requested_congestion_algorithm'] = requested_cc
@@ -2693,6 +2700,12 @@ try:
             if previous:
                 for sizes in (upload_batches if only_direction else previous[direction]['request_batches']):
                     run_batch(direction, sizes)
+                    if raw_upload_limit and item['payload_bytes'] >= upload_target:
+                        # Continue this same sample/socket set, rather than
+                        # discarding already charged payload and starting over.
+                        if (not upload_tcp_supported or not upload_srtt or max(upload_busy) <= 0 or
+                                max(upload_busy) >= 3.5 and time.perf_counter() - begin >= 3.5):
+                            break
             else:
                 ladder = (65536, 262144, 1048576, MAX_REQUEST_BYTES)
                 step = 0
@@ -2823,6 +2836,11 @@ class Cancelled(Exception):
 class Preserved(Exception):
     def __init__(self, reason):
         self.reason = reason
+
+class ShortSample(Preserved):
+    def __init__(self, item):
+        super().__init__('short_sample')
+        self.item = item
 
 def stop_child():
     if child is not None:
@@ -2981,20 +2999,24 @@ def replay_batches(batches, target):
                 break
     return plan
 
-def trial(cc, index, baseline, allowance, batches):
+def trial(cc, index, pair, baseline, allowance, batches, limit=None):
     global child
     name = os.path.join(directory, 'algorithm-trial-%d.json' % (index + 1))
     if os.path.lexists(name):
         raise ValueError('algorithm trial output already exists')
-    evidence = dict(index=index + 1, pair=index // 2 + 1, algorithm=cc,
-                    reserved_bytes=allowance, report_file=os.path.basename(name))
+    reservation = limit if limit is not None else allowance
+    evidence = dict(index=index + 1, pair=pair, algorithm=cc,
+                    reserved_bytes=reservation, report_file=os.path.basename(name))
     # Allocate the whole trial before starting it. Failed or absent child reports
     # retain this full charge, including bodies accepted before an HTTP refusal.
-    report['reserved_bytes'] += allowance
+    report['reserved_bytes'] += reservation
     report['trials'].append(evidence)
-    child = subprocess.Popen(['bash', '-c', backend + '\nhttp_measure_path "$@"', '_',
+    arguments = ['bash', '-c', backend + '\nhttp_measure_path "$@"', '_',
         'after', baseline['endpoint'], str(baseline['budget_bytes']), timeout_arg, name,
-        before_name, cc, 'upload', str(allowance)], stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+        before_name, cc, 'upload', str(allowance)]
+    if limit is not None:
+        arguments.append(str(limit))
+    child = subprocess.Popen(arguments, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
         start_new_session=True)
     try:
         available_time = 6 * int(timeout_arg) - (time.monotonic() - started)
@@ -3032,6 +3054,10 @@ def trial(cc, index, baseline, allowance, batches):
         evidence.update(upload=item, endpoint=value.get('endpoint'), process_cpu_seconds=value.get('process_cpu_seconds'),
                         address=value.get('address'), node=value.get('node'),
                         congestion_algorithm=value.get('congestion_algorithm'))
+        amount = item.get('payload_bytes')
+        if not integer(amount, allowance, reservation):
+            raise Preserved('conditions_mismatch')
+        expected_batches = replay_batches(baseline['upload']['request_batches'], amount) if limit is not None else batches
         if (value.get('type') != 'netpilot-http-measurement' or value.get('version') != 1 or
                 value.get('phase') != 'after' or value.get('endpoint') != baseline['endpoint'] or
                 value.get('address') != baseline['address'] or value.get('port') != baseline['port'] or
@@ -3040,14 +3066,18 @@ def trial(cc, index, baseline, allowance, batches):
                 value.get('connection_policy') != 'pinned-parallel' or
                 value.get('timeout_seconds') != int(timeout_arg) or
                 value.get('congestion_algorithm') != cc or value.get('requested_congestion_algorithm') != cc or
-                item.get('request_batches') != batches or
-                item.get('request_sizes') != [size for batch in batches for size in batch] or
-                item.get('payload_bytes') != allowance or value.get('reserved_bytes') != allowance):
+                item.get('request_batches') != expected_batches or
+                item.get('request_sizes') != [size for batch in expected_batches for size in batch] or
+                value.get('reserved_bytes') != amount):
             raise Preserved('conditions_mismatch')
         duration, bps = item.get('duration_seconds'), item.get('bits_per_second')
         if (not positive(duration, int(timeout_arg) + 1) or not positive(bps) or
-                not math.isclose(bps, allowance * 8 / duration, rel_tol=1e-8)):
+                not math.isclose(bps, amount * 8 / duration, rel_tol=1e-8)):
             raise ValueError('algorithm throughput metrics are corrupt')
+        # Only a validated successful measurement releases its unused allowance.
+        # Missing, refused or inconsistent reports retain the full reservation.
+        report['reserved_bytes'] -= reservation - amount
+        evidence['reserved_bytes'] = amount
         tcp = item.get('tcp_info')
         if (not isinstance(tcp, dict) or tcp.get('supported') is not True or
                 not positive(tcp.get('srtt_ms'), 60000) or
@@ -3058,10 +3088,10 @@ def trial(cc, index, baseline, allowance, batches):
                 tcp['busy_time_seconds'] != max(tcp['connection_busy_seconds']) or
                 not integer(tcp.get('total_retransmissions'), 0, 2 ** 63 - 1)):
             raise Preserved('missing_tcp_info')
-        if duration < 3 or tcp['busy_time_seconds'] < 3:
-            raise Preserved('short_sample')
         if tcp['busy_time_seconds'] > duration + 1:
             raise Preserved('missing_tcp_info')
+        if duration < 3 or tcp['busy_time_seconds'] < 3:
+            raise ShortSample(item)
         return item
     finally:
         stop_child()
@@ -3083,23 +3113,83 @@ try:
                   final_reserved_bytes=2 * spent, trial_allowance_bytes=allowance,
                   planned_trial_bytes=6 * allowance, endpoint=baseline['endpoint'],
                   address=baseline['address'], node=baseline['node'], parallelism=4,
-                  policy='three-paired-upload-v1')
+                  policy='three-paired-upload-v2', discarded_trials=[])
     if original not in ('cubic', 'bbr'):
         raise Preserved('unsupported_original')
     if baseline['node_verified'] is not True:
         raise Preserved('unverified_node')
-    if allowance > baseline['budget_bytes'] or 6 * allowance > int(whole_arg) - 3 * spent:
-        raise Preserved('insufficient_budget')
-    if baseline['upload']['duration_seconds'] * allowance / baseline['upload']['payload_bytes'] > int(timeout_arg):
-        raise Preserved('trial_timeout')
-    batches = replay_batches(baseline['upload']['request_batches'], allowance)
     candidate = 'bbr' if original == 'cubic' else 'cubic'
     report['candidate'] = candidate
-    pairs = []
-    for pair in range(3):
-        order = (original, candidate) if pair % 2 == 0 else (candidate, original)
-        items = {cc: trial(cc, pair * 2 + index, baseline, allowance, batches) for index, cc in enumerate(order)}
-        pairs.append(items)
+    sizing = baseline['upload']
+    sizes = baseline['upload']['request_sizes']
+    cycles, tail = divmod(4096, len(sizes))
+    request_limit = cycles * sum(sizes) + sum(sizes[:tail])
+    while True:
+        # Every discarded byte remains charged. Six equal samples and both
+        # final measurements must fit before another comparison starts.
+        available = int(whole_arg) - 3 * spent - report['reserved_bytes']
+        limit = min(baseline['budget_bytes'], available // 6, request_limit)
+        if allowance > limit:
+            tcp = sizing.get('tcp_info', {})
+            busy = tcp.get('busy_time_seconds')
+            if (not positive(busy) or limit < 2 * baseline['upload']['payload_bytes'] or
+                    limit * busy / sizing['payload_bytes'] < 3 or
+                    limit * sizing['duration_seconds'] / sizing['payload_bytes'] < 3):
+                raise Preserved('insufficient_budget')
+            allowance = limit
+            report.update(trial_allowance_bytes=allowance, planned_trial_bytes=6 * allowance)
+        if len(report['discarded_trials']) + 6 > 24:
+            raise Preserved('insufficient_budget')
+        if sizing['duration_seconds'] * allowance / sizing['payload_bytes'] > int(timeout_arg):
+            raise Preserved('trial_timeout')
+        batches = replay_batches(baseline['upload']['request_batches'], allowance)
+        pairs = []
+        try:
+            for pair in range(3):
+                order = (original, candidate) if pair % 2 == 0 else (candidate, original)
+                items = {}
+                for cc in order:
+                    index = len(report['discarded_trials']) + len(report['trials'])
+                    first = not report['trials']
+                    item = trial(cc, index, pair + 1, baseline, allowance, batches,
+                                 limit=limit if first else None)
+                    if first:
+                        allowance = item['payload_bytes']
+                        batches = replay_batches(baseline['upload']['request_batches'], allowance)
+                        report.update(trial_allowance_bytes=allowance, planned_trial_bytes=6 * allowance)
+                    items[cc] = item
+                pairs.append(items)
+            break
+        except ShortSample as short:
+            sizing = short.item
+            busy = sizing['tcp_info']['busy_time_seconds']
+            if busy <= 0:
+                raise Preserved('missing_tcp_info')
+            goal = Fraction(7, 2) * sizing['payload_bytes']
+            allowance = max(allowance + 1, math.ceil(goal / Fraction(busy)),
+                            math.ceil(goal / Fraction(sizing['duration_seconds'])))
+            available = int(whole_arg) - 3 * spent - report['reserved_bytes']
+            next_limit = min(baseline['budget_bytes'], available // 6, request_limit)
+            if allowance > next_limit:
+                if (next_limit <= sizing['payload_bytes'] or
+                        next_limit * busy / sizing['payload_bytes'] < 3 or
+                        next_limit * sizing['duration_seconds'] / sizing['payload_bytes'] < 3):
+                    raise Preserved('insufficient_budget')
+                allowance = next_limit
+            if len(report['discarded_trials']) + len(report['trials']) + 6 > 24:
+                raise Preserved('insufficient_budget')
+            # Full schedules remain in each private trial file. Keep discarded
+            # history compact so the bounded summary reader can still load it.
+            for previous in report['trials']:
+                upload = previous.get('upload')
+                if isinstance(upload, dict):
+                    upload['request_count'] = len(upload.pop('request_sizes', []))
+                    upload['batch_count'] = len(upload.pop('request_batches', []))
+            report['discarded_trials'].extend(report['trials'])
+            report['trials'] = []
+            report.update(trial_allowance_bytes=allowance, planned_trial_bytes=6 * allowance)
+            print(('自动补样：扩大工作量并重新配对比较，已用流量继续计账。' if os.environ.get('NETPILOT_LANG', 'zh') != 'en' else
+                   'Extending samples: restarting matched pairs; earlier payload remains charged.'), file=sys.stderr)
     gains = [pair[candidate]['bits_per_second'] / pair[original]['bits_per_second'] for pair in pairs]
     original_rtt = statistics.median(pair[original]['tcp_info']['srtt_ms'] for pair in pairs)
     rtt_delta = statistics.median(pair[candidate]['tcp_info']['srtt_ms'] - pair[original]['tcp_info']['srtt_ms'] for pair in pairs)
@@ -3355,9 +3445,19 @@ def selection_data(data, total=None):
     trials = data.get('trials')
     if not isinstance(trials, list) or len(trials) > 6:
         raise ValueError('invalid algorithm trial count')
-    charged = sum(integer(t.get('reserved_bytes'), 0, AUTO_TOTAL_BUDGET) for t in trials if isinstance(t, dict))
-    if any(not isinstance(t, dict) for t in trials) or charged != data['reserved_bytes']:
+    discarded = data.get('discarded_trials', [])
+    if (not isinstance(discarded, list) or len(discarded) > 18 or
+            discarded and data.get('policy') != 'three-paired-upload-v2'):
+        raise ValueError('invalid discarded algorithm trials')
+    all_trials = discarded + trials
+    charged = sum(integer(t.get('reserved_bytes'), 0, AUTO_TOTAL_BUDGET) for t in all_trials if isinstance(t, dict))
+    if any(not isinstance(t, dict) for t in all_trials) or charged != data['reserved_bytes']:
         raise ValueError('algorithm trial reservations disagree')
+    if data.get('policy') == 'three-paired-upload-v2':
+        for index, trial in enumerate(all_trials):
+            if (type(trial.get('index')) is not int or trial['index'] != index + 1 or
+                    trial.get('report_file') != 'algorithm-trial-%d.json' % (index + 1)):
+                raise ValueError('algorithm trial identities disagree')
     if data['status'] == 'preserved':
         if data['selected'] != data['original'] or data['reason_code'] == 'consistent_gain':
             raise ValueError('preserved algorithm changed or claims a selected gain')
@@ -3373,8 +3473,8 @@ def selection_data(data, total=None):
     planned = integer(data.get('planned_trial_bytes'), 1, budget)
     timeout = integer(data.get('timeout_seconds'), 1, 600)
     if (total is not None and budget != total or final != 2 * baseline or
-            planned != 6 * allowance or data['reserved_bytes'] != planned or
-            6 * allowance > budget - 3 * baseline):
+            planned != 6 * allowance or sum(t['reserved_bytes'] for t in trials) != planned or
+            data['reserved_bytes'] > budget - 3 * baseline):
         raise ValueError('selected algorithm did not reserve its paired work and final measurements')
     origin = data.get('endpoint')
     if not isinstance(origin, str) or endpoint(origin) != origin:
@@ -3383,16 +3483,16 @@ def selection_data(data, total=None):
     node = data.get('node')
     if (not isinstance(node, str) or not re.fullmatch('[A-Z0-9]{2,8}', node) or
             type(data.get('parallelism')) is not int or data['parallelism'] != 4 or
-            data.get('policy') != 'three-paired-upload-v1' or
+            data.get('policy') not in ('three-paired-upload-v1', 'three-paired-upload-v2') or
             urlsplit(origin).hostname == 'speed.cloudflare.com' and not address.is_global):
         raise ValueError('invalid selected algorithm path or policy')
     order = (original, candidate, candidate, original, original, candidate)
     common_work, rates, rtts = None, [], []
     for index, trial in enumerate(trials):
-        if (type(trial.get('index')) is not int or trial['index'] != index + 1 or
+        if (type(trial.get('index')) is not int or trial['index'] != len(discarded) + index + 1 or
                 type(trial.get('pair')) is not int or trial['pair'] != index // 2 + 1 or
                 type(trial.get('exit_code')) is not int or trial['exit_code'] != 0 or
-                trial.get('report_file') != 'algorithm-trial-%d.json' % (index + 1) or
+                trial.get('report_file') != 'algorithm-trial-%d.json' % (len(discarded) + index + 1) or
                 trial.get('algorithm') != order[index] or trial.get('congestion_algorithm') != order[index] or
                 any(trial.get(key) != data[key] for key in ('endpoint', 'address', 'node'))):
             raise ValueError('selected algorithm trial order, result or path differs')
@@ -3713,7 +3813,7 @@ try:
                             continue
                         with os.scandir(run_fd) as entries:
                             files = [(entry.name, entry.stat(follow_symlinks=False)) for entry in entries]
-                        if any(filename not in ('.netpilot-report', 'before.json', 'after.json', 'summary.json', 'confirmation.json', 'algorithm.json', 'run-snapshot.json', 'before-reservation.json', 'after-reservation.json', 'algorithm-reservation.json', 'confirmation-reservation.json') and filename not in tuple('algorithm-trial-%d.json' % n for n in range(1,7)) for filename, _ in files):
+                        if any(filename not in ('.netpilot-report', 'before.json', 'after.json', 'summary.json', 'confirmation.json', 'algorithm.json', 'run-snapshot.json', 'before-reservation.json', 'after-reservation.json', 'algorithm-reservation.json', 'confirmation-reservation.json') and filename not in tuple('algorithm-trial-%d.json' % n for n in range(1,25)) for filename, _ in files):
                             print(text('报告目录包含其他文件，已保留：', 'Report directory contains other files and was kept: ') + repr(str(root / name)), file=sys.stderr)
                             continue
                         if any(not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid() for _, info in files):
@@ -4037,7 +4137,7 @@ auto_tune() {
   }
   if [[ -n "$values" ]]; then read -r bandwidth rtt <<< "$values"; measured_options=(--bandwidth "$bandwidth" --rtt "$rtt"); fi
   stage=selection
-  np_msg '[2/5] 比较候选算法，证据不足保留原算法…\n' '[2/5] Comparing algorithms; inconclusive samples keep the current algorithm...\n'
+  np_msg '[2/5] 比较候选算法，样本不足时在预算内自动补足…\n' '[2/5] Comparing algorithms; extending short samples within the budget...\n'
   # Publish the maximum possible candidate charge before spawning children. If
   # their final report is lost, the ledger never silently treats traffic as zero.
   remaining="$(auto_report reserve-selection "$run_dir" "$total")" || { _auto_tune_finish 1; return $?; }

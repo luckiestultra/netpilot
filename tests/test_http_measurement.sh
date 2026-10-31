@@ -38,7 +38,7 @@ root = pathlib.Path(os.environ['NETPILOT_HTTP_TEST_TMP'])
 fragment = os.environ['NETPILOT_HTTP_TEST_FRAGMENT']
 state = {'mode': 'ok', 'requests': [], 'node': 'LAB', 'accepted': 0, 'generation': 0,
          'active': 0, 'max_active': 0, 'spans': [], 'barrier': None, 'upload_read': 0,
-         'bandwidth_next': 0.0, 'connections': 0}
+         'bandwidth_next': 0.0, 'connections': 0, 'upload_peers': set()}
 lock = threading.Lock()
 
 def shared_bandwidth(size):
@@ -147,6 +147,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         size = int(parse_qs(u.query).get('bytes', ['0'])[0])
         with lock:
             state['requests'].append(('POST', size, self.client_address[0]))
+            state['upload_peers'].add(self.client_address)
         remaining = int(self.headers.get('Content-Length', '0'))
         received = 0
         try:
@@ -179,7 +180,7 @@ threading.Thread(target=server.serve_forever, daemon=True).start()
 endpoint = 'http://127.0.0.1:%d' % server.server_address[1]
 budget = 1048576
 
-def run(name, phase='before', previous='', limit=10, endpoint_override=None, extra_env=None, cc='', direction='', upload_target=None):
+def run(name, phase='before', previous='', limit=10, endpoint_override=None, extra_env=None, cc='', direction='', upload_target=None, upload_limit=None):
     output = root / (name + '.json')
     env = dict(os.environ, NETPILOT_LANG='en', HTTP_PROXY='http://127.0.0.1:1', HTTPS_PROXY='http://127.0.0.1:1', ALL_PROXY='http://127.0.0.1:1')
     if extra_env:
@@ -188,6 +189,8 @@ def run(name, phase='before', previous='', limit=10, endpoint_override=None, ext
             endpoint_override or endpoint, str(budget), str(limit), str(output), str(previous), cc, direction]
     if upload_target is not None:
         args.append(str(upload_target))
+    if upload_limit is not None:
+        args.append(str(upload_limit))
     result = subprocess.run(args, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=limit + 4)
     report = json.loads(output.read_text()) if output.exists() else None
     return result, report, output
@@ -195,7 +198,7 @@ def run(name, phase='before', previous='', limit=10, endpoint_override=None, ext
 def reset(mode='ok'):
     state.update(mode=mode, requests=[], accepted=0, node='LAB', generation=state['generation'] + 1,
                  active=0, max_active=0, spans=[], upload_read=0,
-                 bandwidth_next=0.0, connections=0,
+                 bandwidth_next=0.0, connections=0, upload_peers=set(),
                  barrier=threading.Barrier(4) if mode == 'parallel-delay' else None)
 
 def valid_report(report, phase, expected_endpoint=endpoint, expected_address='127.0.0.1'):
@@ -308,6 +311,90 @@ try:
     budget = original_budget
     print('PASS: explicit upload byte plans replay identically beyond 2U, truncate the final request and reject invalid arguments before traffic')
 
+    # Keep actual localhost HTTP traffic and TCP connections, but control only
+    # the returned Linux TCP_INFO counters so a short sample is reproducible.
+    # A counter pair adds .6s of activity per acknowledged request. The real
+    # response delay supplies elapsed time independently of that counter.
+    counter_site = root / 'controlled-tcp'; counter_site.mkdir()
+    (counter_site / 'sitecustomize.py').write_text('''import os, socket, struct
+original = socket.socket
+class ControlledSocket(original):
+    def getsockopt(self, level, option, *args):
+        value = super().getsockopt(level, option, *args)
+        if level == socket.IPPROTO_TCP and option == socket.TCP_INFO and args:
+            if os.environ.get('NETPILOT_FIXTURE_TCP') == 'missing':
+                return bytes(100)
+            data = bytearray(value)
+            if len(data) < 176: data.extend(bytes(176-len(data)))
+            count = getattr(self, '_fixture_info_count', 0)
+            self._fixture_info_count = count + 1
+            busy = 0 if os.environ.get('NETPILOT_FIXTURE_TCP') == 'zero' else ((count+1)//2)*600000
+            struct.pack_into('=I', data, 68, 1000)
+            struct.pack_into('=I', data, 100, 0)
+            struct.pack_into('=Q', data, 168, busy)
+            return bytes(data)
+        return value
+socket.socket = ControlledSocket
+''')
+    counter_env = {'PYTHONPATH': str(counter_site)}
+    original_budget = budget
+    budget = expanded_before['budget_bytes']
+    minimum = 2 * before['upload']['payload_bytes']
+    maximum = 6 * before['upload']['payload_bytes']
+    reset('auto-delay')
+    result, filled, _ = run('upload-fill-live', 'after', expanded_path,
+                            cc='cubic', direction='upload', upload_target=minimum,
+                            upload_limit=maximum, extra_env=counter_env)
+    assert result.returncode == 0, (result.stderr.decode(), filled)
+    item = filled['upload']; actual = item['payload_bytes']
+    assert minimum < actual < maximum, (minimum, actual, maximum, filled)
+    assert item['duration_seconds'] >= 3.5 and item['tcp_info']['busy_time_seconds'] >= 3.5, filled
+    assert actual == filled['reserved_bytes'] == state['accepted']
+    assert state['max_active'] <= 4 and all(method == 'POST' for method, _, _ in state['requests'])
+    # Only the three RTT connections plus one persistent socket per used slot
+    # are allowed; extending must not close and restart the measurement.
+    width = max(map(len, item['request_batches']))
+    assert len(state['upload_peers']) == width and state['connections'] == 3 + width, state
+    reset('auto-delay')
+    result, replayed, _ = run('upload-fill-exact-replay', 'after', expanded_path,
+                              cc='cubic', direction='upload', upload_target=actual,
+                              extra_env=counter_env)
+    assert result.returncode == 0 and replayed['upload']['request_batches'] == item['request_batches'], (result.stderr.decode(), replayed, item)
+    assert replayed['reserved_bytes'] == state['accepted'] == actual
+    print('PASS: live HTTP short uploads extend on their original sockets and the final canonical work replays exactly')
+
+    # A cap is absolute even in the middle of a canonical batch. Zero/missing
+    # TCP activity must not turn arbitrary response delay into valid evidence.
+    reset('auto-delay')
+    result, capped_fill, _ = run('upload-fill-cap', 'after', expanded_path,
+                                 cc='cubic', direction='upload', upload_target=minimum,
+                                 upload_limit=minimum + 17, extra_env=counter_env)
+    assert result.returncode == 0 and capped_fill['reserved_bytes'] == state['accepted'] == minimum + 17, (result.stderr.decode(), capped_fill)
+    assert capped_fill['upload']['request_batches'][-1] == [17], capped_fill
+    assert capped_fill['upload']['duration_seconds'] < 3.5 or capped_fill['upload']['tcp_info']['busy_time_seconds'] < 3.5
+    for mode in ('zero', 'missing'):
+        reset()
+        result, no_busy, _ = run('upload-fill-' + mode, 'after', expanded_path,
+                                 cc='cubic', direction='upload', upload_target=minimum,
+                                 upload_limit=maximum,
+                                 extra_env={**counter_env, 'NETPILOT_FIXTURE_TCP': mode})
+        assert result.returncode == 0 and no_busy['reserved_bytes'] == state['accepted'] == minimum, (result.stderr.decode(), no_busy)
+    for index, (phase, cc, direction, target_arg, limit_arg) in enumerate((
+            ('before', '', '', 1, 2), ('after', 'cubic', '', 1, 2),
+            ('after', 'cubic', 'upload', 2, 1), ('after', 'cubic', 'upload', 1, 'bad'),
+            ('after', 'cubic', 'upload', 1, budget + 1))):
+        reset()
+        result, invalid, _ = run('invalid-fill-limit-%d' % index, phase,
+                                 expanded_path if phase == 'after' else '', cc=cc,
+                                 direction=direction, upload_target=target_arg, upload_limit=limit_arg)
+        assert result.returncode != 0 and not state['requests'] and state['connections'] == 0, (result.returncode, invalid, state)
+    reset()
+    result, invalid, _ = run('fill-request-limit', 'after', tiny_path,
+                             cc='cubic', direction='upload', upload_target=1, upload_limit=4097)
+    assert result.returncode != 0 and not state['requests'] and state['connections'] == 0, (result.returncode, invalid, state)
+    budget = original_budget
+    print('PASS: adaptive upload caps, missing activity and invalid limits cannot overrun payload or launch unbounded requests')
+
     # A synthetic baseline without usable TCP activity retains the legacy 2U
     # attempt; delayed ACK wall time still cannot qualify that trial.
     legacy_before = copy.deepcopy(before)
@@ -320,7 +407,8 @@ try:
     selection_dir = root / 'real-selector'
     selection_dir.mkdir(mode=0o700)
     result = subprocess.run(['bash', '-c', 'source "$1"; http_select_congestion "$2" "$3" 67108864 10 "$4" cubic',
-        '_', fragment, str(legacy_path), endpoint, str(selection_dir)], capture_output=True, timeout=15)
+        '_', fragment, str(legacy_path), endpoint, str(selection_dir)], capture_output=True, timeout=15,
+        env={**os.environ, **counter_env, 'NETPILOT_FIXTURE_TCP': 'zero'})
     selection = json.loads((selection_dir / 'algorithm.json').read_text())
     assert result.returncode == 0 and selection['status'] == 'preserved', (result.stderr.decode(), selection)
     assert selection['reason_code'] in ('short_sample', 'missing_tcp_info'), selection
@@ -338,7 +426,7 @@ try:
     cancel_dir.mkdir(mode=0o700)
     process = subprocess.Popen(['bash', '-c', 'source "$1"; http_select_congestion "$2" "$3" 67108864 10 "$4" cubic',
         '_', fragment, str(legacy_path), endpoint, str(cancel_dir)], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-        start_new_session=True)
+        start_new_session=True, env={**os.environ, **counter_env, 'NETPILOT_FIXTURE_TCP': 'zero'})
     descendants = {process.pid}
     try:
         for _ in range(100):

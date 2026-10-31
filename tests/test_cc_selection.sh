@@ -70,13 +70,13 @@ while left:
 sizes=[size for batch in batches for size in batch]
 ratio=1.2 if cc!=os.environ['CC_ORIGINAL'] else 1.
 if case=='threshold':ratio=1.1 if cc!=os.environ['CC_ORIGINAL'] else 1.
-if case in ('equal','replanned'):ratio=1.
+if case=='equal' or case.startswith('replanned'):ratio=1.
 if case=='mixed' and count==2:ratio=1.
 duration=4.8/ratio
-if case=='replanned':duration=b['upload']['duration_seconds']*sum(sizes)/b['upload']['payload_bytes']
+if case.startswith('replanned'):duration=b['upload']['duration_seconds']*sum(sizes)/b['upload']['payload_bytes']
 if case=='short':duration=.1
 busy=20. if case=='impossible-busy' else 1. if case=='overlap' else 3.2 if case!='idle' else .001
-if case=='replanned':busy=b['upload']['tcp_info']['busy_time_seconds']*sum(sizes)/b['upload']['payload_bytes']
+if case.startswith('replanned'):busy=b['upload']['tcp_info']['busy_time_seconds']*sum(sizes)/b['upload']['payload_bytes']
 srtt=1. if cc==os.environ['CC_ORIGINAL'] else (3. if case=='rtt' else 1.1)
 r=dict(b,phase='after',congestion_algorithm=cc,requested_congestion_algorithm=cc,
        reserved_bytes=sum(sizes),duration_seconds=duration,process_cpu_seconds=.05)
@@ -145,7 +145,9 @@ print('PASS: real fast-path baseline plans fractional replay bytes for six eligi
 # A complete comparison must fit before the first request, including when
 # TCP activity asks for more payload or predicts a wall-clock timeout.
 p,r,calls,_=run('replanned-budget',budget=14*1024**3,baseline=fast)
-assert p.returncode==0 and r['reason_code']=='insufficient_budget' and not calls,r
+assert p.returncode==0 and r['reason_code']=='no_consistent_gain' and len(calls)==6,r
+assert r['trial_allowance_bytes']==(14*1024**3-3*fast['reserved_bytes'])//6,r
+assert all(t['upload']['tcp_info']['busy_time_seconds']>=3 for t in r['trials']),r
 slow_wall=copy.deepcopy(fast);slow_wall['timeout_seconds']=10
 for direction in ('download','upload'):
  item=slow_wall[direction];item['duration_seconds']=8.
@@ -165,7 +167,7 @@ p,r,_,_=run('threshold')
 assert p.returncode==0 and r['status']=='selected',r
 print('PASS: three alternating paired upload schedules select either candidate only on consistent wins')
 for case,reason in [('equal','no_consistent_gain'),('mixed','no_consistent_gain'),('rtt','latency_regression'),
-                    ('short','short_sample'),('idle','short_sample'),('overlap','short_sample'),('missing-tcp','missing_tcp_info'),('impossible-busy','missing_tcp_info'),
+                    ('short','missing_tcp_info'),('idle','insufficient_budget'),('overlap','insufficient_budget'),('missing-tcp','missing_tcp_info'),('impossible-busy','missing_tcp_info'),
                     ('wrong-cc','conditions_mismatch'),('wrong-schedule','conditions_mismatch'),('wrong-peer','conditions_mismatch'),
                     ('forbidden','endpoint_rejected'),('missing-report','trial_failed'),('unsupported-cc','congestion_unavailable')]:
     p,r,calls,_=run(case)
@@ -180,7 +182,7 @@ assert p.returncode==0 and r['reason_code']=='unsupported_original' and not call
 print('PASS: full six-trial plan and two final measurements are reserved before any candidate traffic')
 for case in ('fatal','cancel'):
     p,r,calls,_=run(case)
-    assert p.returncode!=0 and r['reserved_bytes']==1048576,(case,p.returncode,r)
+    assert p.returncode!=0 and r['reserved_bytes']==min(base['budget_bytes'],(64*1048576-3*base['reserved_bytes'])//6),(case,p.returncode,r)
 corrupt=copy.deepcopy(base);corrupt['upload']['request_sizes']=[True]
 p,r,calls,_=run('corrupt',baseline=corrupt)
 assert p.returncode!=0 and not calls,(p.returncode,r,calls)
