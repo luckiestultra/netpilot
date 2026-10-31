@@ -139,8 +139,8 @@ summary=json.loads(reports[0].read_text())
 assert summary['status']=='failed' and summary['stage']=='before'
 assert summary['applied'] is False and summary['configuration_state']=='unchanged'
 requests=[json.loads(line) for line in (root/'http-requests.jsonl').read_text().splitlines()]
-assert len(requests)==1 and requests[0]['mode']=='limited'
-assert requests[0]['sent']==requests[0]['received']==0
+assert 1 <= len(requests) <= 4 and all(item['mode']=='limited' for item in requests)
+assert all(item['sent']==item['received']==0 for item in requests)
 PY
 printf 'PASS: full CLI rejects a real HTTP 429 baseline before creating configuration or backup state\n'
 
@@ -155,8 +155,12 @@ bash "$SCRIPT" --lang en tune --endpoint "$endpoint" --budget-mib 1 < /dev/null 
 [[ -f /var/lib/netpilot/original-values && -f /var/lib/netpilot/backup/sysctl-file ]] || fail 'CLI did not create its original-values and file backup'
 cmp -s /var/lib/netpilot/backup/sysctl-file "$TMP/original.conf" || fail 'CLI backup differs from the actual original configuration'
 grep -qx 'net.ipv4.tcp_congestion_control=cubic' /var/lib/netpilot/original-values || fail 'original algorithm was not recorded'
-[[ "$(cat "$TMP/kernel/net.ipv4.tcp_congestion_control")" == bbr && "$(cat "$TMP/kernel/net.core.default_qdisc")" == fq && "$(cat "$TMP/kernel/net.ipv4.tcp_moderate_rcvbuf")" == 1 ]] || fail 'real CLI did not apply the measured plan'
-grep -q 'Measured plan: bandwidth' "$TMP/success.log" || fail 'CLI did not identify its measured parameter source'
+[[ "$(cat "$TMP/kernel/net.ipv4.tcp_congestion_control")" == bbr && "$(cat "$TMP/kernel/net.core.default_qdisc")" == fq && "$(cat "$TMP/kernel/net.ipv4.tcp_moderate_rcvbuf")" == 1 ]] || fail 'real CLI did not apply the basic plan'
+for key in net.core.rmem_max net.core.wmem_max net.ipv4.tcp_rmem net.ipv4.tcp_wmem; do
+  cmp -s "$TMP/kernel/$key" "$TMP/original-kernel/$key" || fail "short local measurements changed buffer values: $key"
+done
+grep -Eiq 'short|budget-limited' "$TMP/success.log" || fail 'CLI omitted the short-sample reason'
+grep -Eiq 'buffers' "$TMP/success.log" || fail 'CLI did not explain why buffer values were preserved'
 bash "$SCRIPT" --lang en verify > "$TMP/verify.log" 2>&1 || fail 'separate real verify command rejected the persisted plan'
 python3 - "$TMP" "$REPORT_ROOT" <<'PY'
 import json, pathlib, stat, sys
@@ -169,6 +173,7 @@ assert summary['stage']=='completed' and summary['exit_code']==0
 assert summary['changed'] and summary['applied'] and summary['verified']
 assert summary['configuration_state']=='verified' and summary['comparison'] is not None
 assert summary['comparison']['causal_claim'] is False
+assert summary['comparison']['budget_limited'] is True
 assert stat.S_IMODE(reports.stat().st_mode)==0o700
 assert stat.S_IMODE(path.parent.stat().st_mode)==0o700
 for name in ['before.json','after.json','summary.json']:

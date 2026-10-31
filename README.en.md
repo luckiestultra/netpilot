@@ -18,7 +18,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/luckiestultra/netpilot/main/
 
 The script saves itself and opens the English menu. **Choose `9` to tune and `10` to view results.** `L` switches languages; `0` exits.
 
-Tuning measures, backs up, applies, verifies and retests automatically. No manual bandwidth, latency or report names are needed. The default whole-run payload budget is **128MiB**; protocol overhead is additional.
+Tuning measures, backs up, applies, verifies and retests automatically. No manual bandwidth, latency or report names are needed. The default whole-run payload budget is **128MiB**; protocol overhead is additional. A small initial probe is followed by measurements using up to 4 connections. Short samples trigger basic tuning while retaining existing buffers.
 
 Next time on the same server, run:
 
@@ -122,11 +122,11 @@ Chinese is the default; menu `L` switches the current session. Use `netpilot --l
 | `--endpoint` | `https://speed.cloudflare.com` | HTTPS origin with compatible download/upload APIs; HTTP is limited to loopback addresses. |
 | `--report-dir` | `/tmp/netpilot-reports` | Must not allow other users to write; cannot be inside `/var/lib/netpilot/`. |
 
-Tests use chunks of at most **4MiB** per request without increasing the total budget. This is a conservative client policy, not a claimed limit of the measurement service. Each phase gets half the budget, split between download and upload. Failed requests consume budget; HTTP rejection stops measurement without automatic retry.
+Tests start with a **64KiB** request, then increase in batches up to **4 connections and 4MiB per request**. These are client policies, not claimed service limits. Each phase gets half the budget, split between download and upload. Each batch is reserved before sending, with no refund on failure. HTTP rejection stops new batches without automatic retry.
 
-Rates are effective HTTP throughput including chunk-request overhead. Samples shorter than 3 seconds are marked budget-limited and cannot establish peak link bandwidth. Latency is the average of three TCP connection times.
+Rates are total bytes divided by elapsed wall time, representing observed multi-connection HTTP throughput. Each baseline direction stops after reaching 3 seconds of sampling or exhausting its budget; the budget never increases automatically. Buffer estimates use measurements only when both baseline directions reach 3 seconds. Short samples remain observational, with basic tuning still applied. Sufficient duration does not prove link saturation. Latency is the average of three TCP connection times.
 
-Retests reuse the baseline IP, request sizes and timeout; Cloudflare nodes must also match. Reports are saved automatically as `before.json`, `after.json` when available, and `summary.json`.
+Retests reuse the baseline IP, node, parallelism, batch plan and timeout. Reports are saved automatically as `before.json`, `after.json` when available, and `summary.json`. Older serial reports remain readable but cannot be compared with parallel reports.
 
 Baseline failure leaves settings unchanged. Apply or verification failures after this run starts writing attempt to restore the original baseline; retest failures retain verified settings. HTTP errors show the status code, download or upload direction, request size and reserved budget; menu `10` shows them again. On cancellation, check configuration and rollback states in the report.
 

@@ -121,8 +121,11 @@ import json, math, os, sys
 phase, endpoint, budget, seconds, output, scenario = sys.argv[1:]
 budget, seconds = int(budget), int(seconds)
 failed = (phase == 'before' and scenario in ('before_failure','cancel_before')) or (phase == 'after' and scenario in ('after_failure','cancel_after'))
-down, up, latency = (400e6, 100e6, 50.0) if phase == 'before' else (500e6, 125e6, 40.0)
-if phase == 'after' and scenario == 'regression': down, up, latency = 200e6, 50e6, 70.0
+down, up, latency = (80e6, 40e6, 50.0) if phase == 'before' else (100e6, 50e6, 40.0)
+if phase == 'after' and scenario == 'regression': down, up, latency = 40e6, 20e6, 70.0
+if scenario == 'short_sample': down, up = 400e6, 100e6
+if scenario == 'short_download': down = 400e6
+if scenario == 'short_upload': up = 400e6
 address, node = '1.1.1.1', 'NRT'
 size = budget // 2
 report = dict(type='netpilot-http-measurement', version=1, ok=not failed,
@@ -175,14 +178,19 @@ assert_no_changes() {
   cmp -s "$SYSCTL_FILE" "$CASE_DIR/original.conf" || fail 'failed preflight or measurement modified configuration'
 }
 
-assert_applied() {
+assert_basic_applied() {
   [[ "$(cat "$KERNEL_DIR/net.ipv4.tcp_congestion_control")" == bbr ]] || fail 'measured plan did not select BBR'
   [[ "$(cat "$KERNEL_DIR/net.core.default_qdisc")" == fq ]] || fail 'measured plan did not select default FQ'
-  [[ "$(cat "$KERNEL_DIR/net.core.rmem_max")" -gt 212992 ]] || fail 'measured bandwidth and latency did not affect buffer planning'
+  [[ "$(cat "$KERNEL_DIR/net.ipv4.tcp_moderate_rcvbuf")" == 1 ]] || fail 'basic plan did not enable receive-buffer autotuning'
   [[ -f "$STATE_DIR/original-values" && -f "$BACKUP_DIR/sysctl-file" ]] || fail 'automatic application omitted original state or configuration backup'
   cmp -s "$BACKUP_DIR/sysctl-file" "$CASE_DIR/original.conf" || fail 'automatic application did not preserve the original file'
   grep -qx 'net.ipv4.tcp_congestion_control=cubic' "$STATE_DIR/original-values" || fail 'original kernel value was not recorded'
   fixture_verify_tuning > "$CASE_DIR/final-verify" || fail 'automatic application is inconsistent with its saved values'
+}
+
+assert_applied() {
+  assert_basic_applied
+  [[ "$(cat "$KERNEL_DIR/net.core.rmem_max")" -gt 212992 ]] || fail 'measured bandwidth and latency did not affect buffer planning'
 }
 
 assert_restored() {
@@ -250,7 +258,7 @@ test_automatic_command_and_bilingual_menu() (
     fi
     python3 - "$PLAN_BANDWIDTH" "$PLAN_RTT" <<'PY'
 import math,sys
-assert math.isclose(float(sys.argv[1]),400.0)
+assert math.isclose(float(sys.argv[1]),80.0)
 assert math.isclose(float(sys.argv[2]),50.0)
 PY
     assert_applied
@@ -259,6 +267,36 @@ PY
     ! grep -Eq '用户输入|user input' "$CASE_DIR/output" || fail 'automatic plan mislabels measured values as user input'
     run_mutation rollback_tuning > "$CASE_DIR/rollback" 2>&1 || fail 'automatic changes cannot be rolled back'
     assert_restored
+  done
+)
+
+test_short_samples_keep_buffers_and_apply_basic_tuning() (
+  require_auto
+  local scenario lang key before plan
+  for scenario in short_sample short_download short_upload; do
+    for lang in zh en; do
+      setup_case "$scenario-$lang"; AUTO_SCENARIO="$scenario"
+      main --lang "$lang" tune < /dev/null > "$CASE_DIR/output" 2>&1 || fail 'short samples prevented basic automatic tuning'
+      [[ -z "$PLAN_BANDWIDTH" && -z "$PLAN_RTT" ]] || fail 'short measurements were used as path data for buffer planning'
+      assert_basic_applied
+      for key in net.core.rmem_max net.core.wmem_max net.ipv4.tcp_rmem net.ipv4.tcp_wmem; do
+        cmp -s "$KERNEL_DIR/$key" "$CASE_DIR/original-kernel/$key" || fail "short samples changed an existing buffer: $key"
+      done
+      before="$(summary_file)"; before="${before%/*}/before.json"
+      plan="$(auto_report plan "$before" "$AUTO_DEFAULT_ENDPOINT" 67108864 30)" || fail 'valid short samples were treated as invalid measurements'
+      [[ -z "$plan" ]] || fail 'report planner returned path values from a short sample'
+      grep -Eiq 'short|budget-limited|样本|预算受限' "$CASE_DIR/output" || fail 'short sample reason was omitted'
+      grep -Eiq 'buffers|缓冲' "$CASE_DIR/output" || fail 'preserved buffers were not explained'
+      python3 - "$(summary_file)" <<'PY'
+import json, sys
+d=json.load(open(sys.argv[1]))
+assert d['status']=='completed' and d['changed'] and d['applied'] and d['verified'],d
+assert d['comparison']['budget_limited'] is True,d
+assert any(d['before'][direction]['quality']=='budget-limited' for direction in ('download','upload')),d
+PY
+      run_mutation rollback_tuning > "$CASE_DIR/rollback" 2>&1 || fail 'basic short-sample tuning cannot be rolled back'
+      assert_restored
+    done
   done
 )
 
@@ -538,7 +576,7 @@ PY
 )
 
 failures=0
-for test in test_manual_fixture_and_rollback test_automatic_command_and_bilingual_menu test_automatic_options_and_budget test_invalid_options_are_zero_traffic test_baseline_failures_never_apply test_application_and_verification_failures_restore test_post_failures_keep_verified_settings test_no_change_still_compares test_observed_regression_does_not_force_rollback test_repeated_runs_preserve_reports_and_first_backup test_report_paths_preserve_existing_data test_report_paths_cannot_enter_tuning_state test_cancel_does_not_report_success test_noop_cancellation_preserves_previous_tuning test_cancelled_apply_with_failed_rollback_reports_uncertainty; do
+for test in test_manual_fixture_and_rollback test_automatic_command_and_bilingual_menu test_short_samples_keep_buffers_and_apply_basic_tuning test_automatic_options_and_budget test_invalid_options_are_zero_traffic test_baseline_failures_never_apply test_application_and_verification_failures_restore test_post_failures_keep_verified_settings test_no_change_still_compares test_observed_regression_does_not_force_rollback test_repeated_runs_preserve_reports_and_first_backup test_report_paths_preserve_existing_data test_report_paths_cannot_enter_tuning_state test_cancel_does_not_report_success test_noop_cancellation_preserves_previous_tuning test_cancelled_apply_with_failed_rollback_reports_uncertainty; do
   if "$test"; then printf 'PASS: %s\n' "$test"
   else
     failures=$((failures+1))

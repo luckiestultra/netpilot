@@ -11,28 +11,32 @@ script = str(Path(sys.argv[1]).resolve())
 temporary = tempfile.TemporaryDirectory()
 root = Path(temporary.name)
 
-def write_measurements(folder, budget=67108864, request_sizes=None, timeout=30):
+def write_measurements(folder, budget=67108864, request_sizes=None, timeout=30, parallel=False):
     for phase, down, up, latency in [('before', 100e6, 40e6, 50), ('after', 125e6, 50e6, 40)]:
         data = dict(type='netpilot-http-measurement', version=1, ok=True, phase=phase,
                     endpoint='https://speed.cloudflare.com', address='1.1.1.1', port=443,
                     node='NRT', family='IPv4', node_verified=True, connection_policy='pinned-preconnected',
                     latency_method='tcp-connect-estimate', latency_ms=latency, budget_bytes=budget,
                     reserved_bytes=budget, timeout_seconds=timeout, download_bps=down, upload_bps=up)
+        if parallel:
+            data.update(measurement_policy='parallel-http-v1', parallelism=4, connection_policy='pinned-parallel')
         for direction, rate in [('download', down), ('upload', up)]:
             size = budget // 2
             duration = size * 8 / rate
             sizes = request_sizes if request_sizes is not None else [4 * 1048576] * (size // (4 * 1048576))
             data[direction] = dict(request_sizes=sizes, payload_bytes=size, duration_seconds=duration,
                                    bits_per_second=rate, quality='sampled' if duration >= 3 else 'budget-limited')
+            if parallel:
+                data[direction]['request_batches'] = [sizes[i:i+4] for i in range(0, len(sizes), 4)]
         (folder / (phase + '.json')).write_text(json.dumps(data))
 
 def make_summary(name, status='failed', stage='before', code=1, changed=0, applied=0, verified=0,
                  verify_status='not-needed', rollback_status='not-needed',
-                 budget=134217728, request_sizes=None, timeout=30):
+                 budget=134217728, request_sizes=None, timeout=30, parallel=False):
     folder = root / name / 'run.fixture'
     folder.mkdir(parents=True)
     if status == 'completed':
-        write_measurements(folder, budget // 2, request_sizes, timeout)
+        write_measurements(folder, budget // 2, request_sizes, timeout, parallel)
     result = subprocess.run(['bash', '-c', 'source "$1"; auto_report summary "${@:2}"', '_', script,
                              str(folder), status, stage, str(code), str(budget), 'balanced', str(changed),
                              str(applied), str(verified), verify_status, rollback_status,
@@ -120,6 +124,24 @@ def rejected(name, original, update):
         assert result.returncode == 1, (name, 'accepted corrupt report', result.stdout, result.stderr)
         assert not result.stdout, (name, 'partial misleading output', result.stdout)
         assert 'Cannot read the latest report:' in result.stderr, (name, result.stderr)
+
+parallel_path = make_summary('parallel', status='completed', stage='completed', code=0, parallel=True)
+parallel = json.loads(parallel_path.read_text())
+for json_mode in (False, True):
+    result = read(parallel_path, json_mode)
+    assert result.returncode == 0, result.stderr
+for name, update in [
+    ('parallelism-changed', lambda d: d['after'].update(parallelism=2)),
+    ('parallelism-too-large', lambda d: d['before'].update(parallelism=5)),
+    ('parallel-policy-changed', lambda d: d['after'].pop('measurement_policy')),
+    ('parallel-batches-missing', lambda d: d['before']['download'].pop('request_batches')),
+    ('parallel-batch-mismatch', lambda d: d['before']['download'].update(request_batches=[[1048576]])),
+    ('parallel-batch-noninteger', lambda d: d['before']['download']['request_batches'][0].__setitem__(0, 4194304.0)),
+    ('parallel-batch-too-wide', lambda d: d['before']['download'].update(request_batches=[d['before']['download']['request_sizes']])),
+    ('parallel-batch-reordered', lambda d: d['after']['download'].update(request_batches=[[4194304]*2]*4)),
+]:
+    rejected(name, parallel, update)
+print('PASS: parallel reports validate bounded batch plans and reject mixed measurement policies or changed parallelism')
 
 too_many_sizes = [2 * 1048576] * 127 + [1048576, 1048576]
 assert len(too_many_sizes) == 129 and sum(too_many_sizes) == 268435456

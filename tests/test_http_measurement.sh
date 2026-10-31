@@ -36,7 +36,8 @@ from urllib.parse import parse_qs, urlsplit
 
 root = pathlib.Path(os.environ['NETPILOT_HTTP_TEST_TMP'])
 fragment = os.environ['NETPILOT_HTTP_TEST_FRAGMENT']
-state = {'mode': 'ok', 'requests': [], 'node': 'LAB', 'accepted': 0}
+state = {'mode': 'ok', 'requests': [], 'node': 'LAB', 'accepted': 0, 'generation': 0,
+         'active': 0, 'max_active': 0, 'spans': [], 'barrier': None, 'upload_read': 0}
 lock = threading.Lock()
 
 class Server(http.server.ThreadingHTTPServer):
@@ -45,6 +46,28 @@ class Server(http.server.ThreadingHTTPServer):
         # Deliberate early aborts reject bad headers before reading the body.
         if not isinstance(sys.exc_info()[1], OSError):
             super().handle_error(request, client_address)
+
+def tracked(method):
+    def request(self):
+        with lock:
+            generation, mode, barrier = state['generation'], state['mode'], state['barrier']
+            state['active'] += 1
+            state['max_active'] = max(state['max_active'], state['active'])
+        size = int(parse_qs(urlsplit(self.path).query).get('bytes', ['0'])[0])
+        begin = time.monotonic()
+        try:
+            if mode == 'parallel-delay' and size != 65536:
+                # Exactly four requests must reach the server together. A
+                # serial collector cannot pass this rendezvous.
+                barrier.wait(timeout=2)
+                time.sleep(.3)
+            return method(self)
+        finally:
+            with lock:
+                if state['generation'] == generation:
+                    state['active'] -= 1
+                    state['spans'].append((method.__name__, size, begin, time.monotonic()))
+    return request
 
 class Handler(http.server.BaseHTTPRequestHandler):
     protocol_version = 'HTTP/1.1'
@@ -58,7 +81,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.send_response(429 if mode == 'limited' else 403 if forbidden else 302 if mode == 'redirect' else 200)
         self.send_header('Content-Length', str(length))
         self.send_header('Content-Type', 'application/octet-stream')
-        node = 'ALT' if mode == 'node-change' and len(state['requests']) > 1 else state['node']
+        node = 'ALT' if mode == 'node-change' and size != 65536 else state['node']
         self.send_header('colo', node)
         self.send_header('CF-RAY', '0123456789abcdef-' + ('BAD' if mode == 'node-conflict' else node))
         if mode == 'encoded':
@@ -68,6 +91,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if uploaded is not None:
             self.send_header('cf-meta-upload-bytes', str(uploaded + (1 if mode == 'bad-ack' else 0)))
         self.end_headers()
+    @tracked
     def do_GET(self):
         u = urlsplit(self.path)
         size = int(parse_qs(u.query).get('bytes', ['0'])[0])
@@ -84,7 +108,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 return
             remaining = max(0, size - 1) if mode == 'short-body' else length
             while remaining:
-                chunk = b'x' * min(65536, remaining)
+                chunk = b'x' * min(16384 if mode == 'slow-pilot' else 65536, remaining)
+                if mode == 'slow-pilot':
+                    time.sleep(.8)
                 self.wfile.write(chunk)
                 remaining -= len(chunk)
             self.wfile.flush()
@@ -92,6 +118,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self.close_connection = True
         except (OSError, BrokenPipeError):
             self.close_connection = True
+    @tracked
     def do_POST(self):
         u = urlsplit(self.path)
         size = int(parse_qs(u.query).get('bytes', ['0'])[0])
@@ -101,13 +128,20 @@ class Handler(http.server.BaseHTTPRequestHandler):
         received = 0
         try:
             while remaining:
-                chunk = self.rfile.read(min(65536, remaining))
+                chunk = self.rfile.read(min(16384 if state['mode'] in ('slow-upload', 'slow-pilot') else 65536, remaining))
                 if not chunk:
                     break
                 assert not chunk.strip(b'\0'), 'upload must contain synthetic zero bytes only'
                 remaining -= len(chunk)
                 received += len(chunk)
-            state['accepted'] += received
+                if state['mode'] == 'slow-upload':
+                    with lock:
+                        state['upload_read'] += len(chunk)
+                    time.sleep(.02)
+                elif state['mode'] == 'slow-pilot':
+                    time.sleep(.8)
+            with lock:
+                state['accepted'] += received
             self.headers_for(0, received)
         except (OSError, BrokenPipeError):
             self.close_connection = True
@@ -130,18 +164,25 @@ def run(name, phase='before', previous='', limit=10, endpoint_override=None, ext
     return result, report, output
 
 def reset(mode='ok'):
-    state.update(mode=mode, requests=[], accepted=0, node='LAB')
+    state.update(mode=mode, requests=[], accepted=0, node='LAB', generation=state['generation'] + 1,
+                 active=0, max_active=0, spans=[], upload_read=0,
+                 barrier=threading.Barrier(4) if mode == 'parallel-delay' else None)
 
 def valid_report(report, phase, expected_endpoint=endpoint, expected_address='127.0.0.1'):
     assert report['type'] == 'netpilot-http-measurement' and report['version'] == 1 and report['ok'] is True
     assert report['phase'] == phase and report['endpoint'] == expected_endpoint
     assert report['address'] == expected_address and report['node'] == 'LAB'
     assert report['latency_method'] == 'tcp-connect-estimate'
+    assert report['measurement_policy'] == 'parallel-http-v1'
+    assert report['connection_policy'] == 'pinned-parallel' and report['parallelism'] == 4
     assert 0 < report['latency_ms'] <= 60000
     assert 0 < report['reserved_bytes'] <= report['budget_bytes'] == budget
     for direction in ('download', 'upload'):
         item = report[direction]
         assert item['payload_bytes'] == sum(item['request_sizes']) > 0
+        batches = item['request_batches']
+        assert batches and all(1 <= len(batch) <= 4 for batch in batches)
+        assert [size for batch in batches for size in batch] == item['request_sizes']
         assert math.isfinite(item['bits_per_second']) and item['bits_per_second'] > 0
         assert item['quality'] in ('sampled', 'budget-limited')
         assert item['duration_seconds'] > 0
@@ -164,9 +205,55 @@ try:
     assert result.returncode == 0, result.stderr.decode()
     valid_report(after, 'after')
     assert {d: after[d]['request_sizes'] for d in schedule} == schedule
-    assert [(method, size) for method, size, _ in state['requests']] == before_request_log
+    assert collections.Counter((method, size) for method, size, _ in state['requests']) == collections.Counter(before_request_log)
+    assert {d: after[d]['request_batches'] for d in schedule} == {d: before[d]['request_batches'] for d in schedule}
     assert before['node'] == after['node'] and before['address'] == after['address']
     print('PASS: real HTTP bidirectional probes, exact phase budget, pinned peer and matched before/after schedules')
+
+    reset('slow-pilot')
+    original_budget = budget
+    budget = 64 * 1048576
+    result, slow, _ = run('slow-pilot-before', limit=12)
+    assert result.returncode == 0, result.stderr.decode()
+    valid_report(slow, 'before')
+    assert [(method, size) for method, size, _ in state['requests']] == [('GET', 65536), ('POST', 65536)], state['requests']
+    assert state['max_active'] == 1 and slow['reserved_bytes'] == 131072
+    for direction in ('download', 'upload'):
+        item = slow[direction]
+        assert item['request_batches'] == [[65536]] and item['request_sizes'] == [65536]
+        assert 3 <= item['duration_seconds'] < 6 and item['quality'] == 'sampled', item
+    budget = original_budget
+    print('PASS: real slow transfers stop after a 64 KiB pilot per direction without launching larger requests')
+
+    reset('parallel-delay')
+    original_budget = budget
+    budget = 2228224
+    started = time.monotonic()
+    result, parallel, parallel_path = run('parallel-before')
+    elapsed = time.monotonic() - started
+    assert result.returncode == 0, result.stderr.decode()
+    valid_report(parallel, 'before')
+    assert 2 <= state['max_active'] <= 4, state['max_active']
+    for direction, method in (('download', 'do_GET'), ('upload', 'do_POST')):
+        item = parallel[direction]
+        assert item['request_batches'] == [[65536], [262144] * 4], item
+        all_spans = [(size, end - begin) for name, size, begin, end in state['spans'] if name == method]
+        spans = [duration for size, duration in all_spans if size != 65536]
+        assert len(all_spans) == 5 and len(spans) == 4 and min(spans) >= .29, all_spans
+        # The denominator is aggregate wall time, never summed worker time.
+        assert .29 <= item['duration_seconds'] < sum(spans) * .7, (item, spans, elapsed)
+        assert item['duration_seconds'] <= elapsed
+    parallel_requests = collections.Counter((method, size) for method, size, _ in state['requests'])
+    parallel_batches = {d: parallel[d]['request_batches'] for d in ('download', 'upload')}
+    reset('parallel-delay')
+    result, parallel_after, _ = run('parallel-after', 'after', parallel_path)
+    assert result.returncode == 0, result.stderr.decode()
+    valid_report(parallel_after, 'after')
+    assert collections.Counter((method, size) for method, size, _ in state['requests']) == parallel_requests
+    assert {d: parallel_after[d]['request_batches'] for d in ('download', 'upload')} == parallel_batches
+    assert 2 <= state['max_active'] <= 4
+    budget = original_budget
+    print('PASS: real simultaneous requests are capped at four, use aggregate wall time and replay identical batches')
 
     ipv6_info = pathlib.Path('/proc/net/if_inet6')
     ipv6_loopback = ipv6_info.exists() and any(line.split()[0] == '0' * 31 + '1' and line.split()[-1] == 'lo' for line in ipv6_info.read_text().splitlines())
@@ -191,6 +278,7 @@ try:
     result, capped, capped_path = run('default-phase-before')
     assert result.returncode == 0, (result.stderr.decode(), state['requests'])
     valid_report(capped, 'before')
+    assert 1 <= state['max_active'] <= 4, state['max_active']
     assert capped['provider'] == 'custom'
     assert max(size for _, size, _ in state['requests']) == 4 * 1048576
     assert sum(size for _, size, _ in state['requests']) <= budget
@@ -202,11 +290,13 @@ try:
     result, capped_after, _ = run('default-phase-after', 'after', capped_path)
     assert result.returncode == 0, result.stderr.decode()
     valid_report(capped_after, 'after')
+    assert 1 <= state['max_active'] <= 4, state['max_active']
     assert capped_after['budget_bytes'] == capped['budget_bytes'] == budget
     assert capped_after['reserved_bytes'] == capped['reserved_bytes']
-    assert [(method, size) for method, size, _ in state['requests']] == capped_requests
+    assert collections.Counter((method, size) for method, size, _ in state['requests']) == collections.Counter(capped_requests)
     for direction in ('download', 'upload'):
         assert capped_after[direction]['request_sizes'] == capped[direction]['request_sizes']
+        assert capped_after[direction]['request_batches'] == capped[direction]['request_batches']
     budget = small_budget
     print('PASS: default 64 MiB phases succeed against a real 4 MiB request limit with identical bidirectional schedules')
 
@@ -217,7 +307,7 @@ try:
     maximum['budget_bytes'] = maximum['reserved_bytes'] = budget
     for direction in ('download', 'upload'):
         item = maximum[direction]
-        item.update(request_sizes=[2 * 1048576] * 128, payload_bytes=budget // 2,
+        item.update(request_sizes=[2 * 1048576] * 128, request_batches=[[2 * 1048576] * 4 for _ in range(32)], payload_bytes=budget // 2,
                     duration_seconds=2.0, bits_per_second=budget * 2, quality='budget-limited')
         maximum[direction + '_bps'] = item['bits_per_second']
     maximum_path = root / 'maximum-baseline.json'
@@ -225,12 +315,15 @@ try:
     reset('forbidden')
     result, denied, _ = run('maximum-baseline-after', 'after', maximum_path)
     assert result.returncode != 0 and denied['ok'] is False
-    assert [(method, size) for method, size, _ in state['requests']] == [('GET', 2 * 1048576)]
-    assert denied['reserved_bytes'] == 2 * 1048576
+    assert 1 <= len(state['requests']) <= 4, state['requests']
+    assert all(method == 'GET' and size == 2 * 1048576 for method, size, _ in state['requests'])
+    assert denied['reserved_bytes'] == 8 * 1048576
+    assert denied['download']['request_sizes'] == [2 * 1048576] * 4
     assert denied['http_error']['status'] == 403 and denied['http_error']['direction'] == 'download'
     too_many = copy.deepcopy(maximum)
     for direction in ('download', 'upload'):
         too_many[direction]['request_sizes'] = [2 * 1048576] * 127 + [1048576, 1048576]
+        too_many[direction]['request_batches'] = [too_many[direction]['request_sizes'][i:i+4] for i in range(0, 129, 4)]
     too_many_path = root / 'too-many-baseline.json'
     too_many_path.write_text(json.dumps(too_many))
     reset()
@@ -252,18 +345,20 @@ try:
         assert report is not None and report['ok'] is False and report['error'], (mode, report)
         assert 0 <= report['reserved_bytes'] <= budget
         if mode in ('limited', 'forbidden', 'redirect', 'encoded', 'long-length', 'node-conflict'):
-            assert len(state['requests']) == 1, (mode, state['requests'])
+            assert 1 <= len(state['requests']) <= 4, (mode, state['requests'])
+            assert len(report['download']['request_batches']) == 1, (mode, report)
         assert sum(size for _, size, _ in state['requests']) <= budget
         if mode in ('forbidden', 'forbidden-upload'):
             direction = 'download' if mode == 'forbidden' else 'upload'
             method = 'GET' if direction == 'download' else 'POST'
             attempted = [size for requested_method, size, _ in state['requests'] if requested_method == method]
-            assert len(attempted) == 1, (mode, state['requests'])
+            assert 1 <= len(attempted) <= 4, (mode, state['requests'])
+            assert len(report[direction]['request_batches']) == 1, (mode, report)
             assert report['http_error']['status'] == 403
             assert report['http_error']['direction'] == direction
-            assert report['http_error']['request_bytes'] == attempted[0]
+            assert report['http_error']['request_bytes'] in report[direction]['request_batches'][0]
             assert report['http_error']['reserved_bytes'] == report['reserved_bytes']
-            assert report['reserved_bytes'] == sum(size for _, size, _ in state['requests'])
+            assert report['reserved_bytes'] >= sum(size for _, size, _ in state['requests'])
             assert report['reserved_bytes'] == sum(sum(report[d]['request_sizes']) for d in ('download', 'upload'))
     print('PASS: HTTP status, redirects, encoding, length, acknowledgement and node mismatches fail without retries')
 
@@ -274,11 +369,32 @@ try:
     invalid_path.write_text(json.dumps(tampered))
     result, report, _ = run('invalid-before', 'after', invalid_path)
     assert result.returncode != 0 and not state['requests']
+    for kind in ('legacy', 'parallelism', 'batch-flatten', 'batch-numeric-type', 'wide-batch'):
+        reset()
+        incompatible = copy.deepcopy(before)
+        if kind == 'legacy':
+            incompatible.pop('measurement_policy')
+            incompatible.pop('parallelism')
+            incompatible['connection_policy'] = 'pinned-preconnected'
+            for direction in ('download', 'upload'):
+                incompatible[direction].pop('request_batches')
+        elif kind == 'parallelism':
+            incompatible['parallelism'] = 5
+        elif kind == 'batch-flatten':
+            incompatible['download']['request_batches'][0][0] += 1
+        elif kind == 'batch-numeric-type':
+            incompatible['download']['request_batches'][0][0] = float(incompatible['download']['request_batches'][0][0])
+        else:
+            incompatible['download']['request_batches'] = [[1] * 5]
+        incompatible_path = root / ('incompatible-' + kind + '.json')
+        incompatible_path.write_text(json.dumps(incompatible))
+        result, rejected, _ = run('rejected-' + kind, 'after', incompatible_path)
+        assert result.returncode != 0 and rejected['ok'] is False and not state['requests'], kind
     reset()
     state['node'] = 'ALT'
     result, report, _ = run('changed-after', 'after', before_path)
     assert result.returncode != 0 and report['ok'] is False
-    print('PASS: invalid prior reports and changed after-test nodes cannot produce a comparison')
+    print('PASS: malformed or legacy runtime policies, invalid batches and changed after-test nodes fail without a comparison')
 
     reset('stall')
     started = time.monotonic()
@@ -304,11 +420,40 @@ try:
         children = subprocess.check_output(['ps', '-eo', 'pid=,pgid=,stat='], text=True)
         alive = [line for line in children.splitlines() if len(line.split()) == 3 and int(line.split()[1]) == process.pid and not line.split()[2].startswith('Z')]
         assert not alive, alive
+        requests_after_exit = list(state['requests'])
+        time.sleep(.15)
+        assert state['requests'] == requests_after_exit, 'measurement continued sending after cancellation'
     finally:
         if process.poll() is None:
             os.killpg(process.pid, signal.SIGKILL)
             process.communicate()
     print('PASS: SIGINT cancels the HTTP measurement without surviving child processes')
+
+    reset('slow-upload')
+    output = root / 'cancel-upload.json'
+    command = ['bash', '-c', 'source "$1"; http_measure_path before "$2" 67108864 10 "$3"', '_', fragment, endpoint, str(output)]
+    process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True)
+    try:
+        for _ in range(150):
+            if (any(method == 'POST' and size == 4 * 1048576 for method, size, _ in state['requests']) or
+                    process.poll() is not None):
+                break
+            time.sleep(.02)
+        assert process.poll() is None and any(method == 'POST' and size == 4 * 1048576 for method, size, _ in state['requests']), process.communicate() if process.poll() is not None else state
+        os.killpg(process.pid, signal.SIGINT)
+        process.communicate(timeout=3)
+        assert process.returncode != 0
+        children = subprocess.check_output(['ps', '-eo', 'pid=,pgid=,stat='], text=True)
+        alive = [line for line in children.splitlines() if len(line.split()) == 3 and int(line.split()[1]) == process.pid and not line.split()[2].startswith('Z')]
+        assert not alive, alive
+        requests_after_exit = list(state['requests'])
+        time.sleep(.15)
+        assert state['requests'] == requests_after_exit, 'new HTTP requests started after upload cancellation'
+    finally:
+        if process.poll() is None:
+            os.killpg(process.pid, signal.SIGKILL)
+            process.communicate()
+    print('PASS: cancellation during real upload closes worker processes and starts no further HTTP requests')
 
     reset()
     result, report, _ = run('insecure-remote', endpoint_override='http://example.com')

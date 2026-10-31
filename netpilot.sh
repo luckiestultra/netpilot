@@ -1318,7 +1318,11 @@ adaptive_plan() {
   fi
   adaptive_add_change net.ipv4.tcp_moderate_rcvbuf 1 "$(np_msg '保留接收缓冲区自动调节能力。' 'Preserve receive-buffer autotuning.')"
   if [[ -z "$PLAN_BANDWIDTH" ]]; then
-    PLAN_NOTES+=("$(np_msg '未提供路径带宽与 RTT，保留现有缓冲区；未执行测速。' 'No path bandwidth/RTT provided; existing buffers are retained and no benchmark was run.')")
+    if [[ -n "${AUTO_TUNE_ENDPOINT:-}" ]]; then
+      PLAN_NOTES+=("$(np_msg '测速样本不足，保留现有缓冲区，仅执行基础调优。' 'Measurement samples are too short; existing buffers are retained and only basic tuning is applied.')")
+    else
+      PLAN_NOTES+=("$(np_msg '未提供路径带宽与 RTT，保留现有缓冲区；未执行测速。' 'No path bandwidth/RTT provided; existing buffers are retained and no benchmark was run.')")
+    fi
     return 0
   fi
   limit="$(adaptive_buffer_limit "$memory" "$PLAN_PROFILE" "$PLAN_BANDWIDTH" "$PLAN_RTT")"
@@ -1909,13 +1913,17 @@ import stat
 import sys
 import tempfile
 import time
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from urllib.parse import urlsplit
 
 phase, raw_endpoint, raw_budget, raw_timeout, output_name, before_name = sys.argv[1:]
 language = os.environ.get('NETPILOT_LANG', 'zh')
 report = {'type': 'netpilot-http-measurement', 'version': 1, 'ok': False,
           'phase': phase, 'endpoint': raw_endpoint, 'reserved_bytes': 0}
-connection = None
+connections = [None] * 4
+executor = None
+stopping = threading.Event()
 output = os.path.abspath(output_name)
 started = time.monotonic()
 deadline_at = started + int(raw_timeout)
@@ -1930,7 +1938,20 @@ class Cancelled(Exception):
         super().__init__('measurement cancelled')
         self.code = 128 + number
 
+def close_connections():
+    stopping.set()
+    for connection in connections:
+        if connection is not None:
+            sock = connection.sock
+            if sock is not None:
+                try:
+                    sock.shutdown(socket.SHUT_RDWR)
+                except OSError:
+                    pass
+            connection.close()
+
 def cancelled(number, _frame):
+    close_connections()
     raise Cancelled(number)
 
 signal.signal(signal.SIGINT, cancelled)
@@ -1952,6 +1973,7 @@ def positive(value, high=float('inf')):
 # Client resource policy, not a claim about any provider's service limit.
 MAX_REQUEST_BYTES = 4 * 1048576
 MAX_REQUESTS_PER_DIRECTION = 128
+PARALLELISM = 4
 
 def publish(value):
     # Link a complete private temporary file into place without replacing any
@@ -1998,7 +2020,9 @@ def read_before(path):
         raise ValueError('plaintext baseline address is not loopback')
     if not isinstance(value.get('node'), str) or not value['node'] or len(value['node']) > 128:
         raise ValueError('invalid baseline node')
-    if type(value.get('node_verified')) is not bool or value.get('connection_policy') != 'pinned-preconnected':
+    if (type(value.get('node_verified')) is not bool or value.get('connection_policy') != 'pinned-parallel' or
+            value.get('measurement_policy') != 'parallel-http-v1' or
+            type(value.get('parallelism')) is not int or value['parallelism'] != PARALLELISM):
         raise ValueError('invalid baseline connection or node-verification policy')
     if cloudflare and (value.get('node_verified') is not True or not re.fullmatch(r'[A-Z0-9]{2,8}', value['node'])):
         raise ValueError('baseline Cloudflare node is not verified')
@@ -2008,6 +2032,12 @@ def read_before(path):
         if not isinstance(item, dict):
             raise ValueError('missing baseline direction')
         sizes = item.get('request_sizes')
+        batches = item.get('request_batches')
+        if (not isinstance(batches, list) or not 1 <= len(batches) <= MAX_REQUESTS_PER_DIRECTION or
+                any(not isinstance(batch, list) or not 1 <= len(batch) <= PARALLELISM for batch in batches) or
+                any(type(size) is not int for batch in batches for size in batch) or
+                [size for batch in batches for size in batch] != sizes):
+            raise ValueError('invalid baseline parallel batch plan')
         if (not isinstance(sizes, list) or not 1 <= len(sizes) <= MAX_REQUESTS_PER_DIRECTION or
                 any(not integer(size, 1, min(MAX_REQUEST_BYTES, slots[direction])) for size in sizes) or
                 sum(sizes) > slots[direction] or item.get('payload_bytes') != sum(sizes) or
@@ -2024,12 +2054,16 @@ def read_before(path):
         raise ValueError('invalid baseline reservation total')
     return value
 
-def dial(address_value, family_value):
+def dial(address_value, family_value, owner=None):
     sock = socket.socket(family_value, socket.SOCK_STREAM)
+    if owner is not None:
+        owner.sock = sock
     sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
     sock.settimeout(remaining())
     begin = time.perf_counter()
     try:
+        if stopping.is_set():
+            raise ValueError('measurement cancelled')
         destination = (address_value, port, 0, 0) if family_value == socket.AF_INET6 else (address_value, port)
         sock.connect(destination)
         elapsed = (time.perf_counter() - begin) * 1000
@@ -2040,16 +2074,16 @@ def dial(address_value, family_value):
         sock.close()
         raise
 
-def check_headers(response, direction, size):
+class HTTPRejected(ValueError):
+    def __init__(self, status):
+        self.status = status
+        super().__init__('measurement endpoint returned HTTP %d' % status)
+
+def check_headers(response):
     if sum(len(key) + len(value) for key, value in response.getheaders()) > 16384:
         raise ValueError('response headers exceed the allowed size')
     if response.status != 200:
-        report['http_error'] = dict(status=response.status, direction=direction,
-                                    request_bytes=size, reserved_bytes=report['reserved_bytes'])
-        label = text('下载', 'download') if direction == 'download' else text('上传', 'upload')
-        raise ValueError(text('测速接口返回 HTTP %d（%s，单次 %d 字节；本阶段已预扣 %d 字节）',
-                              'measurement endpoint returned HTTP %d (%s; request %d bytes; phase reserved %d bytes)') %
-                         (response.status, label, size, report['reserved_bytes']))
+        raise HTTPRejected(response.status)
     if response.getheader('Content-Encoding', 'identity').lower().strip() != 'identity':
         raise ValueError('encoded measurement responses are not supported')
     identities = []
@@ -2071,103 +2105,134 @@ def check_headers(response, direction, size):
     if cloudflare and not identities:
         raise ValueError('Cloudflare measurement node cannot be verified')
     node = identities[0] if identities else 'address:' + address
-    expected = report.get('node')
-    if expected is not None and node != expected:
-        raise ValueError('measurement node changed')
-    report['node'] = node
-    report['node_verified'] = bool(identities)
+    return node, bool(identities)
 
-def prepare_connection():
-    global connection
+def prepare_connection(index):
+    if stopping.is_set():
+        raise ValueError('measurement cancelled')
+    connection = connections[index]
     if connection is None:
         context = ssl.create_default_context() if scheme == 'https' else None
         class PinnedConnection(http.client.HTTPConnection):
             def connect(self):
-                raw_socket, _ = dial(address, family)
+                raw_socket, _ = dial(address, family, self)
                 try:
-                    self.sock = context.wrap_socket(raw_socket, server_hostname=host) if context else raw_socket
+                    self.sock = context.wrap_socket(raw_socket, server_hostname=host,
+                                                    do_handshake_on_connect=False) if context else raw_socket
                     self.sock.settimeout(remaining())
+                    if stopping.is_set():
+                        raise ValueError('measurement cancelled')
+                    if context:
+                        self.sock.do_handshake()
                 except BaseException:
                     raw_socket.close()
+                    if self.sock is not None:
+                        self.sock.close()
                     raise
         connection = PinnedConnection(host, port, timeout=remaining())
-    # A clean server-requested close between completed requests may require a
-    # new connection; always reconnect to the pinned address before timing.
+        connections[index] = connection
+    if stopping.is_set():
+        raise ValueError('measurement cancelled')
     if connection.sock is None:
         connection.connect()
+    if stopping.is_set():
+        raise ValueError('measurement cancelled')
+    connection.sock.settimeout(remaining())
+    return connection
+
+def update_timeout(connection):
+    if stopping.is_set():
+        raise ValueError('measurement cancelled')
     connection.sock.settimeout(remaining())
 
-def update_timeout():
-    limit = remaining()
-    if connection is not None and connection.sock is not None:
-        connection.sock.settimeout(limit)
+def probe(index, direction, size):
+    # Each connection has one request in flight; workers return local results.
+    payload = 0
+    try:
+        connection = prepare_connection(index)
+        if direction == 'download':
+            connection.request('GET', '/__down?bytes=%d' % size,
+                               headers={'Accept-Encoding': 'identity', 'User-Agent': 'NetPilot/1'})
+            update_timeout(connection)
+            response = connection.getresponse()
+            node, verified = check_headers(response)
+            length = response.getheader('Content-Length')
+            if length is None or not re.fullmatch(r'[0-9]+', length) or int(length) != size or response.getheader('Transfer-Encoding'):
+                raise ValueError('download length does not match the reserved payload')
+            left = size
+            while left:
+                update_timeout(connection)
+                try:
+                    data = response.read(min(65536, left))
+                except http.client.IncompleteRead as exc:
+                    payload += len(exc.partial)
+                    raise ValueError('download ended before the reserved payload was received') from exc
+                if not data:
+                    raise ValueError('download ended before the reserved payload was received')
+                payload += len(data)
+                left -= len(data)
+            response.close()
+        else:
+            connection.putrequest('POST', '/__up?bytes=%d' % size, skip_accept_encoding=True)
+            connection.putheader('Content-Length', str(size))
+            connection.putheader('Content-Type', 'application/octet-stream')
+            connection.putheader('Accept-Encoding', 'identity')
+            connection.putheader('User-Agent', 'NetPilot/1')
+            connection.endheaders()
+            left = size
+            zeros = b'\0' * min(65536, size)
+            while left:
+                update_timeout(connection)
+                chunk = zeros if left >= len(zeros) else zeros[:left]
+                connection.send(chunk)
+                payload += len(chunk)
+                left -= len(chunk)
+            update_timeout(connection)
+            response = connection.getresponse()
+            node, verified = check_headers(response)
+            acknowledged = response.getheader('cf-meta-upload-bytes', '')
+            if not re.fullmatch(r'[0-9]+', acknowledged) or int(acknowledged) != size:
+                raise ValueError('server did not acknowledge the complete upload')
+            length = response.getheader('Content-Length')
+            if length is not None and (not re.fullmatch(r'[0-9]+', length) or int(length) != 0):
+                raise ValueError('unexpected upload response body')
+            update_timeout(connection)
+            if response.read(1):
+                raise ValueError('unexpected upload response body')
+            response.close()
+        return payload, node, verified, None
+    except Exception as exc:
+        return payload, None, False, exc
 
-def probe(direction, size):
+def run_batch(direction, sizes):
     item = report[direction]
-    if size > MAX_REQUEST_BYTES or len(item['request_sizes']) >= MAX_REQUESTS_PER_DIRECTION:
-        raise ValueError('measurement request exceeds the client resource policy')
-    if report['reserved_bytes'] + size > budget or sum(item['request_sizes']) + size > slots[direction]:
+    if (not 1 <= len(sizes) <= PARALLELISM or
+            len(item['request_sizes']) + len(sizes) > MAX_REQUESTS_PER_DIRECTION or
+            any(not integer(size, 1, MAX_REQUEST_BYTES) for size in sizes)):
+        raise ValueError('measurement batch exceeds the client resource policy')
+    total = sum(sizes)
+    if report['reserved_bytes'] + total > budget or sum(item['request_sizes']) + total > slots[direction]:
         raise ValueError('measurement payload budget exhausted')
-    # Debit before the request. Failed or partially transmitted requests never
-    # receive a refund and are never retried.
-    report['reserved_bytes'] += size
-    item['request_sizes'].append(size)
-    prepare_connection()
-    begin = time.perf_counter()
-    if direction == 'download':
-        connection.request('GET', '/__down?bytes=%d' % size,
-                           headers={'Accept-Encoding': 'identity', 'User-Agent': 'NetPilot/1'})
-        update_timeout()
-        response = connection.getresponse()
-        check_headers(response, direction, size)
-        length = response.getheader('Content-Length')
-        if length is None or not re.fullmatch(r'[0-9]+', length) or int(length) != size or response.getheader('Transfer-Encoding'):
-            raise ValueError('download length does not match the reserved payload')
-        left = size
-        while left:
-            update_timeout()
-            try:
-                data = response.read(min(65536, left))
-            except http.client.IncompleteRead as exc:
-                item['payload_bytes'] += len(exc.partial)
-                raise ValueError('download ended before the reserved payload was received') from exc
-            if not data:
-                raise ValueError('download ended before the reserved payload was received')
-            item['payload_bytes'] += len(data)
-            left -= len(data)
-        response.close()
-    else:
-        connection.putrequest('POST', '/__up?bytes=%d' % size, skip_accept_encoding=True)
-        connection.putheader('Content-Length', str(size))
-        connection.putheader('Content-Type', 'application/octet-stream')
-        connection.putheader('Accept-Encoding', 'identity')
-        connection.putheader('User-Agent', 'NetPilot/1')
-        connection.endheaders()
-        left = size
-        zeros = b'\0' * min(65536, size)
-        while left:
-            update_timeout()
-            chunk = zeros if left >= len(zeros) else zeros[:left]
-            connection.send(chunk)
-            item['payload_bytes'] += len(chunk)
-            left -= len(chunk)
-        update_timeout()
-        response = connection.getresponse()
-        check_headers(response, direction, size)
-        acknowledged = response.getheader('cf-meta-upload-bytes', '')
-        if not re.fullmatch(r'[0-9]+', acknowledged) or int(acknowledged) != size:
-            raise ValueError('server did not acknowledge the complete upload')
-        length = response.getheader('Content-Length')
-        if length is not None and (not re.fullmatch(r'[0-9]+', length) or int(length) != 0):
-            raise ValueError('unexpected upload response body')
-        update_timeout()
-        if response.read(1):
-            raise ValueError('unexpected upload response body')
-        response.close()
-    duration = time.perf_counter() - begin
-    if not positive(duration):
-        raise ValueError('invalid measurement duration')
-    item['duration_seconds'] += duration
+    # Reserve the entire in-flight batch before submitting any request.
+    report['reserved_bytes'] += total
+    item['request_sizes'].extend(sizes)
+    item['request_batches'].append(sizes)
+    futures = [executor.submit(probe, index, direction, size) for index, size in enumerate(sizes)]
+    results = [future.result() for future in futures]
+    item['payload_bytes'] += sum(result[0] for result in results)
+    for size, (_, node, verified, error) in zip(sizes, results):
+        if isinstance(error, HTTPRejected):
+            report['http_error'] = dict(status=error.status, direction=direction,
+                                        request_bytes=size, reserved_bytes=report['reserved_bytes'])
+            label = text('下载', 'download') if direction == 'download' else text('上传', 'upload')
+            raise ValueError(text('测速接口返回 HTTP %d（%s，单次 %d 字节；本阶段已预扣 %d 字节）',
+                                  'measurement endpoint returned HTTP %d (%s; request %d bytes; phase reserved %d bytes)') %
+                             (error.status, label, size, report['reserved_bytes']))
+        if error is not None:
+            raise error
+        if report.get('node') is not None and (node != report['node'] or verified != report['node_verified']):
+            raise ValueError('measurement node changed')
+        report.update(node=node, node_verified=verified)
 
 exit_code = 1
 try:
@@ -2202,7 +2267,8 @@ try:
     endpoint = scheme + '://' + netloc
     slots = {'download': budget // 2, 'upload': budget // 2}
     report.update(endpoint=endpoint, budget_bytes=budget, timeout_seconds=int(raw_timeout),
-                  latency_method='tcp-connect-estimate', connection_policy='pinned-preconnected',
+                  latency_method='tcp-connect-estimate', connection_policy='pinned-parallel',
+                  measurement_policy='parallel-http-v1', parallelism=PARALLELISM,
                   provider='cloudflare' if cloudflare else 'custom')
     previous = read_before(before_name) if phase == 'after' else None
     if phase == 'before' and before_name:
@@ -2246,22 +2312,35 @@ try:
     report.update(address=address, port=port, family='IPv6' if family == socket.AF_INET6 else 'IPv4',
                   latency_ms=sum(timings) / len(timings), latency_samples=len(timings))
     for direction in ('download', 'upload'):
-        report[direction] = {'request_sizes': [], 'payload_bytes': 0, 'duration_seconds': 0.0}
+        report[direction] = {'request_sizes': [], 'request_batches': [], 'payload_bytes': 0, 'duration_seconds': 0.0}
+    executor = ThreadPoolExecutor(max_workers=PARALLELISM)
     for direction in ('download', 'upload'):
-        if previous:
-            for size in previous[direction]['request_sizes']:
-                probe(direction, size)
-        else:
-            ladder = (65536, 262144, 1048576, MAX_REQUEST_BYTES)
-            step = 0
-            while sum(report[direction]['request_sizes']) < slots[direction]:
-                available = slots[direction] - sum(report[direction]['request_sizes'])
-                size = min(ladder[step] if step < len(ladder) else ladder[-1], available)
-                probe(direction, size)
-                step += 1
-                if report[direction]['duration_seconds'] >= 3:
-                    break
         item = report[direction]
+        begin = time.perf_counter()
+        try:
+            if previous:
+                for sizes in previous[direction]['request_batches']:
+                    run_batch(direction, sizes)
+            else:
+                ladder = (65536, 262144, 1048576, MAX_REQUEST_BYTES)
+                step = 0
+                while sum(item['request_sizes']) < slots[direction]:
+                    available = slots[direction] - sum(item['request_sizes'])
+                    sizes = []
+                    # A single small pilot protects slow paths from an oversized
+                    # first batch; faster paths progressively reach concurrency.
+                    width = 1 if step == 0 else PARALLELISM
+                    target = ladder[min(step, len(ladder) - 1)]
+                    while available and len(sizes) < width:
+                        size = min(target, available)
+                        sizes.append(size)
+                        available -= size
+                    run_batch(direction, sizes)
+                    step += 1
+                    if time.perf_counter() - begin >= 3:
+                        break
+        finally:
+            item['duration_seconds'] = time.perf_counter() - begin
         item['bits_per_second'] = item['payload_bytes'] * 8 / item['duration_seconds']
         item['quality'] = 'sampled' if item['duration_seconds'] >= 3 else 'budget-limited'
         if not positive(item['bits_per_second']):
@@ -2283,8 +2362,10 @@ except Exception as exc:
         pass
     print(text('HTTP 测量失败：', 'HTTP measurement failed: ') + str(exc), file=sys.stderr)
 finally:
-    if connection is not None:
-        connection.close()
+    close_connections()
+    if executor is not None:
+        executor.shutdown(wait=True)
+    close_connections()
 sys.exit(exit_code)
 PY
   http_measure_pid=$!
@@ -2369,12 +2450,30 @@ def measurement_data(d, phase, expected_endpoint=None, budget=None, timeout=None
     integer(d['budget_bytes'], 1)
     if budget is not None and d['budget_bytes'] != budget: raise ValueError('measurement budget changed')
     integer(d['reserved_bytes'], 0, d['budget_bytes'])
+    parallel = 'measurement_policy' in d
+    if parallel:
+        if (d['measurement_policy'] != 'parallel-http-v1' or
+                d.get('connection_policy') != 'pinned-parallel' or
+                type(d.get('parallelism')) is not int or not 1 <= d['parallelism'] <= 4):
+            raise ValueError('invalid parallel measurement policy')
+    elif 'parallelism' in d or d.get('connection_policy') == 'pinned-parallel':
+        raise ValueError('missing parallel measurement policy')
     used = 0
     for direction in ('download', 'upload'):
         stream = d[direction]
         sizes = stream['request_sizes']
         if not isinstance(sizes, list) or not 1 <= len(sizes) <= MAX_REQUESTS_PER_DIRECTION: raise ValueError('invalid request schedule')
         for size in sizes: integer(size, 1, d['budget_bytes'])
+        if parallel:
+            batches = stream.get('request_batches')
+            if (not isinstance(batches, list) or not 1 <= len(batches) <= MAX_REQUESTS_PER_DIRECTION or
+                    any(not isinstance(batch, list) or not 1 <= len(batch) <= d['parallelism'] for batch in batches) or
+                    any(type(size) is not int for batch in batches for size in batch) or
+                    [size for batch in batches for size in batch] != sizes or
+                    any(size > 4 * 1048576 for size in sizes)):
+                raise ValueError('invalid parallel request batches')
+        elif 'request_batches' in stream:
+            raise ValueError('batch plan requires a parallel measurement policy')
         payload = sum(sizes)
         if payload > d['budget_bytes'] // 2 or stream['payload_bytes'] != payload:
             raise ValueError('direction payload exceeds its budget')
@@ -2386,6 +2485,8 @@ def measurement_data(d, phase, expected_endpoint=None, budget=None, timeout=None
             raise ValueError('sample quality does not match measurement duration')
         used += payload
     if used > d['reserved_bytes']: raise ValueError('unaccounted measurement payload')
+    if parallel and sum(d[k]['duration_seconds'] for k in ('download', 'upload')) > d['timeout_seconds'] + 1:
+        raise ValueError('measurement duration exceeds the phase timeout')
     return d
 def measurement(path, phase, expected_endpoint=None, budget=None, timeout=None):
     return measurement_data(load(path), phase, expected_endpoint, budget, timeout)
@@ -2397,11 +2498,13 @@ def summary_configuration_state(data):
 def compare(before, after):
     for key in ('endpoint', 'address', 'port', 'node', 'latency_method', 'budget_bytes', 'timeout_seconds'):
         if before[key] != after[key]: raise ValueError('test condition changed: ' + key)
-    for key in ('family', 'connection_policy', 'node_verified'):
+    for key in ('family', 'connection_policy', 'node_verified', 'measurement_policy', 'parallelism'):
         if before.get(key) != after.get(key): raise ValueError('test policy changed: ' + key)
     for direction in ('download', 'upload'):
         if before[direction]['request_sizes'] != after[direction]['request_sizes']:
             raise ValueError('request schedule changed')
+        if before[direction].get('request_batches') != after[direction].get('request_batches'):
+            raise ValueError('parallel request batches changed')
     return {
         'download_change_pct': (after['download_bps'] / before['download_bps'] - 1) * 100,
         'upload_change_pct': (after['upload_bps'] / before['upload_bps'] - 1) * 100,
@@ -2609,8 +2712,9 @@ try:
                     raise
     elif op == 'plan':
         d = measurement(args[0], 'before', args[1], int(args[2]), int(args[3]))
-        bandwidth = max(d['download_bps'], d['upload_bps']) / 1e6
-        print(format(bandwidth, '.6f'), format(d['latency_ms'], '.6f'))
+        if all(d[k]['quality'] == 'sampled' for k in ('download', 'upload')):
+            bandwidth = max(d['download_bps'], d['upload_bps']) / 1e6
+            print(format(bandwidth, '.6f'), format(d['latency_ms'], '.6f'))
     elif op == 'view':
         root = Path(args[0]).absolute()
         flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW
@@ -2694,6 +2798,10 @@ try:
                     print(label + text('：', ': ') + labels[key][data[key]])
                 if comparison is not None:
                     b, a = data['before'], data['after']
+                    if b.get('measurement_policy') == 'parallel-http-v1':
+                        print(text('测量方式：最多 %d 个连接的 HTTP 观测吞吐。', 'Measurement: observed HTTP throughput using up to %d connections.') % b['parallelism'])
+                        if any(b[k]['quality'] == 'budget-limited' for k in ('download', 'upload')):
+                            print(text('前测样本不足，本轮未用测速结果估算缓冲区。', 'Baseline samples were too short; measurements were not used to estimate buffers.'))
                     print(text('观测下载：%.2f → %.2f Mbps', 'Observed download: %.2f -> %.2f Mbps') % (b['download_bps']/1e6, a['download_bps']/1e6))
                     print(text('观测上传：%.2f → %.2f Mbps', 'Observed upload: %.2f -> %.2f Mbps') % (b['upload_bps']/1e6, a['upload_bps']/1e6))
                     print(text('TCP 建连延迟：%.3f → %.3f ms', 'TCP-connect latency: %.3f -> %.3f ms') % (b['latency_ms'], a['latency_ms']))
@@ -2761,6 +2869,7 @@ auto_tune() {
   local profile=balanced budget=128 seconds=30 endpoint="$AUTO_DEFAULT_ENDPOINT" report_root="$AUTO_REPORT_ROOT" option dep
   local run_dir before after values bandwidth rtt total phase_budget status=failed stage=before error=''
   local changed=0 applied=0 verified=0 verify_status=not-needed rollback_status=not-needed auto_cancel_code=0 saved_traps
+  local -a measured_options=()
   local TRANSACTION_RECOVERY=not-attempted
   local AUTO_TUNE_ACTIVE=1 AUTO_TUNE_WRITING=0 AUTO_TUNE_ENDPOINT
   while (($#)); do
@@ -2830,10 +2939,13 @@ auto_tune() {
     error="$(np_msg '前测数据无效，未修改配置。' 'Baseline data is invalid; configuration was not changed.')"
     _auto_tune_finish 1; return $?
   }
-  read -r bandwidth rtt <<< "$values"
+  if [[ -n "$values" ]]; then
+    read -r bandwidth rtt <<< "$values"
+    measured_options=(--bandwidth "$bandwidth" --rtt "$rtt")
+  fi
   stage=apply
-  np_msg '[2/4] 根据实测数据备份并应用方案…\n' '[2/4] Backing up and applying a measured plan...\n'
-  if apply_tuning --profile "$profile" --bandwidth "$bandwidth" --rtt "$rtt" --yes; then
+  np_msg '[2/4] 备份并应用调优方案…\n' '[2/4] Backing up and applying the tuning plan...\n'
+  if apply_tuning --profile "$profile" "${measured_options[@]}" --yes; then
     if ((${#SYSCTL_KEYS[@]})); then changed=1; applied=1; fi
   else
     if ((AUTO_TUNE_WRITING && !auto_cancel_code)); then
@@ -2925,6 +3037,7 @@ Usage: netpilot [--lang zh|en] [command] [options] (or bash netpilot.sh [command
 Basic commands require Linux/Bash 4+. Benchmark dependencies are installed separately.
 Profiles: balanced = general (default); proxy = proxies/many connections, more conservative buffers; bulk = a few large transfers, larger buffer recommendations.
 Automatic tune requires Python 3 and GNU timeout; its default 128MiB payload budget covers the complete before/after run.
+Measurements start small, then use up to 4 connections; short samples retain existing buffers while basic tuning proceeds.
 Manual --rtt-target probing requires --bandwidth, ping and GNU timeout. --rtt and --rtt-target are mutually exclusive.
 First menu startup from a downloaded copy requires root; then use netpilot to reopen. Read-only commands never install automatically.
 Language: Chinese by default; use NETPILOT_LANG=en or --lang en. The command-line option takes precedence.
@@ -2958,6 +3071,7 @@ NetPilot — Linux VPS 网络诊断与调优
 基础命令需要Linux/Bash4+。测速依赖按需安装，脚本不自动安装测速工具。
 配置档：balanced 通用（默认）；proxy 代理/多连接，缓冲建议更保守；bulk 少量大文件传输，缓冲建议更大。
 一键调优需 Python 3 和 GNU timeout；默认 128MiB 测试数据预算覆盖整轮前后双向测量。
+先小请求探测，再使用最多 4 个连接；样本不足时保留缓冲区，仅做基础调优。
 手动使用 --rtt-target 测延迟需同时提供 --bandwidth，并安装 ping 和 GNU timeout；--rtt 与 --rtt-target 互斥。
 从下载副本首次打开菜单需要 root；保存后用 netpilot 再次打开。只读命令不会自动安装。
 语言：默认中文；NETPILOT_LANG=en 或 --lang en 使用英文，命令行选项优先。
