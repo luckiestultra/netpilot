@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 SCRIPT="${SCRIPT_OVERRIDE:-$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)/netpilot.sh}"
+# Extracted application functions share the language formatter.
+source <(sed -n '/^# BEGIN I18N$/,/^# END I18N$/p' "$SCRIPT")
 TMP="$(mktemp -d)"
 trap 'command rm -rf -- "$TMP"' EXIT
 for name in remove_state_files rollback_internal rollback_tuning; do
@@ -87,11 +89,11 @@ test_rollback_propagates_cleanup_failure() (
   setup rollback
   need_root() { :; }; show_status() { :; }
   restore_rps() { :; }; restore_nic_ring() { :; }; remove_mss_rule() { :; }
-  restore_original_values() { :; }; restore_ulimit() { :; }
+  restore_original_values() { :; }
   managed_file_path() { printf '%s\n' "$TMP/config"; }; restore_file() { :; }
   rm() { return 1; }
   if rollback_tuning > "$TMP/rollback-output"; then fail 'rollback reported success after cleanup failure'; fi
-  ! grep -q 'Rollback completed' "$TMP/rollback-output" || fail 'rollback printed completion after cleanup failure'
+  ! grep -Eq 'Rollback completed|回退已完成并通过核验' "$TMP/rollback-output" || fail 'rollback printed completion after cleanup failure'
   [[ -f "$STATE_DIR/original-values" ]] || fail 'failed rollback cleanup removed retry marker'
 )
 

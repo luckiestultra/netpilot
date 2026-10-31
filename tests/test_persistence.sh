@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 SCRIPT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)/netpilot.sh"
+# Extracted application functions share the language formatter.
+source <(sed -n '/^# BEGIN I18N$/,/^# END I18N$/p' "$SCRIPT")
 TMP="$(mktemp -d)"
 trap 'rm -rf -- "$TMP"' EXIT
 source <(awk '/^log\(\)/ {p=1} /^# CLI entry point/ {exit} p {print}' "$SCRIPT")

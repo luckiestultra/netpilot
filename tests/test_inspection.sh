@@ -3,6 +3,8 @@ set -Eeuo pipefail
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 SNIPPET="${INSPECTION_OVERRIDE:-$ROOT/netpilot.sh}"
 [[ -f "$SNIPPET" ]] || { echo 'FAIL: inspection functions missing'; exit 1; }
+# Extracted application functions share the language formatter.
+source <(sed -n '/^# BEGIN I18N$/,/^# END I18N$/p' "$SNIPPET")
 source <(sed -n '/^# BEGIN INSPECTION$/,/^# END INSPECTION$/p' "$SNIPPET")
 TMP="$(mktemp -d)"
 trap 'rm -rf -- "$TMP"' EXIT

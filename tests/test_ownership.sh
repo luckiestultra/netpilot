@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 SCRIPT="${SCRIPT_OVERRIDE:-$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)/netpilot.sh}"
+# Extracted application functions share the language formatter.
+source <(sed -n '/^# BEGIN I18N$/,/^# END I18N$/p' "$SCRIPT")
 TMP="$(mktemp -d)"
 trap 'rm -rf -- "$TMP"' EXIT
 for name in backup_file backup_file_once restore_file write_lines write_bbr_file write_bbr_module_file owned_config_target save_original_values managed_file_path prepare_state rollback_internal remove_state_files gai_preference_active apply_gai_preference apply_ipv4_preference_only; do
@@ -16,7 +18,7 @@ setup() {
   SYSCTL_FILE="$TMP/$1/99-network.conf"; LIMITS_FILE="$TMP/$1/limits.conf"; GAI_FILE="$TMP/$1/gai.conf"
   NIC_IFACE=eth0; SYSCTL_KEYS=()
   restore_rps() { :; }; restore_nic_ring() { :; }; remove_mss_rule() { :; }
-  restore_original_values() { :; }; restore_ulimit() { :; }
+  restore_original_values() { :; }
 }
 
 test_sysctl_only_never_restores_untouched_files() (

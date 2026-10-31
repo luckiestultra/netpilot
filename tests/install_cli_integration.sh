@@ -85,16 +85,42 @@ cmp -s "$TMP/original-gai" /etc/gai.conf || fail 'rollback did not restore origi
 sha256sum --check --status "$TMP/ignored-before" || fail 'install/apply/rollback changed external namespace'
 printf 'PASS: real IPv4 operation records only NetPilot state; rollback restores its exact baseline\n'
 
+# Default uninstall must leave an active configuration and its exact recovery
+# data intact, including when deleting the executable fails.
+printf '1\n0\n' | /usr/local/bin/netpilot > "$TMP/reapply-before-uninstall.log"
+mkdir -p /var/log/netpilot
+printf 'retained automatic report fixture\n' > /var/log/netpilot/uninstall-report.json
+find /var/lib/netpilot -type f -print0 | sort -z | xargs -0 sha256sum > "$TMP/retained-state-hashes"
+sha256sum /etc/gai.conf /var/log/netpilot/uninstall-report.json > "$TMP/retained-config-report-hashes"
+
 # A real kernel permission denial must propagate through the entire CLI.
 BIN_MODE="$(stat -c '%a' /usr/local/bin)"
 chmod 0555 /usr/local/bin
 if printf 'y\n' | setpriv --bounding-set=-all --inh-caps=-all --ambient-caps=-all /usr/local/bin/netpilot uninstall > "$TMP/uninstall-permission.log" 2>&1; then fail 'uninstall ignored real alias deletion failure'; fi
 chmod "$BIN_MODE" /usr/local/bin
 [[ -L /usr/local/bin/netpilot && -f /usr/local/bin/netpilot.sh ]] || fail 'failed alias removal deleted installation'
+sha256sum --check --status "$TMP/retained-state-hashes" || fail 'failed default uninstall changed the recovery data'
+sha256sum --check --status "$TMP/retained-config-report-hashes" || fail 'failed default uninstall changed configuration or reports'
 if grep -q '已移除' "$TMP/uninstall-permission.log"; then fail 'failed alias deletion printed completion'; fi
 printf 'y\n' | /usr/local/bin/netpilot uninstall > "$TMP/uninstall.log"
 [[ ! -e /usr/local/bin/netpilot.sh && ! -L /usr/local/bin/netpilot ]] || fail 'successful uninstall left owned installation'
+sha256sum --check --status "$TMP/retained-state-hashes" || fail 'default uninstall discarded the recovery data'
+sha256sum --check --status "$TMP/retained-config-report-hashes" || fail 'default uninstall changed configuration or reports'
 printf 'PASS: actual GNU rm permission denial is nonzero without false completion; corrected permission allows uninstall\n'
+
+bash "$SCRIPT" rollback > "$TMP/rollback-after-uninstall.log"
+cmp -s "$TMP/original-gai" /etc/gai.conf || fail 'source rollback after default uninstall did not restore the original configuration'
+[[ ! -e /var/lib/netpilot && ! -e /usr/local/bin/netpilot.sh && ! -L /usr/local/bin/netpilot ]] || fail 'source rollback reinstalled NetPilot or left recovery state'
+[[ -f /var/log/netpilot/uninstall-report.json ]] || fail 'source rollback removed retained reports'
+printf 'PASS: default uninstall retains active configuration, backups and reports; retained source can still roll back without reinstalling\n'
+
+printf '0\n' | bash "$SCRIPT" install > "$TMP/reinstall-for-rollback.log"
+printf '1\n0\n' | /usr/local/bin/netpilot > "$TMP/reapply-for-rollback-uninstall.log"
+printf 'y\n' | /usr/local/bin/netpilot uninstall --rollback > "$TMP/rollback-uninstall.log"
+cmp -s "$TMP/original-gai" /etc/gai.conf || fail 'explicit rollback uninstall did not restore the original configuration'
+[[ ! -e /var/lib/netpilot && ! -e /usr/local/bin/netpilot.sh && ! -L /usr/local/bin/netpilot ]] || fail 'explicit rollback uninstall left installation or recovery state'
+[[ -f /var/log/netpilot/uninstall-report.json ]] || fail 'explicit rollback uninstall removed reports'
+printf 'PASS: explicit --rollback restores saved configuration before uninstalling and retains reports\n'
 
 for kind in regular symlink; do
   if [[ "$kind" == regular ]]; then printf 'independent command\n' > /usr/local/bin/netpilot
@@ -108,6 +134,19 @@ for kind in regular symlink; do
   command rm -f /usr/local/bin/netpilot
   printf 'PASS: %s command collision survives fresh install/uninstall unchanged\n' "$kind"
 done
+printf '0\n' | bash "$SCRIPT" --lang en install > "$TMP/en-install.log"
+grep -q 'Network Diagnostics' "$TMP/en-install.log" || fail 'installed script lost English selection across exec'
+printf '0\n' | bash <(cat "$SCRIPT") --lang en install > "$TMP/en-online-install.log"
+grep -q 'Network Diagnostics' "$TMP/en-online-install.log" || fail 'online installation lost English selection across download and exec'
+printf '0\n' | NETPILOT_LANG=zh /usr/local/bin/netpilot --lang en update > "$TMP/en-update.log"
+grep -q 'Network Diagnostics' "$TMP/en-update.log" || fail 'updated script lost selected language across exec'
+if printf 'y\n' | /usr/local/bin/netpilot --lang en uninstall --rollback > "$TMP/en-no-state-uninstall.log" 2>&1; then fail 'explicit rollback uninstall without recovery records reported success'; fi
+[[ -f /usr/local/bin/netpilot.sh && -L /usr/local/bin/netpilot ]] || fail 'missing rollback records still removed installation'
+printf 'PASS: requested rollback without saved state refuses removal and preserves the installed recovery command\n'
+printf 'y\n' | /usr/local/bin/netpilot --lang en uninstall > "$TMP/en-uninstall.log"
+[[ ! -e /usr/local/bin/netpilot.sh && ! -e /usr/local/bin/netpilot && ! -L /usr/local/bin/netpilot ]] || fail 'English uninstall left owned installation'
+printf 'PASS: English selection survives real install/update exec and uninstall retains lifecycle behavior\n'
+
 sha256sum --check --status "$TMP/ignored-before" || fail 'new CLI modified files in other namespaces'
 [[ "$(sha256sum "$SCRIPT" | awk '{print $1}')" == "$SOURCE_HASH" ]] || fail 'CLI modified source payload'
 printf 'PASS: complete NetPilot lifecycle leaves external namespaces and source bytes unchanged\n'

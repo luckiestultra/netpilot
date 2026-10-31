@@ -2,6 +2,8 @@
 set -Eeuo pipefail
 
 SCRIPT="${SCRIPT_OVERRIDE:-$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)/netpilot.sh}"
+# Extracted application functions share the language formatter.
+source <(sed -n '/^# BEGIN I18N$/,/^# END I18N$/p' "$SCRIPT")
 TEST_DIR="$(mktemp -d)"
 trap 'rm -rf -- "$TEST_DIR"' EXIT
 # Load function definitions only; never run startup or real system operations.
@@ -27,7 +29,7 @@ test_rollback_retains_failed_backup() (
   BACKUP_DIR="$STATE_DIR/backup"; mkdir -p "$BACKUP_DIR"
   BBR_FILE=x; BBR_MODULE_FILE=x; SYSCTL_FILE=x; LIMITS_FILE=x; GAI_FILE=x
   restore_rps() { :; }; restore_nic_ring() { :; }; remove_mss_rule() { :; }
-  restore_ulimit() { :; }; restore_file() { :; }
+  restore_file() { :; }
   sysctl() { return 1; }; sysctl_value() { printf 'changed\n'; }
   if rollback_internal; then fail 'partial rollback must report failure'; fi
   [[ -f "$STATE_DIR/original-values" ]] || fail 'failed rollback discarded original state'

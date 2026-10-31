@@ -86,17 +86,18 @@ identity_single_alias() (
 identity_update_alias_failure() (
   INSTALL_PATH="$TMP/update-target"
   UPDATE_URL='https://github.com/luckiestultra/netpilot/raw/refs/heads/main/netpilot.sh'
-  printf '#!/bin/bash\nprintf old\n' > "$INSTALL_PATH"
+  printf '#!/bin/bash\nreadonly UPDATE_URL="%s"\nuninstall_own_script() {\n  :\n}\nprintf old\n' "$UPDATE_URL" > "$INSTALL_PATH"
   curl() {
     while (($#)); do
-      if [[ "$1" == --output ]]; then printf '#!/bin/bash\nprintf new\n' > "$2"; return; fi
+      if [[ "$1" == --output ]]; then printf '#!/bin/bash\nreadonly UPDATE_URL="%s"\nuninstall_own_script() {\n  :\n}\nprintf new\n' "$UPDATE_URL" > "$2"; return; fi
       shift
     done
     return 1
   }
-  install_shortcuts() { return 1; }
+  install_shortcuts() { : > "$TMP/failed-alias-reached"; return 1; }
   exec() { printf 'executed\n' > "$TMP/failed-alias-exec"; }
   if check_update; then fail 'update ignored shortcut creation failure'; fi
+  [[ -f "$TMP/failed-alias-reached" ]] || fail 'update did not reach shortcut creation'
   [[ ! -e "$TMP/failed-alias-exec" ]] || fail 'update continued execution after alias failure'
 )
 

@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 SCRIPT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)/netpilot.sh"
+# Extracted application functions share the language formatter.
+source <(sed -n '/^# BEGIN I18N$/,/^# END I18N$/p' "$SCRIPT")
 TMP="$(mktemp -d)"
 trap 'rm -rf -- "$TMP"' EXIT
 for fn in backup_file backup_file_once restore_file; do

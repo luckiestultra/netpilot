@@ -42,6 +42,7 @@ expected=['send','receive'] if direction=='both' else [direction]
 assert [r['direction'] for r in runs]==expected, runs
 assert all(r['status']=='ok' for r in runs), runs
 assert report['streams']==int(streams)
+assert all(r['remote_endpoints']==[{'address':'127.0.0.1','port':report['port']}] * int(streams) for r in runs)
 transferred=sum(r['bytes'] for r in runs)
 assert 0 < transferred <= int(budget)*1048576, (transferred,budget,runs)
 assert stat.S_IMODE(os.stat(path).st_mode)==0o600

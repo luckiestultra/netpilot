@@ -1,9 +1,11 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 SCRIPT="${SCRIPT_OVERRIDE:-$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)/netpilot.sh}"
+# Extracted application functions share the language formatter.
+source <(sed -n '/^# BEGIN I18N$/,/^# END I18N$/p' "$SCRIPT")
 TEST_DIR="$(mktemp -d)"
 trap 'rm -rf -- "$TEST_DIR"' EXIT
-for name in install_script_atomic install_shortcuts install_local_copy check_update; do
+for name in install_script_atomic install_shortcuts install_local_copy installed_script_owned check_update; do
   sed -n "/^${name}() {/,/^}/p" "$SCRIPT" >> "$TEST_DIR/functions.sh"
 done
 source "$TEST_DIR/functions.sh"
@@ -13,11 +15,12 @@ die() { warn "$*"; exit 1; }
 fail() { printf 'FAIL: %s\n' "$*" >&2; exit 1; }
 
 test_update_write_failure_keeps_old_version() (
-  INSTALL_PATH="$TEST_DIR/failed-update"; printf '#!/bin/bash\nprintf old\n' > "$INSTALL_PATH"
+  INSTALL_PATH="$TEST_DIR/failed-update"
   UPDATE_URL=https://example.invalid/script
+  printf '#!/bin/bash\nreadonly UPDATE_URL="%s"\nuninstall_own_script() {\n  :\n}\nprintf old\n' "$UPDATE_URL" > "$INSTALL_PATH"
   curl() {
     while (($#)); do
-      if [[ "$1" == --output ]]; then printf '#!/bin/bash\nprintf new\n' > "$2"; return; fi
+      if [[ "$1" == --output ]]; then printf '#!/bin/bash\nreadonly UPDATE_URL="%s"\nuninstall_own_script() {\n  :\n}\nprintf new\n' "$UPDATE_URL" > "$2"; return; fi
       shift
     done
     return 1
@@ -29,10 +32,36 @@ test_update_write_failure_keeps_old_version() (
   [[ ! -e "$TEST_DIR/failed-exec" ]] || fail 'failed update executed a script'
 )
 
+test_unrecognized_download_keeps_old_version() (
+  INSTALL_PATH="$TEST_DIR/unrecognized-update"; SHORTCUT_PATH="$TEST_DIR/unrecognized-shortcut"
+  UPDATE_URL='https://github.com/luckiestultra/netpilot/raw/refs/heads/main/netpilot.sh'
+  printf '#!/bin/bash\nreadonly UPDATE_URL="%s"\nuninstall_own_script() {\n  :\n}\nprintf old\n' "$UPDATE_URL" > "$INSTALL_PATH"
+  cp "$INSTALL_PATH" "$TEST_DIR/unrecognized-before"
+  printf '#!/bin/bash\nprintf foreign\n' > "$TEST_DIR/unrecognized-payload"
+  bash -n "$TEST_DIR/unrecognized-payload" || fail 'foreign download fixture has invalid syntax'
+  curl() {
+    while (($#)); do
+      if [[ "$1" == --output ]]; then
+        cp "$TEST_DIR/unrecognized-payload" "$2" || return 1
+        : > "$TEST_DIR/unrecognized-downloaded"
+        return 0
+      fi
+      shift
+    done
+    return 1
+  }
+  exec() { printf 'exec\n' >> "$TEST_DIR/unrecognized-exec"; }
+  if check_update; then fail 'unrecognized downloaded script was accepted'; fi
+  [[ -e "$TEST_DIR/unrecognized-downloaded" ]] || fail 'update did not successfully download the foreign payload'
+  cmp -s "$TEST_DIR/unrecognized-before" "$INSTALL_PATH" || fail 'unrecognized download replaced the current script'
+  [[ ! -e "$TEST_DIR/unrecognized-exec" ]] || fail 'unrecognized download reached execution'
+)
+
 test_install_write_failure_never_executes() (
   INSTALL_PATH="$TEST_DIR/failed-install"; SCRIPT_PATH="$TEST_DIR/install-source"
   SOURCE_SNAPSHOT=''; SHORTCUT_PATH="$TEST_DIR/shortcut"
-  printf '#!/bin/bash\nprintf new\n' > "$SCRIPT_PATH"
+  UPDATE_URL='https://github.com/luckiestultra/netpilot/raw/refs/heads/main/netpilot.sh'
+  printf '#!/bin/bash\nreadonly UPDATE_URL="%s"\nuninstall_own_script() {\n  :\n}\nprintf new\n' "$UPDATE_URL" > "$SCRIPT_PATH"
   install() { return 1; }
   exec() { printf 'exec\n' >> "$TEST_DIR/install-exec"; }
   if install_local_copy; then fail 'installation write failure returned success'; fi
@@ -63,7 +92,7 @@ test_atomic_install_works() (
 )
 
 failures=0
-for test in test_update_write_failure_keeps_old_version test_install_write_failure_never_executes test_invalid_script_keeps_old_version test_symlink_target_is_not_followed test_atomic_install_works; do
+for test in test_update_write_failure_keeps_old_version test_unrecognized_download_keeps_old_version test_install_write_failure_never_executes test_invalid_script_keeps_old_version test_symlink_target_is_not_followed test_atomic_install_works; do
   if "$test"; then printf 'PASS: %s\n' "$test"; else failures=$((failures + 1)); fi
 done
 [[ "$failures" == 0 ]]

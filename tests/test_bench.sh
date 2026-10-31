@@ -13,9 +13,15 @@ printf '%s\n' "$*" >> "$TEST_DIR/calls"
 if [[ "${FAIL_IPERF:-0}" == 1 ]]; then printf 'peer busy\n' >&2; exit 1; fi
 if [[ "${WAIT_IPERF:-0}" == 1 ]]; then printf '%s\n' "$$" > "$TEST_DIR/iperf-pid"; exec python3 -c 'import time; time.sleep(120)'; fi
 if [[ "${INVALID_IPERF:-0}" == 1 ]]; then printf '{}\n'; exit 0; fi
-cat <<'JSON'
-{"start":{"version":"iperf 3.test"},"end":{"sum_sent":{"bytes":524288,"bits_per_second":1048576,"seconds":4,"retransmits":3},"sum_received":{"bytes":524288,"bits_per_second":1000000,"seconds":4},"cpu_utilization_percent":{"host_total":12,"remote_total":20},"streams":[{"sender":{"mean_rtt":10000}}]}}
-JSON
+python3 - "$@" <<'PY'
+import json, sys
+args=sys.argv[1:]
+peer=args[args.index('-c')+1]
+port=int(args[args.index('-p')+1]); streams=int(args[args.index('-P')+1])
+raw={"start":{"version":"iperf 3.test"},"end":{"sum_sent":{"bytes":524288,"bits_per_second":1048576,"seconds":4,"retransmits":3},"sum_received":{"bytes":524288,"bits_per_second":1000000,"seconds":4},"cpu_utilization_percent":{"host_total":12,"remote_total":20},"streams":[{"sender":{"mean_rtt":10000}}]}}
+raw['start']['connected']=[{'remote_host': '127.0.0.1' if peer=='localhost' else peer, 'remote_port':port} for _ in range(streams)]
+json.dump(raw,sys.stdout)
+PY
 MOCK
 cat > "$TEST_DIR/bin/timeout" <<'MOCK'
 #!/usr/bin/env bash
@@ -57,6 +63,7 @@ assert len(report['runs']) == 2
 assert all(x['status'] == 'ok' for x in report['runs'])
 assert report['runs'][0]['retransmits'] == 3
 assert report['runs'][0]['cpu_host_percent'] == 12
+assert report['runs'][0]['remote_endpoints'] == [{'address':'::1','port':5201}] * 2
 assert stat.S_IMODE(os.stat(sys.argv[1]).st_mode) == 0o600
 PY
 cp "$TEST_DIR/before.json" "$TEST_DIR/after.json"
@@ -76,8 +83,20 @@ variants['duplicate-direction']=copy.deepcopy(valid); variants['duplicate-direct
 variants['nan-throughput']=copy.deepcopy(valid); variants['nan-throughput']['runs'][0]['mbps']=float('nan')
 variants['boolean-throughput']=copy.deepcopy(valid); variants['boolean-throughput']['runs'][0]['mbps']=True
 variants['boolean-streams']=copy.deepcopy(valid); variants['boolean-streams']['streams']=True
+variants['missing-peer-identity']=copy.deepcopy(valid); variants['missing-peer-identity']['runs'][0].pop('remote_endpoints')
+variants['boolean-peer-port']=copy.deepcopy(valid); variants['boolean-peer-port']['runs'][0]['remote_endpoints'][0]['port']=True
+variants['boolean-peer-address']=copy.deepcopy(valid); variants['boolean-peer-address']['runs'][0]['remote_endpoints'][0]['address']=True
+variants['wrong-peer-count']=copy.deepcopy(valid); variants['wrong-peer-count']['runs'][0]['remote_endpoints'].pop()
+variants['invalid-request-target']=copy.deepcopy(valid); variants['invalid-request-target']['bytes_per_run_target']=1
+variants['boolean-request-target']=copy.deepcopy(valid); variants['boolean-request-target']['bytes_per_run_target']=True
 for name,report in variants.items():
     (root/('invalid-'+name+'.json')).write_text(json.dumps(report))
+ratio_before=copy.deepcopy(valid);ratio_before['runs'][0]['mbps']=5e-324
+ratio_after=copy.deepcopy(valid);ratio_after['runs'][0]['mbps']=1e308
+(root/'ratio-before.json').write_text(json.dumps(ratio_before))
+(root/'ratio-after.json').write_text(json.dumps(ratio_after))
+other_peer=copy.deepcopy(valid);other_peer['runs'][0]['remote_endpoints'][0]['address']='::2'
+(root/'other-peer.json').write_text(json.dumps(other_peer))
 PY
 comparison_errors=0
 for report in "$TEST_DIR"/invalid-*.json; do
@@ -87,6 +106,9 @@ for report in "$TEST_DIR"/invalid-*.json; do
   fi
 done
 (( comparison_errors == 0 )) || fail 'malformed reports must not compare as valid measurements'
+if bench_compare "$TEST_DIR/ratio-before.json" "$TEST_DIR/ratio-after.json" > "$TEST_DIR/ratio.log" 2>&1; then fail 'nonfinite change percentage compared successfully'; fi
+grep -Eq '有限|finite' "$TEST_DIR/ratio.log" || fail 'ratio test did not reach finite percentage validation'
+if bench_compare "$TEST_DIR/before.json" "$TEST_DIR/other-peer.json" >/dev/null 2>&1; then fail 'different actual peer identities compared'; fi
 python3 - "$TEST_DIR/after.json" <<'PY'
 import json,sys
 p=sys.argv[1]; d=json.load(open(p)); d['peer']='other.example'; json.dump(d,open(p,'w'))
