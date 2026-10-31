@@ -13,10 +13,18 @@ cleanup() {
 trap cleanup EXIT
 fail() { printf 'FAIL: %s\n' "$*" >&2; exit 1; }
 for dep in python3 timeout sha256sum diff; do command -v "$dep" >/dev/null || fail "missing dependency: $dep"; done
-for path in /var/lib/netpilot /etc/sysctl.d/99-netpilot.conf /etc/sysctl.d/10-netpilot-bbr.conf /etc/modules-load.d/netpilot.conf /usr/local/bin/netpilot.sh /usr/local/bin/netpilot; do
+REPORT_ROOT=/tmp/netpilot-reports
+for path in /var/lib/netpilot "$REPORT_ROOT" /etc/sysctl.d/99-netpilot.conf /etc/sysctl.d/10-netpilot-bbr.conf /etc/modules-load.d/netpilot.conf /usr/local/bin/netpilot.sh /usr/local/bin/netpilot; do
   [[ ! -e "$path" && ! -L "$path" ]] || fail "container is not clean: $path"
 done
 source_hash="$(sha256sum "$SCRIPT" | awk '{print $1}')"
+# Reproduce the group-writable /var/log reported by a real VPS. Neither the
+# default workflow nor its reader may require changes to this system directory.
+chmod 0775 /var/log
+log_identity="$(stat -c '%a:%u:%g' /var/log)"
+mkdir -p /var/log/netpilot
+printf 'preserve legacy reports\n' > /var/log/netpilot/legacy-report
+legacy_hash="$(sha256sum /var/log/netpilot/legacy-report | awk '{print $1}')"
 mkdir "$TMP/bin" "$TMP/kernel"
 export NETPILOT_TEST_KERNEL="$TMP/kernel" NETPILOT_TEST_WRITES="$TMP/kernel-writes"
 : > "$NETPILOT_TEST_WRITES"
@@ -117,14 +125,15 @@ endpoint="http://127.0.0.1:$(cat "$TMP/port")"
 
 # A real rejection must stop the full command before any managed configuration
 # or kernel write, while preserving its private failure report for inspection.
-if bash "$SCRIPT" --lang en tune --endpoint "$endpoint" --budget-mib 1 --report-dir "$TMP/reports" < /dev/null > "$TMP/rejected.log" 2>&1; then
+if bash "$SCRIPT" --lang en tune --endpoint "$endpoint" --budget-mib 1 < /dev/null > "$TMP/rejected.log" 2>&1; then
   fail 'the real CLI accepted a 429 baseline'
 fi
 [[ ! -e /var/lib/netpilot && ! -e /etc/sysctl.d/99-netpilot.conf && ! -s "$NETPILOT_TEST_WRITES" ]] || fail 'baseline rejection reached configuration changes'
 diff -r "$TMP/kernel" "$TMP/original-kernel" > "$TMP/rejected-kernel.diff" || fail 'baseline rejection changed kernel values'
-python3 - "$TMP" <<'PY'
+[[ -d "$REPORT_ROOT" ]] || { cat "$TMP/rejected.log" >&2; fail 'default report creation failed with a group-writable /var/log'; }
+python3 - "$TMP" "$REPORT_ROOT" <<'PY'
 import json, pathlib, sys
-root=pathlib.Path(sys.argv[1]); reports=list((root/'reports').glob('run.*/summary.json'))
+root=pathlib.Path(sys.argv[1]); reports=list(pathlib.Path(sys.argv[2]).glob('run.*/summary.json'))
 assert len(reports)==1
 summary=json.loads(reports[0].read_text())
 assert summary['status']=='failed' and summary['stage']=='before'
@@ -140,7 +149,7 @@ printf 'PASS: full CLI rejects a real HTTP 429 baseline before creating configur
 printf 'ok\n' > "$TMP/mode"
 printf '# Managed by netpilot.sh.\nnet.ipv4.tcp_ecn = 0\n' > /etc/sysctl.d/99-netpilot.conf
 cp -a /etc/sysctl.d/99-netpilot.conf "$TMP/original.conf"
-bash "$SCRIPT" --lang en tune --endpoint "$endpoint" --budget-mib 1 --report-dir "$TMP/reports" < /dev/null > "$TMP/success.log" 2>&1 || {
+bash "$SCRIPT" --lang en tune --endpoint "$endpoint" --budget-mib 1 < /dev/null > "$TMP/success.log" 2>&1 || {
   cat "$TMP/success.log" >&2; fail 'complete automatic tuning CLI failed';
 }
 [[ -f /var/lib/netpilot/original-values && -f /var/lib/netpilot/backup/sysctl-file ]] || fail 'CLI did not create its original-values and file backup'
@@ -149,9 +158,9 @@ grep -qx 'net.ipv4.tcp_congestion_control=cubic' /var/lib/netpilot/original-valu
 [[ "$(cat "$TMP/kernel/net.ipv4.tcp_congestion_control")" == bbr && "$(cat "$TMP/kernel/net.core.default_qdisc")" == fq && "$(cat "$TMP/kernel/net.ipv4.tcp_moderate_rcvbuf")" == 1 ]] || fail 'real CLI did not apply the measured plan'
 grep -q 'Measured plan: bandwidth' "$TMP/success.log" || fail 'CLI did not identify its measured parameter source'
 bash "$SCRIPT" --lang en verify > "$TMP/verify.log" 2>&1 || fail 'separate real verify command rejected the persisted plan'
-python3 - "$TMP" <<'PY'
+python3 - "$TMP" "$REPORT_ROOT" <<'PY'
 import json, pathlib, stat, sys
-root=pathlib.Path(sys.argv[1]); reports=root/'reports'
+root=pathlib.Path(sys.argv[1]); reports=pathlib.Path(sys.argv[2])
 all_reports=[(path,json.loads(path.read_text())) for path in reports.glob('run.*/summary.json')]
 success=[(path,data) for path,data in all_reports if data['status']=='completed']
 assert len(success)==1 and len(all_reports)==2
@@ -189,3 +198,15 @@ cmp -s /etc/sysctl.d/99-netpilot.conf "$TMP/original.conf" || fail 'rollback did
 [[ ! -e /usr/local/bin/netpilot.sh && ! -e /usr/local/bin/netpilot && ! -L /usr/local/bin/netpilot ]] || fail 'automatic tune unexpectedly installed the script'
 [[ "$(sha256sum "$SCRIPT" | awk '{print $1}')" == "$source_hash" ]] || fail 'CLI changed source bytes'
 printf 'PASS: full CLI rollback restores actual parameters/configuration and preserves private automatic reports\n'
+
+bash "$SCRIPT" --lang en report --json > "$TMP/default-report.json"
+python3 - "$TMP/default-report.json" "$report_path" <<'PY'
+import json, pathlib, sys
+assert json.loads(pathlib.Path(sys.argv[1]).read_text()) == json.loads(pathlib.Path(sys.argv[2]).read_text())
+PY
+printf '10\n0\n' | bash "$SCRIPT" --lang en > "$TMP/menu-report.log"
+grep -q 'Flow: Completed' "$TMP/menu-report.log" || fail 'menu 10 cannot read the default report'
+grep -qx 'Full data: netpilot --lang en report --json' "$TMP/menu-report.log" || fail 'default report command still requires a custom path'
+[[ "$(stat -c '%a:%u:%g' /var/log)" == "$log_identity" ]] || fail 'automatic tuning changed /var/log permissions or ownership'
+[[ "$(sha256sum /var/log/netpilot/legacy-report | awk '{print $1}')" == "$legacy_hash" ]] || fail 'automatic tuning changed a legacy report'
+printf 'PASS: default report and menu 10 work with group-writable /var/log; system permissions and legacy reports are preserved\n'

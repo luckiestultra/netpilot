@@ -34,7 +34,7 @@ netpilot
 netpilot report
 ```
 
-摘要显示配置状态、前后测量和报告更新时间。默认读取 `/var/log/netpilot`；若本轮尚未生成报告，可能显示旧记录，请核对时间。自定义目录使用 `netpilot report --report-dir DIR`。
+摘要显示配置状态、前后测量和报告更新时间。默认读取 `/tmp/netpilot-reports`，系统清理或重启后可能消失；若本轮尚未生成报告，可能显示旧记录，请核对时间。自定义目录使用 `netpilot report --report-dir DIR`。
 
 | 状态 | 含义 |
 |---|---|
@@ -51,10 +51,10 @@ netpilot report
 |---|---|---|
 | 更新并打开菜单 | `6` | `netpilot update` |
 | 恢复首次原值 | `5` | `netpilot rollback` |
-| 仅卸载程序 | `7` → `1`，默认 | `netpilot uninstall` |
+| 卸载工具并清理报告 | `7` → `1`，默认 | `netpilot uninstall` |
 | 回滚后卸载 | `7` → `2` | `netpilot uninstall --rollback` |
 
-回滚恢复**首次保存的原值**。默认卸载保留配置、备份和报告；回滚后卸载须先恢复成功，无记录或恢复失败时停止。卸载均需 `y/N` 确认。
+回滚恢复**首次保存的原值**。默认卸载清理工具和默认目录中的自动报告，保留调优配置与恢复备份；自定义报告目录自行管理。回滚后卸载须先恢复成功，无记录或恢复失败时停止。卸载均需 `y/N` 确认。
 
 ## 交给 AI
 
@@ -120,7 +120,7 @@ netpilot report --json
 | `--budget-mib` | `128` | 整轮测试数据，整数 1–1024MiB。 |
 | `--timeout` | `30` | 每阶段超时，整数 5–120 秒。 |
 | `--endpoint` | `https://speed.cloudflare.com` | 兼容下载/上传接口的 HTTPS 源；HTTP 仅限回环地址。 |
-| `--report-dir` | `/var/log/netpilot` | 私有报告目录，不能位于 `/var/lib/netpilot/` 内。 |
+| `--report-dir` | `/tmp/netpilot-reports` | 私有报告目录，不能位于 `/var/lib/netpilot/` 内。 |
 
 延迟采用 3 次 TCP 建连耗时的平均值。前测、复测各占一半预算，再平分给下载和上传；失败请求也计入预算，不自动重试。短于 3 秒的样本标记为预算受限，不能判断峰值。
 
@@ -194,7 +194,7 @@ netpilot compare before.json after.json
 |---|---|
 | `/usr/local/bin/netpilot.sh`、`/usr/local/bin/netpilot` | 程序、快捷命令。 |
 | `/var/lib/netpilot/` | 原值、备份、恢复状态。 |
-| `/var/log/netpilot/` | 自动报告，回滚和卸载均保留。 |
+| `/tmp/netpilot-reports/` | 临时自动报告，卸载时清理。 |
 | `/etc/sysctl.d/99-netpilot.conf`、`/etc/sysctl.d/10-netpilot-bbr.conf` | 调优与 BBR 参数。 |
 | `/etc/modules-load.d/netpilot.conf` | BBR 模块加载。 |
 | `/etc/gai.conf` | IPv4 优先配置。 |
@@ -202,12 +202,14 @@ netpilot compare before.json after.json
 
 恢复失败会保留备份。仅卸载后，重新运行在线命令并选 `5`，可用保留的备份恢复；回滚范围为 NetPilot 管理的变更。
 
+旧版报告可用 `netpilot report --report-dir /var/log/netpilot` 查看，卸载时也清理可识别的工具报告；目录中的其他文件保留。
+
 ### 环境要求
 
 | 功能 | 依赖 |
 |---|---|
 | 基础运行 | Linux、Bash 4+、`sysctl`、`awk`；在线入口需 `curl`。 |
-| 修改配置与程序维护 | root、`flock`。 |
+| 修改配置与程序维护 | root、`flock`；清理已有报告需 `python3`。 |
 | 自动调优 | `python3`、GNU `timeout`。 |
 | 诊断 / 网卡设置 | `ip`、`tc` / `ethtool`。 |
 | 手动测延迟 | `ping`、GNU `timeout`。 |

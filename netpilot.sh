@@ -44,7 +44,8 @@ readonly MSS_COMMENT="netpilot"
 readonly SHORTCUT_PATH="/usr/local/bin/netpilot"
 readonly UPDATE_URL="https://github.com/luckiestultra/netpilot/raw/refs/heads/main/netpilot.sh"
 readonly AUTO_DEFAULT_ENDPOINT="https://speed.cloudflare.com"
-readonly AUTO_REPORT_ROOT="/var/log/netpilot"
+readonly AUTO_REPORT_ROOT="/tmp/netpilot-reports"
+readonly AUTO_LEGACY_REPORT_ROOT="/var/log/netpilot"
 readonly RED=$'\033[0;31m'
 readonly GREEN=$'\033[0;32m'
 readonly YELLOW=$'\033[0;33m'
@@ -875,6 +876,20 @@ installed_script_owned() {
     grep -Fqx 'uninstall_own_script() {' "$candidate"
 }
 
+remove_automatic_reports() {
+  local root
+  local -a roots=()
+  for root in "$AUTO_REPORT_ROOT" "$AUTO_LEGACY_REPORT_ROOT"; do
+    [[ ! -e "$root" && ! -L "$root" ]] || roots+=("$root")
+  done
+  ((${#roots[@]})) || return 0
+  command -v python3 >/dev/null 2>&1 || {
+    warn "$(np_msg '清理报告需要 python3，未卸载。' 'Python 3 is required to clean reports; NetPilot was not removed.')"
+    return 1
+  }
+  auto_report cleanup "${roots[@]}"
+}
+
 uninstall_own_script() {
   local answer option name rollback_requested=0 has_record=0
   for option in "$@"; do
@@ -885,12 +900,12 @@ uninstall_own_script() {
     esac
   done
   if ((rollback_requested)); then
-    np_msg '\n将先恢复保存的配置，再删除已安装脚本和自有快捷命令；恢复失败则停止卸载。\n' '\nRestore saved configuration, then remove the installed script and owned shortcut; failed restoration stops removal.\n'
+    np_msg '\n将先恢复保存的配置，再清理默认报告并删除程序；恢复失败则停止卸载。\n' '\nRestore saved configuration, then clean default reports and remove the tool; failed restoration stops removal.\n'
   else
-    np_msg '\n仅删除已安装脚本和自有快捷命令，保留调优配置、回退备份和测速报告。\n' '\nRemove only the installed script and owned shortcut; keep tuning configuration, rollback backups and measurement reports.\n'
+    np_msg '\n将删除程序和默认目录中的工具报告，保留调优配置和回退备份。\n' '\nRemove the tool and its default reports; keep tuning configuration and rollback backups.\n'
   fi
   np_msg '  脚本：%s\n  快捷命令：%s\n' '  Script: %s\n  Shortcut: %s\n' "$INSTALL_PATH" "$SHORTCUT_PATH"
-  np_msg '下载副本和源码文件保留；不会删除 3x-ui、Xray、面板或其他服务。\n' 'Download/source copies are kept; 3x-ui, Xray, panels and other services are not removed.\n'
+  np_msg '下载副本、自定义报告目录和无法识别的文件保留；不会删除 3x-ui、Xray 或其他服务。\n' 'Source copies, custom report directories and unrecognized files are kept; 3x-ui, Xray and other services are not removed.\n'
   read -r -p "$(np_msg '确定卸载 NetPilot？[y/N] ' 'Uninstall NetPilot? [y/N] ')" answer || {
     log "$(np_msg '已取消卸载。' 'Uninstall cancelled.')"; return 0;
   }
@@ -920,21 +935,22 @@ uninstall_own_script() {
     }
     rollback_internal || return 1
   fi
+  remove_automatic_reports || return 1
   if [[ -L "$SHORTCUT_PATH" && "$(readlink "$SHORTCUT_PATH")" == "$INSTALL_PATH" ]]; then
     rm -f -- "$SHORTCUT_PATH" || return 1
   fi
   rm -f -- "$INSTALL_PATH" || return 1
   if ((rollback_requested)); then
-    log "$(np_msg '回退已完成，本调优脚本及其自有快捷命令已移除；报告和源码副本保留。' 'Rollback completed; NetPilot and its owned shortcut were removed. Reports and source copies are retained.')"
+    log "$(np_msg '回退已完成，程序、自有快捷命令和可识别的默认报告已清理；源码副本保留。' 'Rollback completed; the tool, its owned shortcut and recognized default reports were removed. Source copies are retained.')"
   else
-    log "$(np_msg '本调优脚本及其快捷命令已移除；调优配置、回退备份和测速报告保留。' 'NetPilot and its shortcut were removed; tuning configuration, rollback backups and measurement reports are retained.')"
+    log "$(np_msg '程序、自有快捷命令和可识别的默认报告已清理；调优配置和回退备份保留。' 'The tool, its owned shortcut and recognized default reports were removed; tuning configuration and rollback backups are retained.')"
   fi
   exit 0
 }
 
 uninstall_menu() {
   local choice
-  np_msg '\n卸载方式：\n  1. 仅卸载工具，保留调优配置、备份和报告（默认）\n  2. 回滚并卸载，恢复失败则停止\n  0. 取消\n' '\nUninstall mode:\n  1. Remove the tool; keep tuning configuration, backups and reports (default)\n  2. Roll back and uninstall; stop if restoration fails\n  0. Cancel\n'
+  np_msg '\n卸载方式：\n  1. 卸载工具并清理默认报告，保留调优配置和备份（默认）\n  2. 回滚并卸载，清理默认报告；恢复失败则停止\n  0. 取消\n' '\nUninstall mode:\n  1. Remove the tool and default reports; keep tuning configuration and backups (default)\n  2. Roll back and uninstall, cleaning default reports; stop if restoration fails\n  0. Cancel\n'
   read -r -p "$(np_msg '请选择 [1/2/0，默认1]：' 'Select [1/2/0; default 1]: ')" choice || {
     log "$(np_msg '已取消卸载。' 'Uninstall cancelled.')"; return 0;
   }
@@ -973,7 +989,7 @@ show_menu() {
   np_msg '\n维护\n' '\nMaintenance\n'
   np_msg '  5. 恢复首次原值\n' '  5. Restore the original baseline\n'
   np_msg '  6. 更新 NetPilot\n' '  6. Update NetPilot\n'
-  np_msg '  7. 卸载（默认保留配置，可选先回滚）\n' '  7. Uninstall (keep settings by default; optional rollback)\n'
+  np_msg '  7. 卸载（清理默认报告，保留配置；可选回滚）\n' '  7. Uninstall (clean default reports, keep settings; optional rollback)\n'
   np_msg '\n高级设置（按需使用）\n' '\nAdvanced settings (optional)\n'
   np_msg '  1. IPv4 优先配置 %s\n' '  1. IPv4 preference %s\n' "$(status_badge "$ipv4_active")"
   np_msg '  2. BBR 与默认 FQ %s\n' '  2. BBR and default FQ %s\n' "$(status_badge "$bbr_active")"
@@ -1001,7 +1017,7 @@ menu() {
       6) run_mutation check_update ;;
       7) uninstall_menu || warn "$(np_msg '卸载未完成。' 'Uninstall did not complete.')" ;;
       8) feature_menu || warn "$(np_msg '诊断或测速未完成。' 'The diagnostics or measurement operation did not complete.')" ;;
-      9) run_mutation auto_tune || warn "$(np_msg '自动调优流程未完成，请查看报告。' 'Automatic tuning did not complete; inspect the report.')" ;;
+      9) run_mutation auto_tune || warn "$(np_msg '自动调优流程未完成，请查看上方错误信息。' 'Automatic tuning did not complete; inspect the error above.')" ;;
       10) report_command || true ;;
       0) return 0 ;;
       l|L) if [[ "${NETPILOT_LANG:-zh}" == en ]]; then np_set_language zh; else np_set_language en; fi ;;
@@ -2404,10 +2420,85 @@ try:
                 info = directory.lstat()
             if (not stat.S_ISDIR(info.st_mode) or info.st_uid not in (0, os.geteuid()) or
                     info.st_mode & 0o022 and not info.st_mode & stat.S_ISVTX):
-                raise ValueError('report directory and its ancestors must be protected from replacement')
+                raise ValueError(text('报告路径目录权限不安全：%s（权限 %04o，属主 UID %d）',
+                                      'Unsafe report path directory: %s (mode %04o, owner UID %d)') %
+                                 (repr(str(directory)), stat.S_IMODE(info.st_mode), info.st_uid))
         if root.lstat().st_uid != os.geteuid():
             raise ValueError('report directory must be owned by this user')
-        print(tempfile.mkdtemp(prefix='run.', dir=str(root)))
+        run = Path(tempfile.mkdtemp(prefix='run.', dir=str(root)))
+        try:
+            atomic(run / '.netpilot-report', dict(type='netpilot-report-directory', version=1))
+        except OSError:
+            run.rmdir()
+            raise
+        print(run)
+    elif op == 'cleanup':
+        import errno
+        flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW
+        def owned_json(directory_fd, name):
+            try:
+                fd = os.open(name, flags | os.O_NONBLOCK, dir_fd=directory_fd)
+            except FileNotFoundError:
+                return None
+            with os.fdopen(fd, encoding='utf-8') as stream:
+                info = os.fstat(stream.fileno())
+                if not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid() or info.st_size > 1048576:
+                    raise ValueError('unsafe report identity file: ' + repr(name))
+                try:
+                    data = json.loads(stream.read(1048577))
+                except (ValueError, RecursionError):
+                    return None
+                return data if isinstance(data, dict) else None
+        for value in args:
+            root = Path(value).absolute()
+            try:
+                root_fd = os.open(root, flags | os.O_DIRECTORY)
+            except FileNotFoundError:
+                continue
+            try:
+                root_info = os.fstat(root_fd)
+                if root_info.st_uid != os.geteuid() or root_info.st_mode & 0o022:
+                    raise ValueError('unsafe report cleanup directory: ' + repr(str(root)))
+                with os.scandir(root_fd) as entries:
+                    names = [entry.name for entry in entries if entry.name.startswith('run.') and entry.is_dir(follow_symlinks=False)]
+                for name in names:
+                    run_fd = os.open(name, flags | os.O_DIRECTORY, dir_fd=root_fd)
+                    try:
+                        info = os.fstat(run_fd)
+                        if info.st_uid != os.geteuid() or info.st_mode & 0o022:
+                            raise ValueError('unsafe report run directory: ' + repr(name))
+                        marker = owned_json(run_fd, '.netpilot-report')
+                        summary = None if marker else owned_json(run_fd, 'summary.json')
+                        identified = (marker == dict(type='netpilot-report-directory', version=1) or
+                                      summary is not None and summary.get('type') == 'netpilot-tune-report' and summary.get('version') == 1)
+                        if not identified:
+                            continue
+                        with os.scandir(run_fd) as entries:
+                            files = [(entry.name, entry.stat(follow_symlinks=False)) for entry in entries]
+                        if any(filename not in ('.netpilot-report', 'before.json', 'after.json', 'summary.json') and
+                               not filename.startswith(('.summary.', '.http-report-')) for filename, _ in files):
+                            print(text('报告目录包含其他文件，已保留：', 'Report directory contains other files and was kept: ') + repr(str(root / name)), file=sys.stderr)
+                            continue
+                        if any(not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid() for _, info in files):
+                            raise ValueError('unsafe file in report directory: ' + repr(name))
+                        # Remove the ownership marker last, so interrupted cleanup
+                        # can still recognize and retry an otherwise empty run.
+                        identity = '.netpilot-report' if marker else 'summary.json'
+                        for filename, _ in sorted(files, key=lambda item: item[0] == identity):
+                            os.unlink(filename, dir_fd=run_fd)
+                    finally:
+                        os.close(run_fd)
+                    os.rmdir(name, dir_fd=root_fd)
+            finally:
+                os.close(root_fd)
+            current = root.lstat()
+            if (current.st_dev, current.st_ino) != (root_info.st_dev, root_info.st_ino):
+                raise ValueError('report directory changed during cleanup: ' + repr(str(root)))
+            try:
+                root.rmdir()
+            except OSError as exc:
+                if exc.errno not in (errno.ENOTEMPTY, errno.EEXIST):
+                    raise
     elif op == 'plan':
         d = measurement(args[0], 'before', args[1], int(args[2]), int(args[3]))
         bandwidth = max(d['download_bps'], d['upload_bps']) / 1e6
@@ -2506,7 +2597,7 @@ try:
                     print(text('原因：', 'Reason: ') + display(data['error'][:2048])[1:-1])
                 import shlex
                 command = 'netpilot --lang en report --json' if english else 'netpilot report --json'
-                if root != Path('/var/log/netpilot'):
+                if root != Path('/tmp/netpilot-reports'):
                     command += ' --report-dir ' + shlex.quote(str(root))
                 controls = {n: '\\u%04x' % n for n in list(range(32)) + list(range(127, 160))}
                 print(text('完整数据：', 'Full data: ') + command.translate(controls))
@@ -2547,7 +2638,8 @@ try:
     else:
         raise ValueError('unknown report operation')
 except (ValueError, TypeError, KeyError, OSError, OverflowError) as exc:
-    print(text('自动调优数据或报告无效：', 'Invalid automatic tuning data or report: ') + str(exc), file=sys.stderr)
+    prefix = text('无法清理报告：', 'Cannot clean reports: ') if op == 'cleanup' else text('自动调优数据或报告无效：', 'Invalid automatic tuning data or report: ')
+    print(prefix + str(exc), file=sys.stderr)
     sys.exit(1)
 PY
 }
@@ -2715,7 +2807,7 @@ Usage: netpilot [--lang zh|en] [command] [options] (or bash netpilot.sh [command
   rollback             Restore the first saved values; retain backups on failure
   install              Explicitly install NetPilot and the netpilot shortcut
   update               Download and validate updates from the project repository
-  uninstall [--rollback]  Remove the tool and keep tuning; --rollback restores configuration first
+  uninstall [--rollback]  Remove the tool and default reports; keep tuning unless --rollback is used
   help                 Show this help
 Basic commands require Linux/Bash 4+. Benchmark dependencies are installed separately.
 Profiles: balanced = general (default); proxy = proxies/many connections, more conservative buffers; bulk = a few large transfers, larger buffer recommendations.
@@ -2748,7 +2840,7 @@ NetPilot — Linux VPS 网络诊断与调优
   rollback             恢复首次记录的原值；失败保留备份
   install              显式安装 NetPilot 及 netpilot 快捷命令
   update               从自有仓库下载并检查更新
-  uninstall [--rollback]  仅卸载工具并保留调优；--rollback 先恢复配置再卸载
+  uninstall [--rollback]  删除工具和默认报告，保留调优；--rollback 先恢复配置再卸载
   help                 显示帮助
 基础命令需要Linux/Bash4+。测速依赖按需安装，脚本不自动安装测速工具。
 配置档：balanced 通用（默认）；proxy 代理/多连接，缓冲建议更保守；bulk 少量大文件传输，缓冲建议更大。

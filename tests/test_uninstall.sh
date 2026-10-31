@@ -8,9 +8,12 @@ SOURCE_HASH="$(sha256sum "$SCRIPT" | awk '{print $1}')"
 source <(sed -n '/^# BEGIN I18N$/,/^# END I18N$/p' "$SCRIPT")
 TEST_DIR="$(mktemp -d)"
 trap 'rm -rf -- "$TEST_DIR"' EXIT
-for name in installed_script_owned uninstall_own_script uninstall_menu resolve_source_path need_root need_command main menu run_mutation rollback_internal restore_rps restore_nic_ring remove_mss_rule restore_original_values managed_file_path restore_file remove_state_files sysctl_matches sysctl_value normalize_sysctl_value; do
+for name in installed_script_owned uninstall_own_script remove_automatic_reports uninstall_menu resolve_source_path need_root need_command main menu run_mutation rollback_internal restore_rps restore_nic_ring remove_mss_rule restore_original_values managed_file_path restore_file remove_state_files sysctl_matches sysctl_value normalize_sysctl_value; do
   sed -n "/^${name}() {/,/^}/p" "$SCRIPT" >> "$TEST_DIR/functions.sh"
 done
+# The embedded Python contains unindented braces; delimit this function using
+# the next shell function instead of the first closing brace.
+sed -n '/^auto_report() {/,/^auto_tune() {/p' "$SCRIPT" | sed '$d' >> "$TEST_DIR/functions.sh"
 # The real mutation wrapper may only lock this test's private directory.
 sed -i "s@/run/netpilot.lock@$TEST_DIR/operation.lock@g" "$TEST_DIR/functions.sh"
 # shellcheck source=/dev/null
@@ -43,6 +46,7 @@ setup() {
   GAI_FILE="$CASE_DIR/config/gai.conf"
   KERNEL_STATE="$CASE_DIR/kernel-algorithm"
   REPORT_ROOT="$CASE_DIR/reports"
+  AUTO_REPORT_ROOT="$REPORT_ROOT"; AUTO_LEGACY_REPORT_ROOT="$CASE_DIR/legacy-reports"
   UPDATE_URL='https://github.com/luckiestultra/netpilot/raw/refs/heads/main/netpilot.sh'
   cp "$SCRIPT" "$INSTALL_PATH"; cp "$SCRIPT" "$SCRIPT_PATH"
   ln -s "$INSTALL_PATH" "$SHORTCUT_PATH"
@@ -89,7 +93,7 @@ saved_data() {
   printf '# Original kernel configuration\n' > "$BACKUP_DIR/sysctl-file"
   printf 'net.ipv4.tcp_congestion_control = bbr\n' > "$SYSCTL_FILE"
   printf 'precedence ::ffff:0:0/96 100\n' > "$GAI_FILE"
-  printf '{"status":"completed","download_bps":100000000}\n' > "$REPORT_ROOT/run.previous/summary.json"
+  printf '{"type":"unrelated-user-data","download_bps":100000000}\n' > "$REPORT_ROOT/run.previous/summary.json"
 }
 protected_snapshot() {
   python3 - "$STATE_DIR" "$CASE_DIR/config" "$REPORT_ROOT" "$CASE_DIR/foreign" "$KERNEL_STATE" <<'PY'
@@ -255,7 +259,7 @@ test_cancel_does_not_mutate() (
   [[ -f "$INSTALL_PATH" && -f "$SCRIPT_PATH" && -L "$SHORTCUT_PATH" ]] || fail 'cancellation changed artifacts'
 )
 
-test_default_uninstall_keeps_configuration_backup_and_reports() (
+test_default_uninstall_keeps_configuration_backup_and_unrelated_files() (
   local language
   for language in zh en; do
     setup "keep-$language"; np_set_language "$language"
@@ -267,6 +271,63 @@ test_default_uninstall_keeps_configuration_backup_and_reports() (
     [[ ! -s "$CASE_DIR/rollback-calls" ]] || fail 'default uninstall invoked rollback'
     assert_protected_unchanged
     [[ -f "$SCRIPT_PATH" ]] || fail 'default uninstall deleted its download source'
+  done
+)
+
+test_uninstall_cleans_only_managed_default_reports() (
+  local language route run_dir legacy custom
+  for language in zh en; do
+    for route in keep rollback cancel failure; do
+      setup "report-cleanup-$language-$route"; saved_data; np_set_language "$language"
+      run_dir="$(auto_report prepare "$AUTO_REPORT_ROOT" "$STATE_DIR")"
+      # Even a damaged or unfinished new report is ours when its private marker
+      # survives. Older reports are recognized by their original JSON type.
+      printf '{broken\n' > "$run_dir/summary.json"
+      legacy="$AUTO_LEGACY_REPORT_ROOT/run.previous"; mkdir -p "$legacy"
+      printf '{"type":"netpilot-tune-report","version":1}\n' > "$legacy/summary.json"
+      custom="$CASE_DIR/custom-reports"
+      mkdir -p "$custom"; printf 'user-managed output\n' > "$custom/summary.json"
+      case "$route" in
+        keep) invoke_cli y || fail 'default uninstall report cleanup failed' ;;
+        rollback)
+          rollback_internal() { printf 'called\n' >> "$CASE_DIR/rollback-calls"; rm -rf -- "$STATE_DIR"; }
+          invoke_cli y --rollback || fail 'rollback uninstall report cleanup failed' ;;
+        cancel) invoke_cli n || fail 'cancelled uninstall failed' ;;
+        failure) if invoke_cli y --rollback; then fail 'failed restoration unexpectedly uninstalled'; fi ;;
+      esac
+      case "$route" in
+        keep|rollback)
+          assert_removed
+          [[ ! -e "$run_dir" && ! -e "$legacy" ]] || fail 'uninstall retained managed default reports'
+          [[ "$route" != keep || -f "$STATE_DIR/original-values" ]] || fail 'report cleanup discarded recovery records' ;;
+        *) assert_installed; [[ -f "$run_dir/summary.json" && -f "$legacy/summary.json" ]] || fail 'cancelled or failed uninstall removed reports' ;;
+      esac
+      [[ -f "$REPORT_ROOT/run.previous/summary.json" && -f "$custom/summary.json" ]] || fail 'report cleanup removed unrelated or custom data'
+    done
+  done
+)
+
+test_report_cleanup_does_not_follow_links_or_delete_user_files() (
+  local kind run_dir
+  for kind in root-link report-link fifo mixed; do
+    setup "unsafe-report-$kind"
+    run_dir="$(auto_report prepare "$AUTO_REPORT_ROOT" "$STATE_DIR")"
+    printf 'private user file\n' > "$CASE_DIR/user-file"
+    case "$kind" in
+      root-link) mv "$AUTO_REPORT_ROOT" "$CASE_DIR/linked-reports"; ln -s "$CASE_DIR/linked-reports" "$AUTO_REPORT_ROOT" ;;
+      report-link) ln -s "$CASE_DIR/user-file" "$run_dir/before.json" ;;
+      fifo) mkfifo "$run_dir/before.json" ;;
+      mixed) printf 'user notes\n' > "$run_dir/notes.txt" ;;
+    esac
+    if [[ "$kind" == mixed ]]; then
+      invoke_cli y || fail 'unrelated files blocked tool removal'
+      assert_removed
+      [[ -f "$run_dir/notes.txt" && -f "$run_dir/.netpilot-report" ]] || fail 'mixed directory was deleted'
+    else
+      if invoke_cli y; then fail "unsafe report path was accepted: $kind"; fi
+      assert_installed
+    fi
+    [[ "$(cat "$CASE_DIR/user-file")" == 'private user file' ]] || fail 'cleanup followed a symbolic link'
   done
 )
 
@@ -466,7 +527,7 @@ test_bilingual_menu_cancellation_and_eof() (
 )
 
 failures=0
-for test in test_download_uninstall_removes_installed_copy_only test_installed_path_uninstalls test_menu_uninstall_without_resolved_source test_process_substitution_resolves_then_uninstalls test_changed_owned_version_is_recognized test_unrelated_installed_file_is_preserved test_installed_symlink_is_preserved test_dangling_installed_symlink_is_preserved test_unrelated_shortcuts_are_preserved test_absent_installation_keeps_source test_failed_rollback_keeps_installation test_residual_state_failure_keeps_installation test_shortcut_remove_failure_is_reported test_install_remove_failure_is_reported test_cancel_does_not_mutate test_default_uninstall_keeps_configuration_backup_and_reports test_default_uninstall_does_not_validate_or_follow_damaged_state test_explicit_rollback_uninstall_runs_before_removal test_explicit_rollback_without_state_preserves_installation test_explicit_rollback_rejects_empty_and_unknown_only_state test_file_only_backups_are_restored_without_original_values_marker test_uninstall_rejects_unknown_options_before_confirmation test_uninstall_confirmation_defaults_to_cancel test_bilingual_menu_default_and_keep_choice_route test_bilingual_menu_rollback_choice_route test_bilingual_menu_cancellation_and_eof; do
+for test in test_download_uninstall_removes_installed_copy_only test_installed_path_uninstalls test_menu_uninstall_without_resolved_source test_process_substitution_resolves_then_uninstalls test_changed_owned_version_is_recognized test_unrelated_installed_file_is_preserved test_installed_symlink_is_preserved test_dangling_installed_symlink_is_preserved test_unrelated_shortcuts_are_preserved test_absent_installation_keeps_source test_failed_rollback_keeps_installation test_residual_state_failure_keeps_installation test_shortcut_remove_failure_is_reported test_install_remove_failure_is_reported test_cancel_does_not_mutate test_default_uninstall_keeps_configuration_backup_and_unrelated_files test_uninstall_cleans_only_managed_default_reports test_report_cleanup_does_not_follow_links_or_delete_user_files test_default_uninstall_does_not_validate_or_follow_damaged_state test_explicit_rollback_uninstall_runs_before_removal test_explicit_rollback_without_state_preserves_installation test_explicit_rollback_rejects_empty_and_unknown_only_state test_file_only_backups_are_restored_without_original_values_marker test_uninstall_rejects_unknown_options_before_confirmation test_uninstall_confirmation_defaults_to_cancel test_bilingual_menu_default_and_keep_choice_route test_bilingual_menu_rollback_choice_route test_bilingual_menu_cancellation_and_eof; do
   if "$test"; then printf 'PASS: %s\n' "$test"; else failures=$((failures + 1)); fi
 done
 [[ "$(sha256sum "$SCRIPT" | awk '{print $1}')" == "$SOURCE_HASH" ]] || fail 'uninstall tests modified source bytes'

@@ -34,7 +34,7 @@ Choose main-menu `10`, or run:
 netpilot --lang en report
 ```
 
-The summary shows configuration state, measurements and the report's update time. It reads `/var/log/netpilot` by default; if the latest attempt has no report yet, this may be an older record. For a custom directory, use `netpilot --lang en report --report-dir DIR`.
+The summary shows configuration state, measurements and the report's update time. It reads `/tmp/netpilot-reports` by default; system cleanup or a reboot may remove these temporary reports. If the latest attempt has no report yet, this may be an older record. For a custom directory, use `netpilot --lang en report --report-dir DIR`.
 
 | Status | Meaning |
 |---|---|
@@ -51,10 +51,10 @@ Verification checks parameter consistency; measurements describe the server-to-t
 |---|---|---|
 | Update and open the menu | `6` | `netpilot --lang en update` |
 | Restore the original baseline | `5` | `netpilot --lang en rollback` |
-| Remove only the tool | `7` → `1`, default | `netpilot --lang en uninstall` |
+| Remove the tool and default reports | `7` → `1`, default | `netpilot --lang en uninstall` |
 | Roll back, then uninstall | `7` → `2` | `netpilot --lang en uninstall --rollback` |
 
-Rollback restores the **first saved values**. Default uninstall keeps settings, backups and reports. Rollback-and-uninstall requires successful restoration; missing records or restore failures stop removal. Both uninstall modes require `y/N` confirmation.
+Rollback restores the **first saved values**. Default uninstall removes the tool and automatic reports in its default locations, keeping tuning settings and recovery backups. Custom report directories remain user-managed. Rollback-and-uninstall requires successful restoration; missing records or restore failures stop removal. Both uninstall modes require `y/N` confirmation.
 
 ## Use with AI
 
@@ -120,7 +120,7 @@ Chinese is the default; menu `L` switches the current session. Use `netpilot --l
 | `--budget-mib` | `128` | Whole-run payload; integer 1–1024MiB. |
 | `--timeout` | `30` | Per-phase timeout; integer 5–120 seconds. |
 | `--endpoint` | `https://speed.cloudflare.com` | HTTPS origin with compatible download/upload APIs; HTTP is limited to loopback addresses. |
-| `--report-dir` | `/var/log/netpilot` | Private report directory; cannot be inside `/var/lib/netpilot/`. |
+| `--report-dir` | `/tmp/netpilot-reports` | Private report directory; cannot be inside `/var/lib/netpilot/`. |
 
 Latency is the average of three TCP connection times. Each phase gets half the budget, split between download and upload. Failed requests consume budget, with no automatic retry. Samples shorter than 3 seconds are marked budget-limited and cannot establish peak bandwidth.
 
@@ -194,7 +194,7 @@ Original values and files are saved before their first change; repeated runs pre
 |---|---|
 | `/usr/local/bin/netpilot.sh`, `/usr/local/bin/netpilot` | Program and shortcut. |
 | `/var/lib/netpilot/` | Original values, backups and recovery state. |
-| `/var/log/netpilot/` | Automatic reports; retained on rollback and uninstall. |
+| `/tmp/netpilot-reports/` | Temporary automatic reports; cleaned on uninstall. |
 | `/etc/sysctl.d/99-netpilot.conf`, `/etc/sysctl.d/10-netpilot-bbr.conf` | Tuning and BBR settings. |
 | `/etc/modules-load.d/netpilot.conf` | BBR module loading. |
 | `/etc/gai.conf` | IPv4 preference. |
@@ -202,12 +202,14 @@ Original values and files are saved before their first change; repeated runs pre
 
 Restore failures retain backups. After program-only removal, run the online command again and choose `5` to restore from retained records. Rollback covers changes managed by NetPilot.
 
+View older reports with `netpilot --lang en report --report-dir /var/log/netpilot`. Uninstall also cleans recognized NetPilot reports there, preserving unrelated files.
+
 ### Requirements
 
 | Function | Dependencies |
 |---|---|
 | Basic operation | Linux, Bash 4+, `sysctl`, `awk`; online startup needs `curl`. |
-| Configuration changes and maintenance | root, `flock`. |
+| Configuration changes and maintenance | root, `flock`; cleaning existing reports needs `python3`. |
 | Automatic tuning | `python3`, GNU `timeout`. |
 | Diagnostics / NIC settings | `ip`, `tc` / `ethtool`. |
 | Manual latency probes | `ping`, GNU `timeout`. |

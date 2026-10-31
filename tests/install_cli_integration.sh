@@ -88,10 +88,12 @@ printf 'PASS: real IPv4 operation records only NetPilot state; rollback restores
 # Default uninstall must leave an active configuration and its exact recovery
 # data intact, including when deleting the executable fails.
 printf '1\n0\n' | /usr/local/bin/netpilot > "$TMP/reapply-before-uninstall.log"
-mkdir -p /var/log/netpilot
-printf 'retained automatic report fixture\n' > /var/log/netpilot/uninstall-report.json
+mkdir -p /tmp/netpilot-reports/run.uninstall /var/log/netpilot/run.uninstall
+for root in /tmp/netpilot-reports /var/log/netpilot; do
+  printf '{"type":"netpilot-tune-report","version":1}\n' > "$root/run.uninstall/summary.json"
+done
 find /var/lib/netpilot -type f -print0 | sort -z | xargs -0 sha256sum > "$TMP/retained-state-hashes"
-sha256sum /etc/gai.conf /var/log/netpilot/uninstall-report.json > "$TMP/retained-config-report-hashes"
+sha256sum /etc/gai.conf > "$TMP/retained-config-report-hashes"
 
 # A real kernel permission denial must propagate through the entire CLI.
 BIN_MODE="$(stat -c '%a' /usr/local/bin)"
@@ -111,16 +113,18 @@ printf 'PASS: actual GNU rm permission denial is nonzero without false completio
 bash "$SCRIPT" rollback > "$TMP/rollback-after-uninstall.log"
 cmp -s "$TMP/original-gai" /etc/gai.conf || fail 'source rollback after default uninstall did not restore the original configuration'
 [[ ! -e /var/lib/netpilot && ! -e /usr/local/bin/netpilot.sh && ! -L /usr/local/bin/netpilot ]] || fail 'source rollback reinstalled NetPilot or left recovery state'
-[[ -f /var/log/netpilot/uninstall-report.json ]] || fail 'source rollback removed retained reports'
-printf 'PASS: default uninstall retains active configuration, backups and reports; retained source can still roll back without reinstalling\n'
+[[ ! -e /tmp/netpilot-reports && ! -e /var/log/netpilot ]] || fail 'default uninstall retained managed reports'
+printf 'PASS: default uninstall cleans managed reports, retains configuration/backups; source rollback works without reinstalling\n'
 
 printf '0\n' | bash "$SCRIPT" install > "$TMP/reinstall-for-rollback.log"
 printf '1\n0\n' | /usr/local/bin/netpilot > "$TMP/reapply-for-rollback-uninstall.log"
+mkdir -p /tmp/netpilot-reports/run.uninstall
+printf '{"type":"netpilot-tune-report","version":1}\n' > /tmp/netpilot-reports/run.uninstall/summary.json
 printf 'y\n' | /usr/local/bin/netpilot uninstall --rollback > "$TMP/rollback-uninstall.log"
 cmp -s "$TMP/original-gai" /etc/gai.conf || fail 'explicit rollback uninstall did not restore the original configuration'
 [[ ! -e /var/lib/netpilot && ! -e /usr/local/bin/netpilot.sh && ! -L /usr/local/bin/netpilot ]] || fail 'explicit rollback uninstall left installation or recovery state'
-[[ -f /var/log/netpilot/uninstall-report.json ]] || fail 'explicit rollback uninstall removed reports'
-printf 'PASS: explicit --rollback restores saved configuration before uninstalling and retains reports\n'
+[[ ! -e /tmp/netpilot-reports ]] || fail 'explicit rollback uninstall retained reports'
+printf 'PASS: explicit --rollback restores saved configuration before removing the tool and default reports\n'
 
 for kind in regular symlink; do
   if [[ "$kind" == regular ]]; then printf 'independent command\n' > /usr/local/bin/netpilot

@@ -41,7 +41,7 @@ netpilot tune
 | `--budget-mib` | 128；整数 1–1024MiB，覆盖整轮前后双向测量。 |
 | `--timeout` | 30；整数 5–120 秒，前测与复测分别计时。 |
 | `--endpoint` | `https://speed.cloudflare.com`；需兼容下载/上传接口的 HTTPS 源，明文 HTTP 仅限显式回环地址。 |
-| `--report-dir` | `/var/log/netpilot`；每轮建立私有 `run.*` 目录。 |
+| `--report-dir` | `/tmp/netpilot-reports`；每轮建立私有 `run.*` 目录。 |
 
 `tune` 不接受 `--bandwidth`、`--rtt`、`--rtt-target` 或 `--yes`。自定义测速源不能含凭据、查询、片段或业务路径；普通网页不能代替测速接口。
 
@@ -80,7 +80,9 @@ netpilot tune
 
 ## 报告与状态
 
-主菜单 `10` 和无参 `netpilot report` 读取服务器默认 `/var/log/netpilot` 目录中最新保存的报告，显示文件更新时间和历史运行摘要；不代表当前实时状态，本轮前置失败时可能仍是旧记录。自定义目录须用 `--report-dir DIR`，无需手找单个报告路径。`netpilot report --json` 输出完整 `summary.json`，不带其他提示文字。
+主菜单 `10` 和无参 `netpilot report` 读取服务器默认 `/tmp/netpilot-reports` 目录中最新保存的报告，显示文件更新时间和历史运行摘要；不代表当前实时状态，本轮前置失败时可能仍是旧记录。自定义目录须用 `--report-dir DIR`，无需手找单个报告路径。`netpilot report --json` 输出完整 `summary.json`，不带其他提示文字。
+
+报告默认临时保存，可能被系统清理或在重启后消失；需要长期保留可指定自定义目录。旧版报告使用 `netpilot report --report-dir /var/log/netpilot` 查看。
 
 报告字段和保存格式不变，下面说明的是完整 JSON。查看器核对流程状态、配置派生状态及内嵌测量/比较是否一致；矛盾或损坏时报错。私有报告需相应读取权限；没有报告时看执行命令和错误输出，结合目标机帮助确认功能版本。
 
@@ -121,10 +123,12 @@ netpilot tune
 | 命令 / 菜单 | 行为 |
 |---|---|
 | `netpilot rollback` / `5` | 恢复首次原值；失败保留备份。 |
-| `netpilot uninstall` / `7` → `1` 或回车 | 默认只删程序和自有快捷命令，保留配置、备份、报告、下载/源码副本。 |
-| `netpilot uninstall --rollback` / `7` → `2` | 先恢复再卸载；无记录或恢复失败则保留安装及已有备份。 |
+| `netpilot uninstall` / `7` → `1` 或回车 | 删除程序、自有快捷命令和默认自动报告，保留配置、恢复备份与下载/源码副本。 |
+| `netpilot uninstall --rollback` / `7` → `2` | 先恢复，再清理默认自动报告并删除程序；无恢复记录或恢复失败则保留安装和报告。 |
 
 卸载均需最终 `y/N` 确认，菜单 `0` 取消。仅卸载后可重新运行在线入口、选 `5` 回滚，无需再次调优。
+
+报告清理限于默认目录和旧版 `/var/log/netpilot` 中带工具标记或可识别格式的运行目录；自定义路径、其他文件和符号链接目标不会被删除。清理失败返回非零并保留程序。
 
 带修改标记的 ring/RPS 缺少有效原值时恢复失败；清理失败也报错并保留状态。旧的损坏或缺失备份不能自动重建。回滚仅恢复 NetPilot 管理的变更，不是系统快照。
 
@@ -132,7 +136,7 @@ netpilot tune
 |---|---|
 | `/usr/local/bin/netpilot.sh`、`/usr/local/bin/netpilot` | 程序、快捷命令。 |
 | `/var/lib/netpilot/original-values`、`/var/lib/netpilot/backup/` | 首次原值、文件备份；其他恢复状态也在 `/var/lib/netpilot/`。 |
-| `/var/log/netpilot/run.*/` | 自动报告，与备份分开。 |
+| `/tmp/netpilot-reports/run.*/` | 自动报告，与备份分开。 |
 | `/etc/sysctl.d/99-netpilot.conf`、`/etc/sysctl.d/10-netpilot-bbr.conf` | 调优、BBR 配置。 |
 | `/etc/modules-load.d/netpilot.conf` | BBR 模块加载。 |
 | `/etc/gai.conf` | 仅显式 IPv4 优先时修改。 |
