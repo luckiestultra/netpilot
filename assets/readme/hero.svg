@@ -1,0 +1,43 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="380" viewBox="0 0 1200 380" role="img" aria-labelledby="title desc">
+  <title id="title">NetPilot — 网络诊断与 TCP 调优</title>
+  <desc id="desc">一条命令进入中英文交互菜单。主菜单 9 自动完成前测、生成并应用方案、核验和复测对比；右侧为该流程的示意，不代表实际测量或验证结果。</desc>
+  <rect width="1200" height="380" rx="18" fill="#f2f5fa"/>
+  <g font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', sans-serif">
+    <g id="category">
+      <path d="M65 47 78 34 91 47 78 60Z" fill="#2855e8"/>
+      <path d="m72 48 6-6 6 6" fill="none" stroke="#fff" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/>
+      <text x="110" y="54" fill="#65758b" font-family="ui-monospace, 'SFMono-Regular', Menlo, monospace" font-size="22" letter-spacing="2">LINUX NETWORK TOOLKIT</text>
+    </g>
+    <g id="wordmark">
+      <g font-size="126" font-weight="750" letter-spacing="-6">
+        <text x="58" y="192" fill="#15243b">Net<tspan fill="#2855e8">Pilot</tspan></text>
+      </g>
+      <text x="64" y="266" fill="#15243b" font-size="42" font-weight="500">网络诊断与 TCP 调优</text>
+      <text x="64" y="322" fill="#65758b" font-size="28">一条命令 · 中英文交互菜单</text>
+    </g>
+    <path d="M678 88v220" stroke="#d7e0eb" stroke-width="1.5"/>
+    <g id="workflow">
+      <text x="750" y="54" fill="#65758b" font-size="22">主菜单 9 · 一键调优</text>
+      <path d="M760 88v198" fill="none" stroke="#2855e8" stroke-width="3"/>
+      <path d="m754 117 6 6 6-6m-12 66 6 6 6-6m-12 66 6 6 6-6" fill="none" stroke="#2855e8" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+      <g fill="#f2f5fa" stroke="#2855e8" stroke-width="3">
+        <circle cx="760" cy="88" r="8"/>
+        <circle cx="760" cy="154" r="8"/>
+        <circle cx="760" cy="220" r="8"/>
+      </g>
+      <rect x="750" y="276" width="20" height="20" rx="3" fill="#2855e8"/>
+      <g font-family="ui-monospace, 'SFMono-Regular', Menlo, monospace" font-size="32">
+        <text x="800" y="98" fill="#15243b">MEASURE</text>
+        <text x="800" y="164" fill="#15243b">TUNE</text>
+        <text x="800" y="230" fill="#15243b">VERIFY</text>
+        <text x="800" y="296" fill="#2855e8">COMPARE</text>
+      </g>
+      <g fill="#65758b" font-size="26">
+        <text x="1040" y="98">前测</text>
+        <text x="1040" y="164">调优</text>
+        <text x="1040" y="230">核验</text>
+        <text x="1040" y="296" fill="#2855e8">复测对比</text>
+      </g>
+    </g>
+  </g>
+</svg>

@@ -1,212 +1,230 @@
-# NetPilot
+<p align="center"><strong>简体中文</strong> · <a href="./README.en.md">English</a></p>
 
-面向通用 Linux VPS 的 TCP 诊断、参数建议、预算测速与回滚工具。根据当前内核能力、有效内存、CPU 配额和路径输入生成建议，提供 `netpilot` 中文菜单与单文件运行方式。
+<p align="center">
+  <img src="./assets/readme/hero.svg" width="100%" alt="NetPilot：Linux VPS 网络诊断与 TCP 调优，支持中英文菜单。">
+</p>
 
-调优不能增加云厂商带宽，也不能保证改善拥塞或代理体验。工具展示读回值和实际测量结果，不把配置成功当作性能提升。
+NetPilot 是 Linux VPS 网络诊断与 TCP 调优工具，自动完成测速、备份、调优和前后对比。
 
-## 环境与权限
+[开始使用](#开始使用) · [查看结果](#查看结果) · [维护与恢复](#维护与恢复) · [交给 AI](#交给-ai) · [完整参考](#完整参考)
 
-- Linux、Bash 4+，基础命令需要 `sysctl`、`awk`。
-- 修改系统、安装、回滚、更新和卸载需要 root；修改操作使用 `flock` 防止并发写入。
-- 出口和队列诊断使用 `ip`，查看实际队列还需要 `tc`。不支持或缺失的能力会明确提示。
-- 测速按需使用 `iperf3`、`python3`、GNU `timeout`；`--latency` 另需 `ping`。工具不自动安装这些测速依赖。
-- 网卡高级选项需要 `ethtool`，缺失时提示自行安装并跳过 ring 操作。
+## 开始使用
 
-小内存、单核、多核、cgroup v1/v2 和 IPv6-only 出口均有相应检测与保守处理；这不意味着所有虚拟化平台都允许修改参数。LXC/OpenVZ、受限容器及特殊内核可能只有部分能力可用。
-
-## 下载、预览和安装
-
-先下载到本地检查，诊断和计划不要求安装：
-
-```bash
-curl -fsSL --proto '=https' --tlsv1.2 \
-  https://raw.githubusercontent.com/luckiestultra/netpilot/main/netpilot.sh \
-  -o /tmp/netpilot.sh
-
-bash -n /tmp/netpilot.sh
-bash /tmp/netpilot.sh doctor
-bash /tmp/netpilot.sh plan --profile balanced
-```
-
-确认需要保留快捷命令后，以 root 执行显式安装：
-
-```bash
-bash /tmp/netpilot.sh install
-```
-
-安装文件为 `/usr/local/bin/netpilot.sh`，快捷命令为 `netpilot`。运行 `netpilot` 打开菜单，使用 `netpilot update` 更新。`install` 遇到内容不同的既有安装文件会保护原文件；被其他文件占用的快捷命令也不会覆盖。
-
-也可通过一行命令直接打开菜单：
+以 root 在 Linux 服务器上运行：
 
 ```bash
 bash <(curl -fsSL https://raw.githubusercontent.com/luckiestultra/netpilot/main/netpilot.sh)
 ```
 
-直接打开菜单、运行 `doctor`、`plan` 或 `status` 不会隐式安装脚本。需要一行安装时，在同一命令后加 `install`。
+脚本自动保存并打开中文菜单。**选 `9` 一键调优，选 `10` 看结果。** `L` 切换中英文，`0` 退出。
 
-NetPilot 使用独立的安装、配置和状态路径。此前安装的其他工具由其自身管理；NetPilot 不自动迁移或清理其他工具的数据。
+调优会依次完成前测、备份应用、参数核验和复测对比，无需手填带宽、延迟或报告名。默认整轮测试数据预算 **128MiB**，协议开销另计。
 
-## 推荐流程
+以后在同一台服务器直接运行：
+
+```bash
+netpilot
+```
+
+## 查看结果
+
+主菜单选 `10`，或运行：
+
+```bash
+netpilot report
+```
+
+摘要显示配置状态、前后测量和报告更新时间。默认读取 `/var/log/netpilot`；若本轮尚未生成报告，可能显示旧记录，请核对时间。自定义目录使用 `netpilot report --report-dir DIR`。
+
+| 状态 | 含义 |
+|---|---|
+| 完成 | 流程与比较完成。 |
+| 部分完成 | 复测或比较未完成，已核验配置保留。 |
+| 失败 | 查看阶段与原因；恢复失败时保留备份。 |
+| 已取消 | 查看配置和回滚状态，确认是否已恢复。 |
+
+核验检查参数是否一致；测速反映服务器到测试源的路径。需要查看当前配置时，用 `netpilot status` 或 `netpilot verify`。
+
+## 维护与恢复
+
+| 操作 | 菜单 | 命令 |
+|---|---|---|
+| 更新并打开菜单 | `6` | `netpilot update` |
+| 恢复首次原值 | `5` | `netpilot rollback` |
+| 仅卸载程序 | `7` → `1`，默认 | `netpilot uninstall` |
+| 回滚后卸载 | `7` → `2` | `netpilot uninstall --rollback` |
+
+回滚恢复**首次保存的原值**。默认卸载保留配置、备份和报告；回滚后卸载须先恢复成功，无记录或恢复失败时停止。卸载均需 `y/N` 确认。
+
+## 交给 AI
+
+把[项目说明](./docs/for-ai.md)链接和你的问题发给 AI：
 
 ```text
-只读诊断 → 查看建议 → 确认并应用 → 读回验证 → 同条件测量与对比
-                                      ↓
-                               必要时恢复首次原值
+https://raw.githubusercontent.com/luckiestultra/netpilot/main/docs/for-ai.md
 ```
 
-### 诊断与建议
+可复制菜单 `10` 的结果；需要完整数据时运行：
 
 ```bash
-netpilot doctor
-netpilot plan --profile proxy
-
-# 带宽与 RTT 应来自同一条实际路径；不要直接填写网卡标称速率。
-netpilot plan --profile proxy --bandwidth 500 --rtt 80
+netpilot report --json
 ```
 
-`doctor` 查看有效内存、可用 CPU、可用/当前拥塞算法、默认与实际 qdisc，并提示可检测到的 tuned 配置。只读操作不测速、不加载模块或改内核。
+分享前在副本中隐藏 IP、域名等私人信息，保留报错和测速数字。没有报告时，提供执行命令和错误输出即可。
 
-`plan` 显示当前值、建议值与理由：
+## 完整参考
 
-| 配置档 | 用途与策略 |
+### 菜单与命令
+
+| 主菜单 | 功能 |
 |---|---|
-| `balanced` | 通用用途，默认档；新建议单 socket 上限受有效内存的约 1/24 约束。 |
-| `proxy` | 代理、多连接用途；新建议上限更保守，约为有效内存的 1/32。 |
-| `bulk` | 少量大流传输；允许较大的新建议上限，约为有效内存的 1/16。 |
+| `9` | 一键调优。 |
+| `10` | 查看最新报告。 |
+| `8` | 诊断与独立测速。 |
+| `5` | 恢复首次原值。 |
+| `6` | 更新 NetPilot。 |
+| `7` | 卸载，默认保留配置。 |
+| `1` | IPv4 优先，修改 `/etc/gai.conf`。 |
+| `2` | 启用内核提供的 BBR 与默认 FQ。 |
+| `3` | 手动调优，预览后确认。 |
+| `4` | 网卡 ring / RPS；单核跳过 RPS。 |
+| `L` / `0` | 切换会话语言 / 退出。 |
 
-所有档位的新建议上限还受 256MiB 限制。给定完整路径输入时，基础候选值采用 `2 × BDP + 256KiB`，其中 `BDP = 带宽(bit/s) × RTT(s) ÷ 8`，再受内存预算约束。这是可解释的保守策略，不是已证明的最优参数。
+主菜单 `8` 的子菜单：
 
-- `--bandwidth` 使用 Mbps，`--rtt` 使用 ms，支持正小数，必须同时提供。
-- 没有完整路径输入时保留现有缓冲区；不会用固定 RTT 伪装实测结果。
-- 保守模式只提高不足的缓冲上限，不降低已有更大值，也不抬高每连接初始缓冲。上限不是预分配内存，预算也不是全机内存硬上限。
-- 内核已经提供 BBR 时才在计划中建议使用；仅凭 `bbr` 名称不能确定 BBR 代际。
-- `default_qdisc=fq` 是默认配置，不代表正在使用的所有网卡队列都已变为 FQ。
+| 选择 | 命令 | 功能 |
+|---|---|---|
+| `1` | `netpilot doctor` | 检查环境。 |
+| `2` | `netpilot plan` | 预览建议。 |
+| `3` | `netpilot bench --peer HOST` | iperf3 测速。 |
+| `4` | `netpilot compare BEFORE.json AFTER.json` | 比较 iperf3 报告。 |
+| `5` | `netpilot verify` | 核验参数。 |
+| `6` | `netpilot diagnose --seconds 5` | 观察计数增量。 |
+| `0` | — | 返回主菜单。 |
 
-### 应用与验证
+`diagnose` 不带参数看累计值，`--seconds` 范围 1–60；重传计数不是端到端丢包率。子菜单操作后返回主菜单。
+
+`netpilot menu` 打开菜单，`netpilot help` 或 `netpilot COMMAND --help` 查看帮助，`netpilot install` 显式安装。
+
+### 语言设置
+
+默认中文，菜单 `L` 切换本次会话语言。命令行使用 `netpilot --lang en doctor`；`--lang zh|en` 放在子命令前，优先于环境变量 `NETPILOT_LANG`。
+
+### 自动调优参数
+
+`netpilot tune` 支持以下参数：
+
+| 参数 | 默认值 | 用途 |
+|---|---|---|
+| `--profile` | `balanced` | [选择用途](#参数建议)。 |
+| `--budget-mib` | `128` | 整轮测试数据，整数 1–1024MiB。 |
+| `--timeout` | `30` | 每阶段超时，整数 5–120 秒。 |
+| `--endpoint` | `https://speed.cloudflare.com` | 兼容下载/上传接口的 HTTPS 源；HTTP 仅限回环地址。 |
+| `--report-dir` | `/var/log/netpilot` | 私有报告目录，不能位于 `/var/lib/netpilot/` 内。 |
+
+延迟采用 3 次 TCP 建连耗时的平均值。前测、复测各占一半预算，再平分给下载和上传；失败请求也计入预算，不自动重试。短于 3 秒的样本标记为预算受限，不能判断峰值。
+
+复测沿用前测的 IP、请求大小和超时；Cloudflare 节点也须一致。报告自动保存为 `before.json`、可获得的 `after.json` 和 `summary.json`。
+
+前测失败不改配置。本轮写入后应用或核验失败会尝试恢复首次原值；复测失败保留已核验配置。取消时以报告中的配置和回滚状态为准。
+
+### 参数建议
+
+| 配置档 | 用途 |
+|---|---|
+| `balanced` | 通用，默认。 |
+| `proxy` | 代理、多连接，缓冲建议更保守。 |
+| `bulk` | 少量大文件传输，缓冲预算更大。 |
+
+工具按路径带宽、延迟和有效内存，分别估算收、发缓冲上限。只提高不足值，保留已有更大值和初始缓冲，不预先分配等量内存。
+
+**手动模式可选**：菜单 `3` 或 `plan` / `apply`；一键调优无需填写以下路径数据。
+
+| 参数 | 用法 |
+|---|---|
+| `--profile` | 上表中的配置档。 |
+| `--bandwidth` | 同一路径的 Mbps，正数 ≤1000000。 |
+| `--rtt` | 同一路径的 ms，正数 ≤60000，须与带宽一起提供。 |
+| `--rtt-target HOST` | 用 ping 测延迟；须提供带宽，与 `--rtt` 互斥。 |
+| `--yes` | `apply` 跳过确认。 |
+
+将示例中的 500Mbps、80ms 换成实际路径数据：
 
 ```bash
-# 先显示计划，确认后才写入和持久化。
+netpilot plan --profile proxy --bandwidth 500 --rtt 80
 netpilot apply --profile proxy --bandwidth 500 --rtt 80
-
-# 明确授权的非交互用法。
-netpilot apply --profile proxy --bandwidth 500 --rtt 80 --yes
-
-netpilot status
-netpilot verify
 ```
 
-`netpilot apply` 默认采用 `balanced` 档。基础调优保留 `tcp_mem`、socket 初始缓冲、ECN、TFO、重试次数、TIME_WAIT、IPv4/IPv6 地址策略；不修改 limits/MSS，也不重启 Xray 或改动 3x-ui 入站。
+`plan` 只预览，`apply` 确认后应用。省略路径数据保留现有缓冲区。菜单中不知道带宽可直接回车；已填带宽但不知道延迟，可回车后输入目标自动测量。延迟测量失败则停止。
 
-`verify` 对比本工具两个 sysctl 配置路径中的期望值与运行值；没有可验证配置、参数不可读或存在偏离时返回非零。它验证参数一致性，不验证吞吐，也不核验所有外部配置文件或服务限制。其他调优器仍可能在稍后覆盖相同参数，应先解决管理冲突。
+### 测速与对比
 
-### 网络计数诊断
+已有自己的 iperf3 服务端时，可使用独立 `bench`；它与一键调优的自动测量分别使用不同报告格式。
+
+| 参数 | 默认值与范围 |
+|---|---|
+| `--peer HOST` | 必填，主机名、IPv4 或 IPv6。 |
+| `--port` | 5201；1–65535。 |
+| `--budget-mib` | 1024MiB；1–1048576，覆盖全部方向和流。 |
+| `--direction` | `both`；`send` 为 VPS → 对端，`receive` 相反。 |
+| `--streams` | 1；1–32。 |
+| `--timeout` | 30 秒；2–600，每方向分别计时。 |
+| `--latency` | 可选 ping 空闲/负载延迟采样。 |
+| `--output FILE` | 默认自动命名，不覆盖已有文件。 |
+| `--yes` | 跳过确认，非交互运行时必需。 |
+
+将 `iperf.example.net` 换成实际服务端，两次测速之间完成所选调优与核验：
 
 ```bash
-netpilot diagnose
-netpilot diagnose --seconds 5
-```
-
-查看接收 softnet 丢弃/处理预算耗尽、监听队列溢出和 TCP 重传等累计计数；指定 `--seconds 1..60` 时观察增量，不发送测速流量。计数可能包含其他业务；TCP 重传不等于直接测量的端到端丢包率，单个计数也不能独自确定瓶颈。
-
-## 有预算测速和前后对比
-
-使用你有权测试、能够连接的 iperf3 服务端：
-
-```bash
-netpilot bench --peer iperf.example.net --port 5201 \
-  --budget-mib 256 --direction both --streams 1 \
-  --timeout 30 --output before.json
-
-# 应用计划后，用相同对端与选项重新测量。
-netpilot bench --peer iperf.example.net --port 5201 \
-  --budget-mib 256 --direction both --streams 1 \
-  --timeout 30 --output after.json
-
+netpilot bench --peer iperf.example.net --budget-mib 256 --output before.json
+# 调优并核验后，以相同条件复测
+netpilot bench --peer iperf.example.net --budget-mib 256 --output after.json
 netpilot compare before.json after.json
 ```
 
-`iperf.example.net` 是占位符，需换成实际服务端。默认预算为 1024MiB，包含全部测试方向和并行流的 payload 目标；默认单流、双向、每方向最多 30 秒：
+`compare` 仅接受不超过 1MiB 的普通 iperf3 JSON 报告；测试条件和实际对端须一致，失败或缺少 `remote_endpoints` 的旧报告会被拒绝。自动调优已完成比较，无需另跑此命令。
 
-- `send`：VPS → 对端；`receive`：对端 → VPS；`both`：依次测试两个方向并分配预算。
-- `--streams 1..32` 调整并行流，`--timeout 2..600` 设置每方向超时。
-- `--latency` 使用 `ping` 额外采样空闲/负载时 ICMP RTT，输出 p95 与变化；ICMP 不可用或样本不足会明确提示。这不是完整的 Flent RRUL 测试。
-- 测试前需要确认；非交互运行须显式加 `--yes`。失败对端不自动重试整轮测速，取消/超时会清理测试进程。
-- payload 预算不等于商家计费硬上限，协议开销、重传、ACK 与可选 ICMP 流量另计。10Gbps 连跑 10 秒约为 12.5GB 单方向 payload，应按套餐选择预算。
-- 高速链路可能在很短时间用完预算；短于 3 秒的样本会标记为不足以确定峰值，不会自动扩大预算。
+预算不含协议开销、重传及可选 ICMP；短样本不能判断峰值，ICMP 也不等于业务延迟。失败不自动重试，取消或超时清理测试进程。
 
-JSON 报告类型为 `netpilot-benchmark`，记录测试条件、吞吐、重传、CPU 与可选延迟信息，以私有权限保存，包含对端地址和可能的错误详情；分享前自行脱敏。默认报告写在当前目录，`--output` 不覆盖已有文件。
+### 配置文件与备份
 
-`compare` 要求对端、端口、方向、流数、预算、超时和延迟采样选项一致，并拒绝失败或格式不匹配的报告。结果只代表该对端、方向和时段；VPS 与近端的测速不能代替用户到节点的真实代理体验，线路波动也可能造成前后差异。
+首次修改前保存原值和文件，重复应用不覆盖首次基线。回滚成功后清理恢复记录，下次修改建立新基线；测速报告独立保存。
 
-## 中文菜单与命令
-
-运行 `netpilot` 打开菜单：
-
-| 选项 | 作用 |
+| 路径 | 内容 |
 |---|---|
-| `1` | 按需设置 IPv4 优先解析，修改 `/etc/gai.conf`。 |
-| `2` | 尝试加载内核提供的 BBR，切换 BBR 和默认 FQ，并读回验证。 |
-| `3` | 生成并确认保守自适应参数计划；用途和路径输入由菜单询问。 |
-| `4` | 网卡 ring/RPS 高级操作；单核默认跳过 RPS，不支持的项目提示跳过。 |
-| `5` | 恢复本工具首次记录的原值。 |
-| `6` | 从本仓库下载、语法检查并更新脚本。 |
-| `7` | 回滚并卸载本工具。 |
-| `8` | 诊断、计划、预算测速、对比、验证和网络计数观察。 |
-| `0` | 退出。 |
+| `/usr/local/bin/netpilot.sh`、`/usr/local/bin/netpilot` | 程序、快捷命令。 |
+| `/var/lib/netpilot/` | 原值、备份、恢复状态。 |
+| `/var/log/netpilot/` | 自动报告，回滚和卸载均保留。 |
+| `/etc/sysctl.d/99-netpilot.conf`、`/etc/sysctl.d/10-netpilot-bbr.conf` | 调优与 BBR 参数。 |
+| `/etc/modules-load.d/netpilot.conf` | BBR 模块加载。 |
+| `/etc/gai.conf` | IPv4 优先配置。 |
+| `/run/netpilot.lock` | 写操作锁。 |
 
-`netpilot help` 查看所有命令与完整参数。
+恢复失败会保留备份。仅卸载后，重新运行在线命令并选 `5`，可用保留的备份恢复；回滚范围为 NetPilot 管理的变更。
 
-选项 `4` 可能提升设备 ring 至允许上限并设置 RPS，属于独立高级操作；硬件支持不等于一定有收益，使用前后应观察延迟、吞吐和 CPU。工具不安装替代内核，不自动开启 swap，也不提供深度限速器扫描、HTB 接管或命名配置存档。
+### 环境要求
 
-## 备份、回滚和卸载
+| 功能 | 依赖 |
+|---|---|
+| 基础运行 | Linux、Bash 4+、`sysctl`、`awk`；在线入口需 `curl`。 |
+| 修改配置与程序维护 | root、`flock`。 |
+| 自动调优 | `python3`、GNU `timeout`。 |
+| 诊断 / 网卡设置 | `ip`、`tc` / `ethtool`。 |
+| 手动测延迟 | `ping`、GNU `timeout`。 |
+| 查看报告 | `python3`、相应读取权限。 |
+| 独立测速 / 比较 | `iperf3`（测速）、`python3`、GNU `timeout`（测速）；延迟采样另需 `ping`。 |
 
-```bash
-netpilot rollback
-netpilot uninstall
-```
+依赖按所选功能安装，缺项会提示。受限容器或特殊内核可能只支持部分功能。
 
-本工具管理的主要路径：
+### 开发与测试
 
-```text
-/etc/sysctl.d/10-netpilot-bbr.conf
-/etc/sysctl.d/99-netpilot.conf
-/etc/modules-load.d/netpilot.conf
-/etc/gai.conf                         # 仅显式选择 IPv4 优先时
-/var/lib/netpilot/                    # 原值、备份与状态
-/run/netpilot.lock                    # 修改操作互斥锁
-/usr/local/bin/netpilot.sh
-/usr/local/bin/netpilot
-```
-
-首次原值不会因重复应用而被更新值覆盖；`rollback` 恢复首次记录的运行值和受管文件，成功后清理记录。恢复失败返回非零、保留备份并报告失败项，修复原因后可重试；此时卸载也会停止。
-
-文件备份在完整复制后才发布；复制失败不留下可供重试接受的正式备份。清理失败也返回非零；已完成恢复后若仅剩未知文件，保留这些文件并提示，不递归删除。
-
-卸载针对 `/usr/local/bin/netpilot.sh` 中可识别为本工具的普通文件，以及指向该路径的自有 `netpilot` 快捷方式。下载或源码副本保留；安装路径若被其他文件或符号链接占用则拒绝删除。回滚或清理失败时停止卸载。
-
-回滚不等于恢复任意时刻的完整系统快照，不删除其他程序的防火墙规则，也不能还原在工具之外发生的所有配置变化。对已运行服务，脚本自身的 `ulimit` 不等于该服务的实际句柄限制。
-
-## 开发与测试
+在可丢弃 Linux 容器中以 root 运行：
 
 ```bash
 bash -n netpilot.sh
 bash tests/run.sh
 ```
 
-完整测试包含 NetPilot 名称与独立路径、建议边界、重复应用、真实复制中断后的备份重试、卸载路径/文件归属、清理失败传播、报告与真实本机回环测速；需要 Linux/Bash 4+，以及 `iperf3`、`python3`、`ping`、`timeout`、`ss` 和 `shellcheck`。缺少依赖会报错，不会当作通过。
+套件需 `iperf3`、`python3`、`ping`、`timeout`、`ss`、`shellcheck`。`tests/*_cli_integration.sh` 和 `tests/linux_apply_integration.sh` 单独运行；后者需可写的网络命名空间 sysctl 与相应权限，重启持久化另行验证。
 
-`tests/test_bench_live.sh` 使用真实 `iperf3`，也可单独运行，不需要公网测速对端。真实内核写入集成测试另在 `tests/linux_apply_integration.sh`，仅允许在具有可写网络命名空间 sysctl 和相应权限的可丢弃 Docker 容器中运行，不包含在默认套件里。重启持久化效果仍需另行验证，不能只靠模拟测试宣布生产效果。
-
-`tests/install_cli_integration.sh` 另外验证完整 CLI 的安装、更新、回滚与卸载，仅限可丢弃 Docker 容器，不在默认套件运行。
-
-## 参考与取舍
-
-实现参考多类上游思路，并结合本工具的单文件接口独立实现：
-
-- [Kylin010/tcpfit](https://github.com/Kylin010/tcpfit)：参数推导、测试预算与清晰的结果状态；保留不确定性，不直接引入其遥测或深度整形逻辑。
-- [redhat-performance/tuned](https://github.com/redhat-performance/tuned)：配置档、推荐与验证的工作流；不引入后台调优服务，不与外部管理器默认抢写。
-- [tohojo/flent](https://github.com/tohojo/flent)：吞吐之外也关注负载时延迟；本工具只实现轻量 ICMP 辅助采样，不声称等同完整 Flent 测试套件。
-- [leandromoreira/linux-network-performance-parameters](https://github.com/leandromoreira/linux-network-performance-parameters)：基于计数定位问题，而非堆叠参数。
-- [Linux TCP 参数文档](https://docs.kernel.org/networking/ip-sysctl.html)、[网络扩展/RPS](https://docs.kernel.org/networking/scaling.html)、[default_qdisc](https://docs.kernel.org/admin-guide/sysctl/net.html#default-qdisc) 与 [iperf3 官方文档](https://software.es.net/iperf/invoking.html)：参数语义和测量边界。
-
-相关功能独立实现，没有直接合入上述项目的代码，也未改变本仓库既有代码的许可声明。
+[更新记录](./CHANGELOG.md)
