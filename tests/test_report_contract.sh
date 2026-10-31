@@ -11,32 +11,34 @@ script = str(Path(sys.argv[1]).resolve())
 temporary = tempfile.TemporaryDirectory()
 root = Path(temporary.name)
 
-def write_measurements(folder):
+def write_measurements(folder, budget=67108864, request_sizes=None, timeout=30):
     for phase, down, up, latency in [('before', 100e6, 40e6, 50), ('after', 125e6, 50e6, 40)]:
-        budget = 67108864
         data = dict(type='netpilot-http-measurement', version=1, ok=True, phase=phase,
                     endpoint='https://speed.cloudflare.com', address='1.1.1.1', port=443,
                     node='NRT', family='IPv4', node_verified=True, connection_policy='pinned-preconnected',
                     latency_method='tcp-connect-estimate', latency_ms=latency, budget_bytes=budget,
-                    reserved_bytes=budget, timeout_seconds=30, download_bps=down, upload_bps=up)
+                    reserved_bytes=budget, timeout_seconds=timeout, download_bps=down, upload_bps=up)
         for direction, rate in [('download', down), ('upload', up)]:
             size = budget // 2
             duration = size * 8 / rate
-            data[direction] = dict(request_sizes=[size], payload_bytes=size, duration_seconds=duration,
+            sizes = request_sizes if request_sizes is not None else [4 * 1048576] * (size // (4 * 1048576))
+            data[direction] = dict(request_sizes=sizes, payload_bytes=size, duration_seconds=duration,
                                    bits_per_second=rate, quality='sampled' if duration >= 3 else 'budget-limited')
         (folder / (phase + '.json')).write_text(json.dumps(data))
 
 def make_summary(name, status='failed', stage='before', code=1, changed=0, applied=0, verified=0,
-                 verify_status='not-needed', rollback_status='not-needed'):
+                 verify_status='not-needed', rollback_status='not-needed',
+                 budget=134217728, request_sizes=None, timeout=30):
     folder = root / name / 'run.fixture'
     folder.mkdir(parents=True)
     if status == 'completed':
-        write_measurements(folder)
-    subprocess.run(['bash', '-c', 'source "$1"; auto_report summary "${@:2}"', '_', script,
-                    str(folder), status, stage, str(code), '134217728', 'balanced', str(changed),
-                    str(applied), str(verified), verify_status, rollback_status,
-                    '' if status == 'completed' else 'fixture failure'],
-                   capture_output=True, text=True, check=True)
+        write_measurements(folder, budget // 2, request_sizes, timeout)
+    result = subprocess.run(['bash', '-c', 'source "$1"; auto_report summary "${@:2}"', '_', script,
+                             str(folder), status, stage, str(code), str(budget), 'balanced', str(changed),
+                             str(applied), str(verified), verify_status, rollback_status,
+                             '' if status == 'completed' else 'fixture failure'],
+                            capture_output=True, text=True)
+    assert result.returncode == 0, (name, result.stderr)
     return folder / 'summary.json'
 
 def read(path, json_mode=True):
@@ -76,6 +78,33 @@ for path in valid:
     assert json.loads(result.stdout) == json.loads(path.read_text())
 print('PASS: report validation preserves real failure, cancellation, unchanged and completed states')
 
+legacy_path = make_summary('legacy-32mib-requests', status='completed', stage='completed', code=0,
+                           request_sizes=[32 * 1048576])
+for json_mode in (False, True):
+    result = read(legacy_path, json_mode)
+    assert result.returncode == 0, result.stderr
+    if json_mode:
+        legacy = json.loads(result.stdout)
+        assert legacy == json.loads(legacy_path.read_text())
+        assert legacy['before']['download']['request_sizes'] == [32 * 1048576]
+print('PASS: historical 32 MiB chunks remain valid for offline summary generation and report readers')
+
+maximum_path = make_summary('maximum-budget-128-requests', status='completed', stage='completed', code=0,
+                            budget=1073741824, request_sizes=[2 * 1048576] * 128, timeout=120)
+maximum = json.loads(maximum_path.read_text())
+assert maximum['budget_bytes'] == 1073741824
+for phase in ('before', 'after'):
+    assert maximum[phase]['budget_bytes'] == maximum[phase]['reserved_bytes'] == 536870912
+    for direction in ('download', 'upload'):
+        assert len(maximum[phase][direction]['request_sizes']) == 128
+        assert sum(maximum[phase][direction]['request_sizes']) == 268435456
+for json_mode in (False, True):
+    result = read(maximum_path, json_mode)
+    assert result.returncode == 0, result.stderr
+    if json_mode:
+        assert json.loads(result.stdout) == maximum
+print('PASS: real summary generation and report readers accept 128 chunks per direction at the 1 GiB run budget')
+
 base = json.loads(valid[12].read_text())
 failure = json.loads(valid[2].read_text())
 
@@ -91,6 +120,23 @@ def rejected(name, original, update):
         assert result.returncode == 1, (name, 'accepted corrupt report', result.stdout, result.stderr)
         assert not result.stdout, (name, 'partial misleading output', result.stdout)
         assert 'Cannot read the latest report:' in result.stderr, (name, result.stderr)
+
+too_many_sizes = [2 * 1048576] * 127 + [1048576, 1048576]
+assert len(too_many_sizes) == 129 and sum(too_many_sizes) == 268435456
+folder = root / 'too-many-summary-requests' / 'run.fixture'
+folder.mkdir(parents=True)
+write_measurements(folder, 536870912, too_many_sizes, timeout=120)
+result = subprocess.run(['bash', '-c', 'source "$1"; auto_report summary "${@:2}"', '_', script,
+                         str(folder), 'completed', 'completed', '0', '1073741824', 'balanced',
+                         '0', '0', '0', 'not-needed', 'not-needed', ''],
+                        capture_output=True, text=True)
+assert result.returncode != 0 and not (folder / 'summary.json').exists(), result.stdout
+def oversized_schedules(value):
+    for phase in ('before', 'after'):
+        for direction in ('download', 'upload'):
+            value[phase][direction]['request_sizes'] = too_many_sizes
+rejected('129-requests-per-direction', maximum, oversized_schedules)
+print('PASS: summary generation and both report readers reject 129 chunks with otherwise valid maximum-budget totals')
 
 for name, original, update in [
     ('restoration-marked-verified', failure, lambda d: d.update(configuration_state='verified')),
@@ -123,7 +169,7 @@ for name, update in [
     ('connection-policy-changed', lambda d: d['after'].update(connection_policy='reconnected')),
     ('node-verification-changed', lambda d: d['after'].update(node_verified=False)),
     ('timeout-changed', lambda d: d['after'].update(timeout_seconds=31)),
-    ('request-schedule-changed', lambda d: d['after']['download'].update(request_sizes=[16777216,16777216])),
+    ('request-schedule-changed', lambda d: d['after']['download'].update(request_sizes=[2097152] * 16)),
     ('reported-rate-inconsistent', lambda d: d['after'].update(download_bps=1.0)),
     ('percentage-invented', lambda d: d['comparison'].update(download_change_pct=9999)),
     ('latency-delta-invented', lambda d: d['comparison'].update(latency_delta_ms=9999)),

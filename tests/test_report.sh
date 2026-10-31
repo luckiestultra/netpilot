@@ -68,6 +68,27 @@ expect_failure 2 bash "$SCRIPT" report --report-dir
 expect_failure 2 bash "$SCRIPT" report --report-dir ''
 printf '%s\n' 'PASS: report language, help and argument validation'
 
+for phase in before after; do
+  folder="$TMP/measurement-$phase/run.fixture"
+  mkdir -p "$folder"
+  python3 - "$folder/$phase.json" <<'PY'
+from pathlib import Path
+import json, sys
+Path(sys.argv[1]).write_text(json.dumps(dict(ok=False, error='HTTP 403: download request, 16777216 bytes; literal \x1b[31m')))
+PY
+  if [[ "$phase" == before ]]; then flow=failed; else flow=partial; fi
+  bash -c 'source "$1"; auto_report summary "$2" "$3" "$4" 1 134217728 balanced 0 0 0 not-needed not-needed "measurement failed"' \
+    _ "$SCRIPT" "$folder" "$flow" "$phase" > /dev/null
+  for lang in zh en; do
+    bash "$SCRIPT" --lang "$lang" report --report-dir "${folder%/*}" > "$TMP/out"
+    grep -q 'HTTP 403.*16777216' "$TMP/out" || fail 'readable report hides the concrete measurement error'
+    if [[ "$lang" == zh ]]; then grep -q '测速错误：' "$TMP/out" || fail 'Chinese measurement error label is missing'
+    else grep -q 'Measurement error:' "$TMP/out" || fail 'English measurement error label is missing'; fi
+    ! grep -q $'\033' "$TMP/out" || fail 'measurement error emitted a terminal control character'
+  done
+done
+printf '%s\n' 'PASS: readable reports show bounded escaped before/after measurement errors in both languages'
+
 expect_failure 1 bash "$SCRIPT" report --report-dir "$TMP/missing"
 grep -q '暂无' "$TMP/out" || fail 'missing reports need a clear message'
 [[ ! -e "$TMP/missing" ]] || fail 'read-only report command created a directory'

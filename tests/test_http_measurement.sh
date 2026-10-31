@@ -19,6 +19,7 @@ declare -F http_measure_path >/dev/null || { printf 'FAIL: http_measure_path is 
 export NETPILOT_HTTP_TEST_FRAGMENT="$TMP/functions.sh" NETPILOT_HTTP_TEST_TMP="$TMP"
 python3 - <<'PY'
 import collections
+import copy
 import http.server
 import json
 import math
@@ -51,7 +52,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
         pass
     def headers_for(self, length, uploaded=None):
         mode = state['mode']
-        self.send_response(429 if mode == 'limited' else 403 if mode == 'forbidden' else 302 if mode == 'redirect' else 200)
+        size = length if uploaded is None else uploaded
+        forbidden = (mode == 'forbidden' or mode == 'forbidden-upload' and uploaded is not None or
+                     mode == 'max-4mib' and size > 4 * 1048576)
+        self.send_response(429 if mode == 'limited' else 403 if forbidden else 302 if mode == 'redirect' else 200)
         self.send_header('Content-Length', str(length))
         self.send_header('Content-Type', 'application/octet-stream')
         node = 'ALT' if mode == 'node-change' and len(state['requests']) > 1 else state['node']
@@ -75,7 +79,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         length = size + 1 if mode == 'long-length' else size
         try:
             self.headers_for(length)
-            if mode in ('limited', 'forbidden', 'redirect'):
+            if mode in ('limited', 'forbidden', 'redirect') or mode == 'max-4mib' and size > 4 * 1048576:
                 self.close_connection = True
                 return
             remaining = max(0, size - 1) if mode == 'short-body' else length
@@ -181,16 +185,59 @@ try:
     else:
         print('SKIP: IPv6 loopback is not configured in this container')
 
-    reset()
+    reset('max-4mib')
     small_budget = budget
-    budget = 80 * 1048576
-    result, capped, _ = run('capped-chunks')
-    assert result.returncode == 0, result.stderr.decode()
+    budget = 64 * 1048576  # The default 128 MiB run allocates 64 MiB to each phase.
+    result, capped, capped_path = run('default-phase-before')
+    assert result.returncode == 0, (result.stderr.decode(), state['requests'])
     valid_report(capped, 'before')
-    assert max(size for _, size, _ in state['requests']) <= 16 * 1048576
+    assert capped['provider'] == 'custom'
+    assert max(size for _, size, _ in state['requests']) == 4 * 1048576
     assert sum(size for _, size, _ in state['requests']) <= budget
+    capped_requests = [(method, size) for method, size, _ in state['requests']]
+    for direction in ('download', 'upload'):
+        assert 4 * 1048576 in capped[direction]['request_sizes']
+        assert all(size <= 4 * 1048576 for size in capped[direction]['request_sizes'])
+    reset('max-4mib')
+    result, capped_after, _ = run('default-phase-after', 'after', capped_path)
+    assert result.returncode == 0, result.stderr.decode()
+    valid_report(capped_after, 'after')
+    assert capped_after['budget_bytes'] == capped['budget_bytes'] == budget
+    assert capped_after['reserved_bytes'] == capped['reserved_bytes']
+    assert [(method, size) for method, size, _ in state['requests']] == capped_requests
+    for direction in ('download', 'upload'):
+        assert capped_after[direction]['request_sizes'] == capped[direction]['request_sizes']
     budget = small_budget
-    print('PASS: large phase budgets retain a 16 MiB per-request ceiling')
+    print('PASS: default 64 MiB phases succeed against a real 4 MiB request limit with identical bidirectional schedules')
+
+    # Validate a maximum-budget baseline without transferring a GiB: the local
+    # server denies the first accepted request, after baseline validation.
+    budget = 512 * 1048576
+    maximum = copy.deepcopy(before)
+    maximum['budget_bytes'] = maximum['reserved_bytes'] = budget
+    for direction in ('download', 'upload'):
+        item = maximum[direction]
+        item.update(request_sizes=[2 * 1048576] * 128, payload_bytes=budget // 2,
+                    duration_seconds=2.0, bits_per_second=budget * 2, quality='budget-limited')
+        maximum[direction + '_bps'] = item['bits_per_second']
+    maximum_path = root / 'maximum-baseline.json'
+    maximum_path.write_text(json.dumps(maximum))
+    reset('forbidden')
+    result, denied, _ = run('maximum-baseline-after', 'after', maximum_path)
+    assert result.returncode != 0 and denied['ok'] is False
+    assert [(method, size) for method, size, _ in state['requests']] == [('GET', 2 * 1048576)]
+    assert denied['reserved_bytes'] == 2 * 1048576
+    assert denied['http_error']['status'] == 403 and denied['http_error']['direction'] == 'download'
+    too_many = copy.deepcopy(maximum)
+    for direction in ('download', 'upload'):
+        too_many[direction]['request_sizes'] = [2 * 1048576] * 127 + [1048576, 1048576]
+    too_many_path = root / 'too-many-baseline.json'
+    too_many_path.write_text(json.dumps(too_many))
+    reset()
+    result, invalid, _ = run('too-many-baseline-after', 'after', too_many_path)
+    assert result.returncode != 0 and invalid['ok'] is False and not state['requests']
+    budget = small_budget
+    print('PASS: maximum-budget baseline reader accepts 128 requests per direction and rejects 129 before any HTTP traffic')
 
     data = after_path.read_bytes()
     reset()
@@ -198,7 +245,7 @@ try:
     assert result.returncode != 0 and after_path.read_bytes() == data and not state['requests']
     print('PASS: HTTP reports are private and existing output files are never overwritten')
 
-    for mode in ('limited', 'forbidden', 'redirect', 'encoded', 'long-length', 'short-body', 'bad-ack', 'node-change', 'node-conflict'):
+    for mode in ('limited', 'forbidden', 'forbidden-upload', 'redirect', 'encoded', 'long-length', 'short-body', 'bad-ack', 'node-change', 'node-conflict'):
         reset(mode)
         result, report, _ = run('failure-' + mode)
         assert result.returncode != 0, mode
@@ -207,6 +254,17 @@ try:
         if mode in ('limited', 'forbidden', 'redirect', 'encoded', 'long-length', 'node-conflict'):
             assert len(state['requests']) == 1, (mode, state['requests'])
         assert sum(size for _, size, _ in state['requests']) <= budget
+        if mode in ('forbidden', 'forbidden-upload'):
+            direction = 'download' if mode == 'forbidden' else 'upload'
+            method = 'GET' if direction == 'download' else 'POST'
+            attempted = [size for requested_method, size, _ in state['requests'] if requested_method == method]
+            assert len(attempted) == 1, (mode, state['requests'])
+            assert report['http_error']['status'] == 403
+            assert report['http_error']['direction'] == direction
+            assert report['http_error']['request_bytes'] == attempted[0]
+            assert report['http_error']['reserved_bytes'] == report['reserved_bytes']
+            assert report['reserved_bytes'] == sum(size for _, size, _ in state['requests'])
+            assert report['reserved_bytes'] == sum(sum(report[d]['request_sizes']) for d in ('download', 'upload'))
     print('PASS: HTTP status, redirects, encoding, length, acknowledgement and node mismatches fail without retries')
 
     reset()

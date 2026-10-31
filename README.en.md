@@ -122,11 +122,13 @@ Chinese is the default; menu `L` switches the current session. Use `netpilot --l
 | `--endpoint` | `https://speed.cloudflare.com` | HTTPS origin with compatible download/upload APIs; HTTP is limited to loopback addresses. |
 | `--report-dir` | `/tmp/netpilot-reports` | Must not allow other users to write; cannot be inside `/var/lib/netpilot/`. |
 
-Latency is the average of three TCP connection times. Each phase gets half the budget, split between download and upload. Failed requests consume budget, with no automatic retry. Samples shorter than 3 seconds are marked budget-limited and cannot establish peak bandwidth.
+Tests use chunks of at most **4MiB** per request without increasing the total budget. This is a conservative client policy, not a claimed limit of the measurement service. Each phase gets half the budget, split between download and upload. Failed requests consume budget; HTTP rejection stops measurement without automatic retry.
+
+Rates are effective HTTP throughput including chunk-request overhead. Samples shorter than 3 seconds are marked budget-limited and cannot establish peak link bandwidth. Latency is the average of three TCP connection times.
 
 Retests reuse the baseline IP, request sizes and timeout; Cloudflare nodes must also match. Reports are saved automatically as `before.json`, `after.json` when available, and `summary.json`.
 
-Baseline failure leaves settings unchanged. Apply or verification failures after this run starts writing attempt to restore the original baseline; retest failures retain verified settings. On cancellation, check configuration and rollback states in the report.
+Baseline failure leaves settings unchanged. Apply or verification failures after this run starts writing attempt to restore the original baseline; retest failures retain verified settings. HTTP errors show the status code, download or upload direction, request size and reserved budget; menu `10` shows them again. On cancellation, check configuration and rollback states in the report.
 
 ### Parameter recommendations
 

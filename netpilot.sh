@@ -1949,6 +1949,10 @@ def integer(value, low, high):
 def positive(value, high=float('inf')):
     return type(value) in (int, float) and math.isfinite(value) and 0 < value <= high
 
+# Client resource policy, not a claim about any provider's service limit.
+MAX_REQUEST_BYTES = 4 * 1048576
+MAX_REQUESTS_PER_DIRECTION = 128
+
 def publish(value):
     # Link a complete private temporary file into place without replacing any
     # existing file or symbolic link. The caller owns the private run directory.
@@ -2004,8 +2008,8 @@ def read_before(path):
         if not isinstance(item, dict):
             raise ValueError('missing baseline direction')
         sizes = item.get('request_sizes')
-        if (not isinstance(sizes, list) or not 1 <= len(sizes) <= 32 or
-                any(not integer(size, 1, min(16777216, slots[direction])) for size in sizes) or
+        if (not isinstance(sizes, list) or not 1 <= len(sizes) <= MAX_REQUESTS_PER_DIRECTION or
+                any(not integer(size, 1, min(MAX_REQUEST_BYTES, slots[direction])) for size in sizes) or
                 sum(sizes) > slots[direction] or item.get('payload_bytes') != sum(sizes) or
                 type(item.get('payload_bytes')) is not int or
                 not positive(item.get('duration_seconds'), int(raw_timeout) + 1) or
@@ -2036,11 +2040,16 @@ def dial(address_value, family_value):
         sock.close()
         raise
 
-def check_headers(response):
+def check_headers(response, direction, size):
     if sum(len(key) + len(value) for key, value in response.getheaders()) > 16384:
         raise ValueError('response headers exceed the allowed size')
     if response.status != 200:
-        raise ValueError('measurement endpoint returned HTTP %d' % response.status)
+        report['http_error'] = dict(status=response.status, direction=direction,
+                                    request_bytes=size, reserved_bytes=report['reserved_bytes'])
+        label = text('下载', 'download') if direction == 'download' else text('上传', 'upload')
+        raise ValueError(text('测速接口返回 HTTP %d（%s，单次 %d 字节；本阶段已预扣 %d 字节）',
+                              'measurement endpoint returned HTTP %d (%s; request %d bytes; phase reserved %d bytes)') %
+                         (response.status, label, size, report['reserved_bytes']))
     if response.getheader('Content-Encoding', 'identity').lower().strip() != 'identity':
         raise ValueError('encoded measurement responses are not supported')
     identities = []
@@ -2095,6 +2104,8 @@ def update_timeout():
 
 def probe(direction, size):
     item = report[direction]
+    if size > MAX_REQUEST_BYTES or len(item['request_sizes']) >= MAX_REQUESTS_PER_DIRECTION:
+        raise ValueError('measurement request exceeds the client resource policy')
     if report['reserved_bytes'] + size > budget or sum(item['request_sizes']) + size > slots[direction]:
         raise ValueError('measurement payload budget exhausted')
     # Debit before the request. Failed or partially transmitted requests never
@@ -2108,7 +2119,7 @@ def probe(direction, size):
                            headers={'Accept-Encoding': 'identity', 'User-Agent': 'NetPilot/1'})
         update_timeout()
         response = connection.getresponse()
-        check_headers(response)
+        check_headers(response, direction, size)
         length = response.getheader('Content-Length')
         if length is None or not re.fullmatch(r'[0-9]+', length) or int(length) != size or response.getheader('Transfer-Encoding'):
             raise ValueError('download length does not match the reserved payload')
@@ -2142,7 +2153,7 @@ def probe(direction, size):
             left -= len(chunk)
         update_timeout()
         response = connection.getresponse()
-        check_headers(response)
+        check_headers(response, direction, size)
         acknowledged = response.getheader('cf-meta-upload-bytes', '')
         if not re.fullmatch(r'[0-9]+', acknowledged) or int(acknowledged) != size:
             raise ValueError('server did not acknowledge the complete upload')
@@ -2241,7 +2252,7 @@ try:
             for size in previous[direction]['request_sizes']:
                 probe(direction, size)
         else:
-            ladder = (65536, 262144, 1048576, 4194304, 16777216)
+            ladder = (65536, 262144, 1048576, MAX_REQUEST_BYTES)
             step = 0
             while sum(report[direction]['request_sizes']) < slots[direction]:
                 available = slots[direction] - sum(report[direction]['request_sizes'])
@@ -2301,6 +2312,9 @@ from urllib.parse import urlsplit
 op, *args = sys.argv[1:-1]
 english = sys.argv[-1] == 'en'
 def text(zh, en): return en if english else zh
+# Older reports can contain larger requests; offline readers retain that
+# compatibility while keeping the number of requests bounded.
+MAX_REQUESTS_PER_DIRECTION = 128
 def number(value, upper=1e15):
     if type(value) not in (int, float) or not math.isfinite(value) or not 0 < value <= upper:
         raise ValueError('invalid positive measurement')
@@ -2359,7 +2373,7 @@ def measurement_data(d, phase, expected_endpoint=None, budget=None, timeout=None
     for direction in ('download', 'upload'):
         stream = d[direction]
         sizes = stream['request_sizes']
-        if not isinstance(sizes, list) or not 1 <= len(sizes) <= 32: raise ValueError('invalid request schedule')
+        if not isinstance(sizes, list) or not 1 <= len(sizes) <= MAX_REQUESTS_PER_DIRECTION: raise ValueError('invalid request schedule')
         for size in sizes: integer(size, 1, d['budget_bytes'])
         payload = sum(sizes)
         if payload > d['budget_bytes'] // 2 or stream['payload_bytes'] != payload:
@@ -2689,6 +2703,11 @@ try:
                         print(text('本轮没有修改参数，测量波动不能归因于调优。', 'No parameters changed; measurement differences cannot be attributed to tuning.'))
                 if data.get('error'):
                     print(text('原因：', 'Reason: ') + display(data['error'][:2048])[1:-1])
+                failed_measurement = data.get('after' if data['stage'] == 'after' else 'before')
+                if isinstance(failed_measurement, dict):
+                    detail = failed_measurement.get('error')
+                    if isinstance(detail, str) and detail:
+                        print(text('测速错误：', 'Measurement error: ') + display(detail[:2048])[1:-1])
                 import shlex
                 command = 'netpilot --lang en report --json' if english else 'netpilot report --json'
                 if root != Path('/tmp/netpilot-reports'):
