@@ -241,23 +241,47 @@ write_lines() {
 }
 
 write_sysctl_file() {
-  local tmp key line value
+  local sync_runtime=0 source_file tmp key line value runtime_val
   local -A merged=()
-  if [[ -e "$SYSCTL_FILE" || -L "$SYSCTL_FILE" ]]; then
-    if [[ -L "$SYSCTL_FILE" ]] || ! grep -Fqx '# Managed by netpilot.sh.' "$SYSCTL_FILE"; then
-      warn "$(np_msg '拒绝覆盖非本工具管理的配置：%s' 'Refusing to replace unowned configuration: %s' "$SYSCTL_FILE")"
-      return 1
+  local -a sources=("$SYSCTL_FILE")
+  if [[ "${1:-}" == --sync-runtime ]]; then
+    sync_runtime=1
+    if [[ -f "$BBR_FILE" && ! -L "$BBR_FILE" ]] && grep -Fqx '# Managed by netpilot.sh.' "$BBR_FILE"; then
+      sources=("$BBR_FILE" "$SYSCTL_FILE")
     fi
+  fi
+  if [[ -e "$SYSCTL_FILE" || -L "$SYSCTL_FILE" ]]; then
+    owned_config_target "$SYSCTL_FILE" || return 1
+  fi
+  for source_file in "${sources[@]}"; do
+    [[ -f "$source_file" && ! -L "$source_file" ]] || continue
     while IFS= read -r line || [[ -n "$line" ]]; do
       line="${line%%#*}"
       [[ "$line" == *'='* ]] || continue
       key="$(awk -F= '{gsub(/^[ \t]+|[ \t]+$/, "", $1);print $1}' <<< "$line")"
       [[ "$key" =~ ^net\.[a-zA-Z0-9_.]+$ ]] || continue
-      value="$(awk -F= '{gsub(/^[ \t]+|[ \t]+$/, "", $2);print $2}' <<< "$line")"
+      value="$(awk -F= '{gsub(/^[ \t]+|[ \t]+$/, "", $2); gsub(/[ \t]+/, " ", $2); print $2}' <<< "$line")"
       [[ -n "$value" ]] && merged["$key"]="$value"
-    done < "$SYSCTL_FILE"
+    done < "$source_file"
+  done
+  if ((sync_runtime)); then
+    for key in "${!merged[@]}"; do
+      if [[ -n "${SYSCTL_TARGETS[$key]+set}" ]]; then continue; fi
+      if runtime_val="$(sysctl_value "$key")" && [[ -n "$runtime_val" ]]; then
+        merged["$key"]="$(normalize_sysctl_value "$runtime_val")"
+      else
+        unset "merged[$key]"
+      fi
+    done
   fi
-  for key in "${SYSCTL_KEYS[@]}"; do merged["$key"]="${SYSCTL_TARGETS[$key]}"; done
+  if ((${#SYSCTL_KEYS[@]})); then
+    for key in "${SYSCTL_KEYS[@]}"; do merged["$key"]="${SYSCTL_TARGETS[$key]}"; done
+  fi
+  if ((sync_runtime && ${#merged[@]} == 0)); then
+    if runtime_val="$(sysctl_value net.ipv4.tcp_moderate_rcvbuf)" && [[ -n "$runtime_val" ]]; then
+      merged[net.ipv4.tcp_moderate_rcvbuf]="$(normalize_sysctl_value "$runtime_val")"
+    fi
+  fi
   tmp="$(mktemp "${SYSCTL_FILE}.tmp.XXXXXX")" || return 1
   if ! {
     printf '%s\n' '# Managed by netpilot.sh.' '# Run rollback to restore the saved state.'
@@ -314,12 +338,14 @@ save_original_values() {
       printf '\n' >> "$tmp" || { rm -f -- "$tmp"; return 1; }
     fi
   fi
-  for key in "${SYSCTL_KEYS[@]}"; do
-    if awk -F = -v n="$key" '$1==n{found=1} END{exit !found}' "$tmp"; then continue; fi
-    value="$(sysctl_value "$key")" || { rm -f -- "$tmp"; return 1; }
-    [[ -n "$value" ]] || { rm -f -- "$tmp"; return 1; }
-    printf '%s=%s\n' "$key" "$value" >> "$tmp" || { rm -f -- "$tmp"; return 1; }
-  done
+  if ((${#SYSCTL_KEYS[@]})); then
+    for key in "${SYSCTL_KEYS[@]}"; do
+      if awk -F = -v n="$key" '$1==n{found=1} END{exit !found}' "$tmp"; then continue; fi
+      value="$(sysctl_value "$key")" || { rm -f -- "$tmp"; return 1; }
+      [[ -n "$value" ]] || { rm -f -- "$tmp"; return 1; }
+      printf '%s=%s\n' "$key" "$value" >> "$tmp" || { rm -f -- "$tmp"; return 1; }
+    done
+  fi
   if ! mv -f -- "$tmp" "$STATE_DIR/original-values"; then
     rm -f -- "$tmp"
     return 1
@@ -431,24 +457,44 @@ ensure_ethtool() {
 }
 
 apply_nic_ring() {
-  local iface info max_rx max_tx current_rx current_tx changed=0
+  local iface info max_rx max_tx current_rx current_tx actual_rx actual_tx rc changed=0
   ensure_ethtool || return 0
-  touch "$STATE_DIR/nic-ring.before" || return 1
+  if [[ -e "$STATE_DIR/nic-ring-changed" && ! -f "$STATE_DIR/nic-ring.before" ]]; then
+    warn "$(np_msg '缺少网卡 ring 原值记录，保留回退状态。' 'Missing NIC ring snapshot; keeping rollback state.')"
+    return 1
+  fi
   while IFS= read -r iface; do
     [[ -n "$iface" ]] || continue
-    info="$(ethtool -g "$iface" 2>/dev/null || true)"
+    info="$(LC_ALL=C ethtool -g "$iface" 2>/dev/null || true)"
     [[ -n "$info" ]] || continue
     max_rx="$(awk '/Pre-set maximums:/{p=1;next} /Current hardware settings:/{p=0} p && $1=="RX:"{print $2;exit}' <<< "$info")"
     max_tx="$(awk '/Pre-set maximums:/{p=1;next} /Current hardware settings:/{p=0} p && $1=="TX:"{print $2;exit}' <<< "$info")"
     current_rx="$(awk '/Current hardware settings:/{p=1;next} p && $1=="RX:"{print $2;exit}' <<< "$info")"
     current_tx="$(awk '/Current hardware settings:/{p=1;next} p && $1=="TX:"{print $2;exit}' <<< "$info")"
     if [[ "$max_rx" =~ ^[0-9]+$ && "$max_tx" =~ ^[0-9]+$ && "$current_rx" =~ ^[0-9]+$ && "$current_tx" =~ ^[0-9]+$ ]]; then
+      if ((10#$current_rx == 10#$max_rx && 10#$current_tx == 10#$max_tx)); then
+        continue
+      fi
+      if ((${NIC_PREPARE_PENDING:-0})); then
+        prepare_state || return 1
+        NIC_PREPARE_PENDING=0
+      fi
+      touch "$STATE_DIR/nic-ring.before" || return 1
       if ! awk -F '\t' -v n="$iface" '$1==n{found=1} END{exit !found}' "$STATE_DIR/nic-ring.before"; then
         printf '%s\t%s\t%s\n' "$iface" "$current_rx" "$current_tx" >> "$STATE_DIR/nic-ring.before" || return 1
       fi
       # Mark ownership before mutation so interrupted operations remain recoverable.
       : > "$STATE_DIR/nic-ring-changed" || return 1
-      ethtool -G "$iface" rx "$max_rx" tx "$max_tx" >/dev/null 2>&1 || return 1
+      rc=0
+      ethtool -G "$iface" rx "$max_rx" tx "$max_tx" >/dev/null 2>&1 || rc=$?
+      if ((rc != 0)); then
+        ((rc == 80)) || return 1
+        info="$(LC_ALL=C ethtool -g "$iface" 2>/dev/null)" || return 1
+        actual_rx="$(awk '/Current hardware settings:/{p=1;next} p && $1=="RX:"{print $2;exit}' <<< "$info")"
+        actual_tx="$(awk '/Current hardware settings:/{p=1;next} p && $1=="TX:"{print $2;exit}' <<< "$info")"
+        [[ "$actual_rx" =~ ^[0-9]+$ && "$actual_tx" =~ ^[0-9]+$ ]] || return 1
+        ((10#$actual_rx == 10#$max_rx && 10#$actual_tx == 10#$max_tx)) || return 1
+      fi
       changed=1
       log "$(np_msg '已更新 %s 的 ring，首次原值已保留。' 'Updated %s ring; initial settings are retained.' "$iface")"
     fi
@@ -458,7 +504,7 @@ apply_nic_ring() {
 }
 
 restore_nic_ring() {
-  local iface current_rx current_tx info actual_rx actual_tx failed=0 records=0
+  local iface current_rx current_tx info actual_rx actual_tx rc failed=0 records=0
   [[ -e "$STATE_DIR/nic-ring-changed" ]] || return 0
   [[ -f "$STATE_DIR/nic-ring.before" ]] || return 1
   command -v ethtool >/dev/null 2>&1 || return 1
@@ -469,13 +515,28 @@ restore_nic_ring() {
       failed=1; continue
     fi
     records=$((records + 1))
-    if ! ethtool -G "$iface" rx "$current_rx" tx "$current_tx" >/dev/null 2>&1; then
+    if info="$(LC_ALL=C ethtool -g "$iface" 2>/dev/null)"; then
+      actual_rx="$(awk '/Current hardware settings:/{p=1;next} p && $1=="RX:"{print $2;exit}' <<< "$info")"
+      actual_tx="$(awk '/Current hardware settings:/{p=1;next} p && $1=="TX:"{print $2;exit}' <<< "$info")"
+      if [[ "$actual_rx" =~ ^[0-9]+$ && "$actual_tx" =~ ^[0-9]+$ ]] && ((10#$actual_rx == 10#$current_rx && 10#$actual_tx == 10#$current_tx)); then
+        continue
+      fi
+    fi
+    rc=0
+    ethtool -G "$iface" rx "$current_rx" tx "$current_tx" >/dev/null 2>&1 || rc=$?
+    if ((rc != 0 && rc != 80)); then
       warn "$(np_msg '无法恢复 %s 的 ring' 'Unable to restore %s ring' "$iface")"; failed=1; continue
     fi
-    info="$(ethtool -g "$iface" 2>/dev/null)" || { failed=1; continue; }
+    info="$(LC_ALL=C ethtool -g "$iface" 2>/dev/null)" || {
+      ((rc == 0)) || warn "$(np_msg '无法恢复 %s 的 ring' 'Unable to restore %s ring' "$iface")"
+      failed=1; continue
+    }
     actual_rx="$(awk '/Current hardware settings:/{p=1;next} p && $1=="RX:"{print $2;exit}' <<< "$info")"
     actual_tx="$(awk '/Current hardware settings:/{p=1;next} p && $1=="TX:"{print $2;exit}' <<< "$info")"
-    [[ "$actual_rx" == "$current_rx" && "$actual_tx" == "$current_tx" ]] || failed=1
+    if [[ ! "$actual_rx" =~ ^[0-9]+$ || ! "$actual_tx" =~ ^[0-9]+$ ]] || ((10#$actual_rx != 10#$current_rx || 10#$actual_tx != 10#$current_tx)); then
+      ((rc == 0)) || warn "$(np_msg '无法恢复 %s 的 ring' 'Unable to restore %s ring' "$iface")"
+      failed=1
+    fi
   done < "$STATE_DIR/nic-ring.before" || failed=1
   if ((records == 0)); then
     warn "$(np_msg '网卡 ring 原值记录为空，保留回退状态。' 'NIC ring snapshot is empty; keeping rollback state.')"
@@ -485,9 +546,11 @@ restore_nic_ring() {
 }
 
 rps_mask_for_cpus() {
-  local allowed="$1" wanted="$2" group first last cpu selected=0 mask=0
+  local allowed="$1" wanted="$2" group first last cpu bit selected=0 mask=0
   local -a groups=()
-  [[ "$allowed" =~ ^[0-9,-]+$ && "$wanted" =~ ^[1-9][0-9]*$ ]] || return 1
+  [[ "$allowed" =~ ^[0-9]+(-[0-9]+)?(,[0-9]+(-[0-9]+)?)*$ && "$wanted" =~ ^[1-9][0-9]?$ ]] || return 1
+  wanted=$((10#$wanted))
+  ((wanted <= 63)) || return 1
   IFS=, read -r -a groups <<< "$allowed"
   for group in "${groups[@]}"; do
     [[ "$group" =~ ^([0-9]{1,4})(-([0-9]{1,4}))?$ ]] || return 1
@@ -495,10 +558,25 @@ rps_mask_for_cpus() {
     last=$first
     [[ -z ${BASH_REMATCH[3]:-} ]] || last=$((10#${BASH_REMATCH[3]}))
     ((first <= last && last <= 62)) || return 1
+  done
+  for group in "${groups[@]}"; do
+    [[ "$group" =~ ^([0-9]{1,4})(-([0-9]{1,4}))?$ ]] || return 1
+    first=$((10#${BASH_REMATCH[1]}))
+    last=$first
+    [[ -z ${BASH_REMATCH[3]:-} ]] || last=$((10#${BASH_REMATCH[3]}))
     for ((cpu=first; cpu<=last; cpu++)); do
-      mask=$((mask | (1 << cpu)))
+      bit=$((1 << cpu))
+      (((mask & bit) == 0)) || continue
+      mask=$((mask | bit))
       selected=$((selected + 1))
-      if ((selected == wanted)); then printf '%x\n' "$mask"; return 0; fi
+      if ((selected == wanted)); then
+        if (((mask >> 32) > 0)); then
+          printf '%x,%08x\n' "$((mask >> 32))" "$((mask & 0xffffffff))"
+        else
+          printf '%x\n' "$mask"
+        fi
+        return 0
+      fi
     done
   done
   return 1
@@ -520,21 +598,29 @@ apply_rps() {
     log "$(np_msg '已跳过 RPS：当前实现无法安全表示 CPU 亲和性。' 'RPS skipped: CPU affinity cannot be safely represented by this implementation.')"
     return 0
   }
-  touch "$STATE_DIR/rps.before" || return 1
+  if [[ -e "$STATE_DIR/rps-changed" && ! -f "$STATE_DIR/rps.before" ]]; then
+    warn "$(np_msg '缺少 RPS 原值记录，保留回退状态。' 'Missing RPS snapshot; keeping rollback state.')"
+    return 1
+  fi
   shopt -s nullglob
   while IFS= read -r iface; do
     [[ -n "$iface" ]] || continue
     for path in "/sys/class/net/$iface"/queues/rx-*/rps_cpus "/sys/class/net/$iface"/queues/rx-*/rps_flow_cnt; do
       [[ -f "$path" && -w "$path" ]] || continue
-      if ! awk -F '\t' -v n="$path" '$1==n{found=1} END{exit !found}' "$STATE_DIR/rps.before"; then
-        old_value="$(cat "$path")" || return 1
-        printf '%s\t%s\n' "$path" "$old_value" >> "$STATE_DIR/rps.before" || return 1
+      if ((${NIC_PREPARE_PENDING:-0})); then
+        prepare_state || { shopt -u nullglob; return 1; }
+        NIC_PREPARE_PENDING=0
       fi
-      : > "$STATE_DIR/rps-changed" || return 1
+      touch "$STATE_DIR/rps.before" || { shopt -u nullglob; return 1; }
+      if ! awk -F '\t' -v n="$path" '$1==n{found=1} END{exit !found}' "$STATE_DIR/rps.before"; then
+        old_value="$(cat "$path")" || { shopt -u nullglob; return 1; }
+        printf '%s\t%s\n' "$path" "$old_value" >> "$STATE_DIR/rps.before" || { shopt -u nullglob; return 1; }
+      fi
+      : > "$STATE_DIR/rps-changed" || { shopt -u nullglob; return 1; }
       if [[ "$path" == */rps_cpus ]]; then
-        printf '%s\n' "$mask" > "$path" || return 1
+        printf '%s\n' "$mask" > "$path" || { shopt -u nullglob; return 1; }
       else
-        printf '%s\n' 4096 > "$path" || return 1
+        printf '%s\n' 4096 > "$path" || { shopt -u nullglob; return 1; }
       fi
       changed=1
     done
@@ -685,15 +771,64 @@ rollback_internal() {
 
 
 apply_tuning() {
-  local answer yes=0 arg persist_bbr=0
-  local -a plan_args=() state_files=(sysctl-file)
+  local answer yes=0 arg persist_bbr=0 sync_sysctl_needed=0 remove_bbr_file=0 remove_bbr_module=0
+  local need_persist_sync=0 write_sysctl_needed=0 intended_cc line key value
+  local -a plan_args=() state_files=()
   for arg in "$@"; do
     if [[ "$arg" == --yes ]]; then yes=1; else plan_args+=("$arg"); fi
   done
-  adaptive_plan "${plan_args[@]}" || return $?
+  if ((${#plan_args[@]})); then
+    adaptive_plan "${plan_args[@]}" || return $?
+  else
+    adaptive_plan || return $?
+  fi
+  if [[ -n "${SYSCTL_TARGETS[net.ipv4.tcp_congestion_control]+set}" ]]; then
+    intended_cc="${SYSCTL_TARGETS[net.ipv4.tcp_congestion_control]}"
+  else
+    intended_cc="$(normalize_sysctl_value "$(sysctl_value net.ipv4.tcp_congestion_control || true)")"
+  fi
+  if [[ -f "$SYSCTL_FILE" && ! -L "$SYSCTL_FILE" ]] && grep -Fqx '# Managed by netpilot.sh.' "$SYSCTL_FILE"; then
+    while IFS= read -r line || [[ -n "$line" ]]; do
+      line="${line%%#*}"
+      [[ "$line" == *'='* ]] || continue
+      key="$(awk -F= '{gsub(/^[ \t]+|[ \t]+$/, "", $1); print $1}' <<< "$line")"
+      [[ "$key" =~ ^net\.[a-zA-Z0-9_.]+$ ]] || continue
+      value="$(awk -F= '{gsub(/^[ \t]+|[ \t]+$/, "", $2); gsub(/[ \t]+/, " ", $2); print $2}' <<< "$line")"
+      [[ -n "$value" ]] || continue
+      [[ -z "${SYSCTL_TARGETS[$key]+set}" ]] || continue
+      if ! sysctl_matches "$key" "$value"; then
+        sync_sysctl_needed=1
+        break
+      fi
+    done < "$SYSCTL_FILE"
+  fi
+  if [[ -f "$BBR_FILE" && ! -L "$BBR_FILE" ]] && grep -Fqx '# Managed by netpilot.sh.' "$BBR_FILE"; then
+    while IFS= read -r line || [[ -n "$line" ]]; do
+      line="${line%%#*}"
+      [[ "$line" == *'='* ]] || continue
+      key="$(awk -F= '{gsub(/^[ \t]+|[ \t]+$/, "", $1); print $1}' <<< "$line")"
+      [[ "$key" =~ ^net\.[a-zA-Z0-9_.]+$ ]] || continue
+      value="$(awk -F= '{gsub(/^[ \t]+|[ \t]+$/, "", $2); gsub(/[ \t]+/, " ", $2); print $2}' <<< "$line")"
+      [[ -n "$value" ]] || continue
+      if [[ -n "${SYSCTL_TARGETS[$key]+set}" ]]; then
+        if [[ "$(normalize_sysctl_value "${SYSCTL_TARGETS[$key]}")" != "$value" ]]; then
+          remove_bbr_file=1
+          break
+        fi
+      elif ! sysctl_matches "$key" "$value"; then
+        remove_bbr_file=1
+        break
+      fi
+    done < "$BBR_FILE"
+  fi
+  if [[ "$intended_cc" != bbr && -f "$BBR_MODULE_FILE" && ! -L "$BBR_MODULE_FILE" ]] && grep -Fqx '# Managed by netpilot.sh.' "$BBR_MODULE_FILE"; then
+    remove_bbr_module=1
+  fi
+  need_persist_sync=$((sync_sysctl_needed || remove_bbr_file || remove_bbr_module))
+  write_sysctl_needed=$((${#SYSCTL_KEYS[@]} > 0 || sync_sysctl_needed || remove_bbr_file))
   if ((yes == 0)); then
     adaptive_print_plan
-    if ((${#SYSCTL_KEYS[@]} == 0)); then
+    if ((${#SYSCTL_KEYS[@]} == 0 && need_persist_sync == 0)); then
       log "$(np_msg '按本轮检查结果保留现有参数。' 'Existing parameters are retained based on this run.')"
       return 0
     fi
@@ -703,26 +838,54 @@ apply_tuning() {
   if [[ "${AUTO_TUNE_ACTIVE:-0}" == 1 ]] && ((${auto_cancel_code:-0})); then return "$auto_cancel_code"; fi
   if ((yes)); then adaptive_print_plan applying; fi
   if [[ "${AUTO_TUNE_ACTIVE:-0}" == 1 ]] && ((${auto_cancel_code:-0})); then return "$auto_cancel_code"; fi
-  if ((${#SYSCTL_KEYS[@]} == 0)); then
+  if ((${#SYSCTL_KEYS[@]} == 0 && need_persist_sync == 0)); then
     log "$(np_msg '按本轮检查结果保留现有参数。' 'Existing parameters are retained based on this run.')"
     return 0
+  fi
+  if ((write_sysctl_needed)); then
+    owned_config_target "$SYSCTL_FILE" || return 1
+    state_files+=(sysctl-file)
+  fi
+  if ((remove_bbr_file)); then
+    owned_config_target "$BBR_FILE" || return 1
+    state_files+=(bbr-file)
   fi
   if [[ "${SYSCTL_TARGETS[net.ipv4.tcp_congestion_control]:-}" == bbr ]]; then
     owned_config_target "$BBR_MODULE_FILE" || return 1
     persist_bbr=1
     state_files+=(bbr-module-file)
+  elif ((remove_bbr_module)); then
+    owned_config_target "$BBR_MODULE_FILE" || return 1
+    state_files+=(bbr-module-file)
   fi
   tuning_run_validate || return 1
   NIC_IFACE="$(default_interface || true)"
-  prepare_state "${state_files[@]}" || return 1
+  if ((${#state_files[@]})); then
+    prepare_state "${state_files[@]}" || return 1
+  else
+    prepare_state || return 1
+  fi
   if [[ "${AUTO_TUNE_ACTIVE:-0}" == 1 ]]; then
     ((${auto_cancel_code:-0} == 0)) || return "$auto_cancel_code"
     AUTO_TUNE_WRITING=1
   fi
-  install -d -m 0755 /etc/sysctl.d || { transaction_failed "$(np_msg '无法创建 sysctl 目录。' 'Cannot create sysctl directory.')"; return 1; }
-  write_sysctl_file || { transaction_failed "$(np_msg '无法保存计划参数。' 'Cannot persist planned parameters.')"; return 1; }
+  if ((write_sysctl_needed)); then
+    install -d -m 0755 /etc/sysctl.d || { transaction_failed "$(np_msg '无法创建 sysctl 目录。' 'Cannot create sysctl directory.')"; return 1; }
+    write_sysctl_file --sync-runtime || { transaction_failed "$(np_msg '无法保存计划参数。' 'Cannot persist planned parameters.')"; return 1; }
+  fi
+  if ((remove_bbr_file)); then
+    if ! tuning_run_file_remove "$BBR_FILE" || ! rm -f -- "$BBR_FILE" || ! tuning_run_record file "$BBR_FILE"; then
+      transaction_failed "$(np_msg '无法清理旧 BBR 配置。' 'Cannot clean stale BBR configuration.')"
+      return 1
+    fi
+  fi
   if ((persist_bbr)); then
     write_bbr_module_file || { transaction_failed "$(np_msg '无法保存 BBR 模块配置。' 'Cannot persist BBR module.')"; return 1; }
+  elif ((remove_bbr_module)); then
+    if ! tuning_run_file_remove "$BBR_MODULE_FILE" || ! rm -f -- "$BBR_MODULE_FILE" || ! tuning_run_record file "$BBR_MODULE_FILE"; then
+      transaction_failed "$(np_msg '无法清理旧 BBR 模块配置。' 'Cannot clean stale BBR module configuration.')"
+      return 1
+    fi
   fi
   apply_sysctl_values || { transaction_failed "$(np_msg '无法应用或核验计划参数。' 'Cannot apply or verify planned parameters.')"; return 1; }
   log "$(np_msg '计划已应用且读回一致；后续可用 verify 检查配置漂移。' 'Plan applied and read back consistently; use verify to check for later configuration drift.')"
@@ -764,16 +927,56 @@ apply_bbr_only() {
 }
 
 apply_nic_only() {
+  local NIC_PREPARE_PENDING=1 had_state=0 had_ring=0 had_rps=0 clean=1 fail_msg=''
   SYSCTL_KEYS=(); SYSCTL_TARGETS=()
   NIC_IFACE="$(default_interface || true)"
-  prepare_state || return 1
-  apply_nic_ring || { transaction_failed "$(np_msg '无法设置网卡 ring。' 'Unable to set NIC ring.')"; return 1; }
-  apply_rps || { transaction_failed "$(np_msg '无法设置 RPS。' 'Unable to set RPS.')"; return 1; }
-  show_nic_dashboard "$(nproc 2>/dev/null || echo 0)"
+  if [[ -e "$STATE_DIR" || -L "$STATE_DIR" ]]; then
+    if [[ ! -d "$STATE_DIR" || -L "$STATE_DIR" || ! -f "$STATE_DIR/original-values" ]]; then
+      warn "$(np_msg '状态目录不完整，请先检查，再应用变更。' 'State directory is incomplete; inspect it before applying changes.')"
+      return 1
+    fi
+    had_state=1
+    [[ ! -e "$STATE_DIR/nic-ring-changed" && ! -e "$STATE_DIR/nic-ring.before" ]] || had_ring=1
+    [[ ! -e "$STATE_DIR/rps-changed" && ! -e "$STATE_DIR/rps-sysctl-changed" && ! -e "$STATE_DIR/rps.before" && ! -e "$STATE_DIR/rps-sysctl.before" ]] || had_rps=1
+  fi
+  if ! apply_nic_ring; then
+    fail_msg="$(np_msg '无法设置网卡 ring。' 'Unable to set NIC ring.')"
+  elif ! apply_rps; then
+    fail_msg="$(np_msg '无法设置 RPS。' 'Unable to set RPS.')"
+  fi
+  if [[ -n "$fail_msg" ]]; then
+    if ((NIC_PREPARE_PENDING)); then
+      warn "$fail_msg"
+      return 1
+    fi
+    if ((had_state == 0)); then
+      transaction_failed "$fail_msg"
+      return 1
+    fi
+    warn "$fail_msg"
+    if ((had_rps == 0)) && [[ -e "$STATE_DIR/rps-changed" || -e "$STATE_DIR/rps-sysctl-changed" || -e "$STATE_DIR/rps.before" || -e "$STATE_DIR/rps-sysctl.before" ]]; then
+      if restore_rps; then
+        rm -f -- "$STATE_DIR/rps-sysctl-changed" "$STATE_DIR/rps-changed" "$STATE_DIR/rps.before" "$STATE_DIR/rps-sysctl.before" || clean=0
+      else
+        clean=0
+      fi
+    fi
+    if ((had_ring == 0)) && [[ -e "$STATE_DIR/nic-ring-changed" || -e "$STATE_DIR/nic-ring.before" ]]; then
+      if restore_nic_ring; then
+        rm -f -- "$STATE_DIR/nic-ring-changed" "$STATE_DIR/nic-ring.before" || clean=0
+      else
+        clean=0
+      fi
+    fi
+    ((clean)) || warn "$(np_msg '恢复未完成，原值状态已保留。' 'Recovery incomplete; saved state is retained.')"
+    return 1
+  fi
+  show_nic_dashboard
 }
 
 apply_sysctl_values() {
   local key
+  ((${#SYSCTL_KEYS[@]})) || return 0
   for key in "${SYSCTL_KEYS[@]}"; do
     if ! tuning_run_record sysctl "$key" "${SYSCTL_TARGETS[$key]}" || ! sysctl -w "$key=${SYSCTL_TARGETS[$key]}" >/dev/null || ! sysctl_matches "$key" "${SYSCTL_TARGETS[$key]}"; then
       warn "$(np_msg '无法应用并核验 %s' 'Unable to apply and verify %s' "$key")"
@@ -1120,7 +1323,10 @@ menu() {
 # This snapshot is separate from the first-ever rollback baseline.
 tuning_run_backend() {
   python3 - "$@" "$SYSCTL_FILE" "$BBR_FILE" "$BBR_MODULE_FILE" "$STATE_DIR/applied-values" <<'PYRUN'
-import base64, json, os, stat, subprocess, sys, tempfile
+import base64, errno, json, os, stat, subprocess, sys, tempfile
+if sys.version_info < (3, 7):
+    sys.stderr.write('需要 Python 3.7 或更高版本。\n' if os.environ.get('NETPILOT_LANG', 'zh') != 'en' else 'Python 3.7 or newer is required.\n')
+    sys.exit(1)
 operation, root, *arguments = sys.argv[1:]
 paths, arguments = arguments[-4:], arguments[:-4]
 keys = ('net.ipv4.tcp_congestion_control', 'net.core.default_qdisc', 'net.ipv4.tcp_moderate_rcvbuf',
@@ -1130,16 +1336,30 @@ MAX_FILE = 1048576
 def directory(path, missing=False):
     if not os.path.isabs(path) or os.path.normpath(path) != path:
         raise ValueError('run recovery requires normalized absolute paths')
+    parts = [part for part in path.split('/')[1:] if part]
     descriptor = os.open('/', flags | os.O_DIRECTORY)
     try:
-        for part in path.split('/')[1:]:
-            if not part: continue
+        for index, part in enumerate(parts):
             try: child = os.open(part, flags | os.O_DIRECTORY, dir_fd=descriptor)
             except FileNotFoundError:
                 if missing:
                     os.close(descriptor)
                     return None
                 raise
+            except OSError as exc:
+                prefix = '/' + '/'.join(parts[:index + 1])
+                if (exc.errno not in (errno.ELOOP, errno.ENOTDIR, getattr(errno, 'EMLINK', 0)) or
+                        index >= len(parts) - 1 and not missing or prefix not in ('/tmp', '/var', '/var/tmp')):
+                    raise
+                parent_info = os.fstat(descriptor)
+                link_info = os.stat(part, dir_fd=descriptor, follow_symlinks=False)
+                if (not stat.S_ISLNK(link_info.st_mode) or link_info.st_uid != 0 or
+                        parent_info.st_uid != 0 or parent_info.st_mode & 0o022):
+                    raise
+                child = os.open(part, (flags & ~os.O_NOFOLLOW) | os.O_DIRECTORY, dir_fd=descriptor)
+                if os.fstat(child).st_uid != 0:
+                    os.close(child)
+                    raise
             os.close(descriptor); descriptor = child
             info = os.fstat(descriptor)
             if info.st_uid not in (0, os.geteuid()) or (info.st_mode & 0o022 and not
@@ -1275,6 +1495,18 @@ try:
                 info = os.fstat(parent); planned.update(parent_device=info.st_dev, parent_inode=info.st_ino)
             finally: os.close(parent)
             entry.update(expected=planned, touched=True); save(state)
+        elif operation == 'prepare-remove':
+            if len(arguments) != 1: raise ValueError('invalid remove arguments')
+            path = arguments[0]
+            if path not in state['files'] or path == paths[3]:
+                raise ValueError('file is outside this run recovery scope')
+            entry = state['files'][path]
+            current = capture(path)
+            if current != entry['expected']: raise ValueError('external file change before write: ' + path)
+            marker = b'# Managed by netpilot.sh.'
+            if current['exists'] and marker not in base64.b64decode(current['data']).splitlines():
+                raise ValueError('refusing to remove an unowned managed configuration')
+            entry.update(expected={'exists': False}, touched=True); save(state)
         elif operation == 'record':
             if not arguments: validate(state)
             elif arguments[0] == 'file' and len(arguments) == 2:
@@ -1336,6 +1568,11 @@ tuning_run_validate() {
 tuning_run_file_prepare() {
   [[ -n "${TUNING_RUN_DIR:-}" ]] || return 0
   tuning_run_backend prepare-file "$TUNING_RUN_DIR" "$@"
+}
+
+tuning_run_file_remove() {
+  [[ -n "${TUNING_RUN_DIR:-}" ]] || return 0
+  tuning_run_backend prepare-remove "$TUNING_RUN_DIR" "$@"
 }
 
 tuning_run_record() {
@@ -1965,7 +2202,10 @@ bench_command() {
   done
   report_tmp="$(mktemp "$(dirname -- "$output")/.netpilot-bench.XXXXXX")" || { bench_finish 0; return 1; }
   if ! python3 - "$bench_dir" "$peer" "$port" "$budget" "$streams" "$deadline" "$direction" "$quota" "$latency" > "$report_tmp" <<'PY'
-import datetime, ipaddress, json, math, pathlib, re, sys
+import datetime, ipaddress, json, math, os, pathlib, re, sys
+if sys.version_info < (3, 7):
+    sys.stderr.write('需要 Python 3.7 或更高版本。\n' if os.environ.get('NETPILOT_LANG', 'zh') != 'en' else 'Python 3.7 or newer is required.\n')
+    sys.exit(1)
 folder=pathlib.Path(sys.argv[1]); peer=sys.argv[2]
 port,budget,streams,timeout=map(int,sys.argv[3:7]); direction=sys.argv[7]
 quota=int(sys.argv[8]); latency=bool(int(sys.argv[9]))
@@ -2042,10 +2282,13 @@ PY
 
 bench_summary() {
   python3 - "$1" "${NETPILOT_LANG:-zh}" <<'PY'
-import json,sys
-english=sys.argv[2]=='en'
+import json,os,sys
+english=(sys.argv[2] if len(sys.argv)>2 and sys.argv[2] in ('zh','en') else os.environ.get('NETPILOT_LANG','zh'))=='en'
 def text(zh,en):
     return en if english else zh
+if sys.version_info<(3,7):
+    sys.stderr.write(text('需要 Python 3.7 或更高版本。\n','Python 3.7 or newer is required.\n'))
+    sys.exit(1)
 d=json.load(open(sys.argv[1])); failed=False
 for r in d['runs']:
     if r['status']!='ok':
@@ -2070,9 +2313,12 @@ bench_compare() {
   command -v python3 >/dev/null 2>&1 || { np_msg 'compare 需要 python3。\n' 'compare requires python3.\n' >&2; return 1; }
   python3 - "$1" "$2" "${NETPILOT_LANG:-zh}" <<'PY'
 import ipaddress,json,math,os,stat,sys
-english=sys.argv[3]=='en'
+english=(sys.argv[3] if len(sys.argv)>3 and sys.argv[3] in ('zh','en') else os.environ.get('NETPILOT_LANG','zh'))=='en'
 def text(zh,en):
     return en if english else zh
+if sys.version_info<(3,7):
+    sys.stderr.write(text('需要 Python 3.7 或更高版本。\n','Python 3.7 or newer is required.\n'))
+    sys.exit(1)
 def load_report(path):
     # Explicit input paths may be symlinks to regular files, but never streams
     # or devices. Nonblocking open prevents a FIFO from hanging the menu.
@@ -2189,6 +2435,10 @@ import threading
 from concurrent.futures import ThreadPoolExecutor
 from urllib.parse import urlsplit
 
+if sys.version_info < (3, 7):
+    sys.stderr.write('需要 Python 3.7 或更高版本。\n' if os.environ.get('NETPILOT_LANG', 'zh') != 'en' else 'Python 3.7 or newer is required.\n')
+    sys.exit(1)
+
 phase, raw_endpoint, raw_budget, raw_timeout, output_name, before_name, requested_cc, only_direction, raw_upload_target, raw_upload_limit = sys.argv[1:]
 language = os.environ.get('NETPILOT_LANG', 'zh')
 report = {'type': 'netpilot-http-measurement', 'version': 1, 'ok': False,
@@ -2248,6 +2498,17 @@ def integer(value, low, high):
 def positive(value, high=float('inf')):
     return type(value) in (int, float) and math.isfinite(value) and 0 < value <= high
 
+def parse_ip(value):
+    if not isinstance(value, str) or '%' in value:
+        raise ValueError('invalid IP address')
+    return ipaddress.ip_address(value)
+
+def is_loopback_ip(address):
+    return address.is_loopback and getattr(address, 'ipv4_mapped', None) is None
+
+def is_global_ip(address):
+    return address.is_global and getattr(address, 'ipv4_mapped', None) is None
+
 # Client resource policy, not a claim about any provider's service limit.
 MAX_REQUEST_BYTES = 4 * 1048576
 MAX_REQUESTS_PER_DIRECTION = 2048
@@ -2293,10 +2554,10 @@ def read_before(path):
             not positive(value.get('latency_ms'), 60000) or
             not integer(value.get('port'), 1, 65535) or value['port'] != port):
         raise ValueError('incompatible baseline measurement')
-    prior_address = ipaddress.ip_address(value.get('address', ''))
-    if cloudflare and not prior_address.is_global:
+    prior_address = parse_ip(value.get('address', ''))
+    if cloudflare and not is_global_ip(prior_address):
         raise ValueError('baseline address is not public')
-    if scheme == 'http' and not prior_address.is_loopback:
+    if scheme == 'http' and not is_loopback_ip(prior_address):
         raise ValueError('plaintext baseline address is not loopback')
     if not isinstance(value.get('node'), str) or not value['node'] or len(value['node']) > 128:
         raise ValueError('invalid baseline node')
@@ -2622,10 +2883,10 @@ try:
         raise ValueError('invalid measurement port')
     literal = None
     try:
-        literal = ipaddress.ip_address(host)
+        literal = parse_ip(host)
     except ValueError:
         pass
-    if scheme == 'http' and not (host == 'localhost' or literal is not None and literal.is_loopback):
+    if scheme == 'http' and not (host == 'localhost' or literal is not None and is_loopback_ip(literal)):
         raise ValueError('plaintext HTTP is allowed only for an explicit loopback endpoint')
     cloudflare = scheme == 'https' and host == 'speed.cloudflare.com'
     netloc = '[' + host + ']' if ':' in host else host
@@ -2666,8 +2927,8 @@ try:
         if candidate_address in seen:
             continue
         seen.add(candidate_address)
-        candidate_ip = ipaddress.ip_address(candidate_address)
-        if cloudflare and not candidate_ip.is_global or scheme == 'http' and not candidate_ip.is_loopback:
+        candidate_ip = parse_ip(candidate_address)
+        if cloudflare and not is_global_ip(candidate_ip) or scheme == 'http' and not is_loopback_ip(candidate_ip):
             continue
         family = candidate[0]
         if family not in (socket.AF_INET, socket.AF_INET6):
@@ -2820,6 +3081,10 @@ import time
 from fractions import Fraction
 from urllib.parse import urlsplit
 
+if sys.version_info < (3, 7):
+    sys.stderr.write('需要 Python 3.7 或更高版本。\n' if os.environ.get('NETPILOT_LANG', 'zh') != 'en' else 'Python 3.7 or newer is required.\n')
+    sys.exit(1)
+
 before_name, endpoint_arg, whole_arg, timeout_arg, directory, original, backend = sys.argv[1:]
 report = dict(type='netpilot-algorithm-selection', version=1, original=original,
               selected=original, status='preserved', reason_code='internal_error', reserved_bytes=0,
@@ -2869,6 +3134,17 @@ def integer(value, low, high):
 
 def positive(value, high=float('inf')):
     return type(value) in (int, float) and math.isfinite(value) and 0 < value <= high
+
+def parse_ip(value):
+    if not isinstance(value, str) or '%' in value:
+        raise ValueError('invalid IP address')
+    return ipaddress.ip_address(value)
+
+def is_loopback_ip(address):
+    return address.is_loopback and getattr(address, 'ipv4_mapped', None) is None
+
+def is_global_ip(address):
+    return address.is_global and getattr(address, 'ipv4_mapped', None) is None
 
 def read_json(name):
     fd = os.open(name, os.O_RDONLY | getattr(os, 'O_NOFOLLOW', 0) | getattr(os, 'O_NONBLOCK', 0))
@@ -2931,16 +3207,16 @@ def validate_baseline():
             type(value.get('node_verified')) is not bool or
             not isinstance(value.get('node'), str) or not 1 <= len(value['node']) <= 128):
         raise ValueError('invalid baseline measurement metadata')
-    address = ipaddress.ip_address(value.get('address', ''))
+    address = parse_ip(value.get('address', ''))
     if parsed.scheme == 'http':
         try:
-            literal = ipaddress.ip_address(host)
+            literal = parse_ip(host)
         except ValueError:
             literal = None
-        if not address.is_loopback or not (host == 'localhost' or literal is not None and literal.is_loopback):
+        if not is_loopback_ip(address) or not (host == 'localhost' or literal is not None and is_loopback_ip(literal)):
             raise ValueError('plaintext baseline endpoint is not loopback')
     if parsed.scheme == 'https' and host == 'speed.cloudflare.com':
-        if not address.is_global or value['node_verified'] is not True or not re.fullmatch(r'[A-Z0-9]{2,8}', value['node']):
+        if not is_global_ip(address) or value['node_verified'] is not True or not re.fullmatch(r'[A-Z0-9]{2,8}', value['node']):
             raise ValueError('invalid verified Cloudflare baseline')
     total = 0
     for direction in ('download', 'upload'):
@@ -3242,17 +3518,28 @@ PY
 # Report operations never change system configuration or execute report data.
 auto_report() {
   python3 - "$@" "${NETPILOT_LANG:-zh}" <<'PY'
-import ipaddress, json, math, os, stat, sys, tempfile
+import ipaddress, json, math, os, re, stat, sys, tempfile
 from pathlib import Path
 from urllib.parse import urlsplit
 
-op, *args = sys.argv[1:-1]
-english = sys.argv[-1] == 'en'
+english = (sys.argv[-1] if len(sys.argv) > 1 and sys.argv[-1] in ('zh', 'en') else os.environ.get('NETPILOT_LANG', 'zh')) == 'en'
 def text(zh, en): return en if english else zh
+if sys.version_info < (3, 7):
+    sys.stderr.write(text('需要 Python 3.7 或更高版本。\n', 'Python 3.7 or newer is required.\n'))
+    sys.exit(1)
+op, *args = sys.argv[1:-1]
 # Older reports can contain larger requests; offline readers retain that
 # compatibility while keeping the number of requests bounded.
 MAX_REQUESTS_PER_DIRECTION = 2048
 AUTO_TOTAL_BUDGET = 16 * 1024 ** 3
+def parse_ip(value):
+    if not isinstance(value, str) or '%' in value:
+        raise ValueError('invalid IP address')
+    return ipaddress.ip_address(value)
+def is_loopback_ip(address):
+    return address.is_loopback and getattr(address, 'ipv4_mapped', None) is None
+def is_global_ip(address):
+    return address.is_global and getattr(address, 'ipv4_mapped', None) is None
 def number(value, upper=1e15):
     if type(value) not in (int, float) or not math.isfinite(value) or not 0 < value <= upper:
         raise ValueError('invalid positive measurement')
@@ -3283,17 +3570,19 @@ def atomic(path, data):
     finally:
         os.unlink(temporary)
 def endpoint(value):
-    if len(value) > 2048 or '\\' in value or any(ord(c) < 33 or ord(c) > 126 for c in value):
+    if not isinstance(value, str) or len(value) > 2048 or '\\' in value or any(ord(c) < 33 or ord(c) > 126 for c in value):
         raise ValueError('invalid measurement endpoint')
     u = urlsplit(value)
-    if u.username is not None or u.password is not None or u.query or u.fragment or u.path not in ('', '/') or not u.hostname:
+    if u.scheme not in ('https', 'http') or u.username is not None or u.password is not None or u.query or u.fragment or u.path not in ('', '/') or not u.hostname:
         raise ValueError('invalid measurement endpoint')
-    if u.scheme != 'https' and not (u.scheme == 'http' and u.hostname in ('localhost', '127.0.0.1', '::1')):
+    host = u.hostname.lower()
+    try: literal = parse_ip(host)
+    except ValueError: literal = None
+    if u.scheme == 'http' and not (host == 'localhost' or literal is not None and is_loopback_ip(literal)):
         raise ValueError('HTTPS is required except for explicit loopback endpoints')
     port = u.port if u.port is not None else (443 if u.scheme == 'https' else 80)
     if not 1 <= port <= 65535:
         raise ValueError('invalid endpoint port')
-    host = u.hostname.lower()
     authority = '[' + host + ']' if ':' in host else host
     if u.port is not None: authority += ':' + str(port)
     return u.scheme + '://' + authority
@@ -3301,14 +3590,21 @@ def measurement_data(d, phase, expected_endpoint=None, budget=None, timeout=None
     if not isinstance(d, dict) or d.get('type') != 'netpilot-http-measurement' or type(d.get('version')) is not int or d['version'] != 1:
         raise ValueError('incompatible HTTP measurement report')
     if d.get('ok') is not True or d.get('phase') != phase: raise ValueError('measurement did not succeed')
-    endpoint(d['endpoint'])
+    if not isinstance(d.get('endpoint'), str) or endpoint(d['endpoint']) != d['endpoint']:
+        raise ValueError('invalid measurement endpoint')
     if expected_endpoint is not None and d['endpoint'] != expected_endpoint: raise ValueError('endpoint changed')
-    ipaddress.ip_address(d['address'])
+    address = parse_ip(d['address'])
+    origin = urlsplit(d['endpoint'])
+    if origin.scheme == 'http' and not is_loopback_ip(address):
+        raise ValueError('plaintext measurement address is not loopback')
     integer(d['port'], 1, 65535)
     integer(d['timeout_seconds'], 1, 600)
     if timeout is not None and d['timeout_seconds'] != timeout: raise ValueError('measurement timeout changed')
-    if d.get('node') is not None and (not isinstance(d['node'], str) or not 1 <= len(d['node']) <= 64):
+    if d.get('node') is not None and (not isinstance(d['node'], str) or not 1 <= len(d['node']) <= 128):
         raise ValueError('invalid node identity')
+    if origin.scheme == 'https' and origin.hostname == 'speed.cloudflare.com':
+        if not is_global_ip(address) or not isinstance(d.get('node'), str) or not re.fullmatch(r'[A-Z0-9]{2,8}', d['node']):
+            raise ValueError('invalid Cloudflare measurement address or node')
     if d.get('latency_method') != 'tcp-connect-estimate': raise ValueError('unexpected latency method')
     number(d['latency_ms'], 60000)
     budget_value(d['budget_bytes'], d.get('budget_mode', 'fixed'), phase=True)
@@ -3479,12 +3775,14 @@ def selection_data(data, total=None):
     origin = data.get('endpoint')
     if not isinstance(origin, str) or endpoint(origin) != origin:
         raise ValueError('invalid selected algorithm endpoint')
-    address = ipaddress.ip_address(data.get('address', ''))
+    address = parse_ip(data.get('address', ''))
     node = data.get('node')
+    parsed_origin = urlsplit(origin)
     if (not isinstance(node, str) or not re.fullmatch('[A-Z0-9]{2,8}', node) or
             type(data.get('parallelism')) is not int or data['parallelism'] != 4 or
             data.get('policy') not in ('three-paired-upload-v1', 'three-paired-upload-v2') or
-            urlsplit(origin).hostname == 'speed.cloudflare.com' and not address.is_global):
+            parsed_origin.scheme == 'http' and not is_loopback_ip(address) or
+            parsed_origin.hostname == 'speed.cloudflare.com' and not is_global_ip(address)):
         raise ValueError('invalid selected algorithm path or policy')
     order = (original, candidate, candidate, original, original, candidate)
     common_work, rates, rtts = None, [], []
@@ -3748,23 +4046,46 @@ try:
         flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW
         def open_directory_chain(path):
             descriptors, bindings = [], []
+            parts = path.parts[1:]
             try:
                 descriptors.append(os.open(path.anchor, flags | os.O_DIRECTORY))
-                for part in path.parts[1:]:
+                for index, part in enumerate(parts):
                     if part == '..':
                         raise ValueError('parent traversal is not allowed during report cleanup')
                     parent_fd = descriptors[-1]
-                    child_fd = os.open(part, flags | os.O_DIRECTORY, dir_fd=parent_fd)
+                    system_link = False
+                    try:
+                        child_fd = os.open(part, flags | os.O_DIRECTORY, dir_fd=parent_fd)
+                    except OSError as exc:
+                        prefix = '/' + '/'.join(parts[:index + 1])
+                        if (exc.errno not in (errno.ELOOP, errno.ENOTDIR, getattr(errno, 'EMLINK', 0)) or
+                                index >= len(parts) - 1 or prefix not in ('/tmp', '/var', '/var/tmp')):
+                            raise
+                        parent_info = os.fstat(parent_fd)
+                        link_info = os.stat(part, dir_fd=parent_fd, follow_symlinks=False)
+                        if (not stat.S_ISLNK(link_info.st_mode) or link_info.st_uid != 0 or
+                                parent_info.st_uid != 0 or parent_info.st_mode & 0o022):
+                            raise
+                        child_fd = os.open(part, (flags & ~os.O_NOFOLLOW) | os.O_DIRECTORY, dir_fd=parent_fd)
+                        if os.fstat(child_fd).st_uid != 0:
+                            os.close(child_fd)
+                            raise
+                        system_link = True
                     descriptors.append(child_fd)
-                    bindings.append((parent_fd, part, child_fd))
+                    bindings.append((parent_fd, part, child_fd, system_link))
                 return descriptors, bindings
             except BaseException:
                 for fd in reversed(descriptors):
                     os.close(fd)
                 raise
         def attached(bindings):
-            for parent_fd, name, child_fd in bindings:
-                entry = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+            for parent_fd, name, child_fd, *rest in bindings:
+                system_link = bool(rest and rest[0])
+                if system_link:
+                    link = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+                    if not stat.S_ISLNK(link.st_mode) or link.st_uid != 0:
+                        raise ValueError('report directory changed before cleanup: ' + repr(name))
+                entry = os.stat(name, dir_fd=parent_fd, follow_symlinks=system_link)
                 opened = os.fstat(child_fd)
                 if not stat.S_ISDIR(entry.st_mode) or (entry.st_dev, entry.st_ino) != (opened.st_dev, opened.st_ino):
                     raise ValueError('report directory changed before cleanup: ' + repr(name))
@@ -4081,6 +4402,9 @@ auto_tune() {
   for dep in python3 timeout mktemp install; do
     command -v "$dep" >/dev/null 2>&1 || { warn "$(np_msg '自动调优缺少依赖：%s。' 'Missing automatic tuning dependency: %s.' "$dep")"; return 1; }
   done
+  python3 -c 'import sys; sys.exit(0 if sys.version_info >= (3, 7) else 1)' 2>/dev/null || {
+    warn "$(np_msg '需要 Python 3.7 或更高版本。' 'Python 3.7 or newer is required.')"; return 1;
+  }
   endpoint="$(auto_report endpoint "$endpoint")" || return 2
   run_dir="$(auto_report prepare "$report_root" "$STATE_DIR")" || return 1
   before="$run_dir/before.json"; after="$run_dir/after.json"
@@ -4249,7 +4573,7 @@ Usage: netpilot [--lang zh|en] [command] [options] (or bash netpilot.sh [command
   help                 Show this help
 Basic commands require Linux/Bash 4+. Benchmark dependencies are installed separately.
 Profiles: balanced = general (default); proxy = proxies/many connections, more conservative buffers; bulk = a few large transfers, larger buffer recommendations.
-Automatic tune requires Python 3 and GNU timeout. Default auto sampling stops after reaching the target duration, with a 16GiB whole-run payload cap; a numeric budget sets a fixed cap in MiB.
+Automatic tune requires Python 3.7+ and GNU timeout. Default auto sampling stops after reaching the target duration, with a 16GiB whole-run payload cap; a numeric budget sets a fixed cap in MiB.
 Measurements start small, then use up to 4 connections; short samples retain existing buffers while basic tuning proceeds.
 Inconclusive comparisons keep the current algorithm. Insufficient retest budget stops before applying; failures or confirmed regression restore this run's starting state.
 Manual --rtt-target probing requires --bandwidth, ping and GNU timeout. --rtt and --rtt-target are mutually exclusive.
@@ -4284,7 +4608,7 @@ NetPilot — Linux VPS 网络诊断与调优
   help                 显示帮助
 基础命令需要Linux/Bash4+。测速依赖按需安装，脚本不自动安装测速工具。
 配置档：balanced 通用（默认）；proxy 代理/多连接，缓冲建议更保守；bulk 少量大文件传输，缓冲建议更大。
-一键调优需 Python 3 和 GNU timeout；默认按采样时长自动确定用量，整轮测试数据最多16GiB；填写数字预算则按 MiB 固定限制。
+一键调优需 Python 3.7+ 和 GNU timeout；默认按采样时长自动确定用量，整轮测试数据最多16GiB；填写数字预算则按 MiB 固定限制。
 先小请求探测，再使用最多 4 个连接；样本不足时保留缓冲区，仅做基础调优。
 算法比较证据不足保留原算法；复测预算不足时不应用。写入后失败或确认退化，恢复本轮开始时的配置。
 手动使用 --rtt-target 测延迟需同时提供 --bandwidth，并安装 ping 和 GNU timeout；--rtt 与 --rtt-target 互斥。
@@ -4457,9 +4781,7 @@ main() {
     rollback) run_mutation rollback_tuning ;;
     install) install_from_source ;;
     update) run_mutation check_update ;;
-    uninstall)
-      resolve_source_path || return 1
-      run_mutation uninstall_own_script "${@:2}" ;;
+    uninstall) run_mutation uninstall_own_script "${@:2}" ;;
     *) usage; return 2 ;;
   esac
 }

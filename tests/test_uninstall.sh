@@ -558,8 +558,32 @@ test_rollback_uninstall_preserves_new_admin_module_file() (
   assert_no_success
 )
 
+test_cli_process_substitution_offline_uninstall_never_downloads_or_leaks() (
+  setup offline-process-substitution
+  # shellcheck disable=SC2034
+  {
+    SOURCE_PATH='/dev/fd/999'
+    RESOLVED_SOURCE=''
+    SCRIPT_PATH=''
+    SOURCE_SNAPSHOT=''
+  }
+  curl() { fail 'uninstall CLI must not invoke curl when launched via process substitution'; }
+  find /tmp -maxdepth 1 -name 'netpilot.*' -print 2>/dev/null | sort > "$CASE_DIR/tmp-before"
+  local status=0
+  invoke_cli '' --bogus || status=$?
+  [[ "$status" == 2 ]] || fail "process-substitution uninstall --bogus returned $status instead of 2"
+  [[ ! -s "$CASE_DIR/prompts" ]] || fail 'process-substitution uninstall --bogus prompted'
+  find /tmp -maxdepth 1 -name 'netpilot.*' -print 2>/dev/null | sort > "$CASE_DIR/tmp-after-bogus"
+  cmp -s "$CASE_DIR/tmp-before" "$CASE_DIR/tmp-after-bogus" || fail 'uninstall --bogus leaked /tmp/netpilot.*'
+
+  invoke_cli y || fail 'offline process-substitution CLI uninstall failed'
+  assert_removed
+  find /tmp -maxdepth 1 -name 'netpilot.*' -print 2>/dev/null | sort > "$CASE_DIR/tmp-after-ok"
+  cmp -s "$CASE_DIR/tmp-before" "$CASE_DIR/tmp-after-ok" || fail 'offline process-substitution uninstall leaked /tmp/netpilot.*'
+)
+
 failures=0
-for test in test_completion_assertion_rejects_actual_success test_download_uninstall_removes_installed_copy_only test_installed_path_uninstalls test_menu_uninstall_without_resolved_source test_process_substitution_resolves_then_uninstalls test_changed_owned_version_is_recognized test_unrelated_installed_file_is_preserved test_installed_symlink_is_preserved test_dangling_installed_symlink_is_preserved test_unrelated_shortcuts_are_preserved test_absent_installation_keeps_source test_failed_rollback_keeps_installation test_residual_state_failure_keeps_installation test_shortcut_remove_failure_is_reported test_install_remove_failure_is_reported test_cancel_does_not_mutate test_default_uninstall_keeps_configuration_backup_and_unrelated_files test_uninstall_cleans_only_managed_default_reports test_report_cleanup_does_not_follow_links_or_delete_user_files test_default_uninstall_does_not_validate_or_follow_damaged_state test_explicit_rollback_uninstall_runs_before_removal test_explicit_rollback_without_state_preserves_installation test_explicit_rollback_rejects_empty_and_unknown_only_state test_file_only_backups_are_restored_without_original_values_marker test_uninstall_rejects_unknown_options_before_confirmation test_uninstall_confirmation_defaults_to_cancel test_bilingual_menu_default_and_keep_choice_route test_bilingual_menu_rollback_choice_route test_bilingual_menu_cancellation_and_eof test_rollback_uninstall_preserves_new_admin_module_file; do
+for test in test_completion_assertion_rejects_actual_success test_download_uninstall_removes_installed_copy_only test_installed_path_uninstalls test_menu_uninstall_without_resolved_source test_process_substitution_resolves_then_uninstalls test_cli_process_substitution_offline_uninstall_never_downloads_or_leaks test_changed_owned_version_is_recognized test_unrelated_installed_file_is_preserved test_installed_symlink_is_preserved test_dangling_installed_symlink_is_preserved test_unrelated_shortcuts_are_preserved test_absent_installation_keeps_source test_failed_rollback_keeps_installation test_residual_state_failure_keeps_installation test_shortcut_remove_failure_is_reported test_install_remove_failure_is_reported test_cancel_does_not_mutate test_default_uninstall_keeps_configuration_backup_and_unrelated_files test_uninstall_cleans_only_managed_default_reports test_report_cleanup_does_not_follow_links_or_delete_user_files test_default_uninstall_does_not_validate_or_follow_damaged_state test_explicit_rollback_uninstall_runs_before_removal test_explicit_rollback_without_state_preserves_installation test_explicit_rollback_rejects_empty_and_unknown_only_state test_file_only_backups_are_restored_without_original_values_marker test_uninstall_rejects_unknown_options_before_confirmation test_uninstall_confirmation_defaults_to_cancel test_bilingual_menu_default_and_keep_choice_route test_bilingual_menu_rollback_choice_route test_bilingual_menu_cancellation_and_eof test_rollback_uninstall_preserves_new_admin_module_file; do
   if "$test"; then printf 'PASS: %s\n' "$test"; else failures=$((failures + 1)); fi
 done
 [[ "$(sha256sum "$SCRIPT" | awk '{print $1}')" == "$SOURCE_HASH" ]] || fail 'uninstall tests modified source bytes'

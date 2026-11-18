@@ -1,0 +1,53 @@
+# Default non-destructive CI suite.
+# Privileged container tests (tests/*_integration.sh) write real system paths
+# or namespaced sysctls and are intentionally excluded from runtime execution here.
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Linux Bash 4+ & ShellCheck
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            ca-certificates \
+            coreutils \
+            curl \
+            ethtool \
+            iperf3 \
+            iproute2 \
+            iputils-ping \
+            procps \
+            python3 \
+            shellcheck \
+            util-linux
+
+      - name: Check Bash syntax and ShellCheck gates
+        run: |
+          bash -n netpilot.sh tests/run.sh tests/test_*.sh tests/*_integration.sh
+          shellcheck --severity=warning netpilot.sh tests/run.sh
+          # Legacy test fixtures source dynamic fragments without source=/dev/null
+          # or SC2034 directives; enforce error-level lint across all test scripts.
+          shellcheck --severity=error tests/test_*.sh tests/*_integration.sh
+
+      - name: Run default test suite
+        run: |
+          sudo env "PATH=/usr/sbin:/sbin:$PATH" TMPDIR=/tmp \
+            bash -c 'umask 0022 && bash tests/run.sh'

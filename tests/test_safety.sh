@@ -122,7 +122,131 @@ test_failed_snapshot_keeps_original() (
 test_cpu_mask_uses_allowed_ids() (
   [[ "$(rps_mask_for_cpus '8-11,20' 3)" == 700 ]] || fail 'CPU count was confused with CPU IDs'
   [[ "$(rps_mask_for_cpus '1,3,5' 2)" == a ]] || fail 'non-contiguous CPU IDs were ignored'
-  if rps_mask_for_cpus '64-65' 2 >/dev/null; then fail 'unsupported high CPU IDs must not wrap'; fi
+  [[ "$(rps_mask_for_cpus '0-31' 32)" == ffffffff ]] || fail '32-CPU mask must stay a single 32-bit chunk'
+  [[ "$(rps_mask_for_cpus '32' 1)" == 1,00000000 ]] || fail 'CPU 32 lacked 32-bit comma chunking'
+  [[ "$(rps_mask_for_cpus '32-33' 2)" == 3,00000000 ]] || fail 'CPUs 32-33 lacked 32-bit comma chunking'
+  [[ "$(rps_mask_for_cpus '0-32' 33)" == 1,ffffffff ]] || fail 'CPUs 0-32 lacked 32-bit comma chunking'
+  [[ "$(rps_mask_for_cpus '0-47' 48)" == ffff,ffffffff ]] || fail 'CPUs 0-47 lacked 32-bit comma chunking'
+  [[ "$(rps_mask_for_cpus '0-62' 63)" == 7fffffff,ffffffff ]] || fail 'CPUs 0-62 lacked 32-bit comma chunking'
+  [[ "$(rps_mask_for_cpus '62' 1)" == 40000000,00000000 ]] || fail 'CPU 62 mask was miscomputed'
+  [[ "$(rps_mask_for_cpus '32,0-3' 3)" == 1,00000003 ]] || fail 'unordered high/low CPU ranges failed zero-padded chunking'
+  [[ "$(rps_mask_for_cpus '0-2,1-3' 4)" == f ]] || fail 'overlapping CPU ranges were not deduplicated'
+  local invalid_case allowed wanted
+  for invalid_case in '63:1' '0-63:2' '64-65:2' '5-2:1' '0-1,5-2:2' '1,1:2' '0-1,:1'; do
+    IFS=: read -r allowed wanted <<< "$invalid_case"
+    if rps_mask_for_cpus "$allowed" "$wanted" >/dev/null; then
+      fail "invalid CPU mask input was accepted: $invalid_case"
+    fi
+  done
+)
+
+test_ring_noop_and_exit_80() (
+  STATE_DIR="$TEST_DIR/ring-exit80"; mkdir -p "$STATE_DIR"
+  ensure_ethtool() { return 0; }
+  network_interfaces() { printf 'eth0\n'; }
+  # Already at hardware maximums: must skip without touching .before/-changed or calling ethtool -G.
+  ethtool() {
+    if [[ "$1" == -g ]]; then
+      [[ "${LC_ALL:-}" == C ]] || fail 'ethtool -g must run under LC_ALL=C'
+      printf 'Pre-set maximums:\nRX: 1024\nTX: 1024\nCurrent hardware settings:\nRX: 1024\nTX: 1024\n'
+    elif [[ "$1" == -G ]]; then
+      fail 'ethtool -G must not run when current ring equals maximum'
+    fi
+  }
+  apply_nic_ring || fail 'already-maximal NIC ring failed'
+  [[ ! -e "$STATE_DIR/nic-ring.before" && ! -e "$STATE_DIR/nic-ring-changed" ]] || fail 'no-op NIC ring created snapshot or change marker'
+
+  # Exit code 80 with matching read-back succeeds, while exit codes 1 and 81 fail.
+  printf '256 256\n' > "$TEST_DIR/ring-hw"
+  local ring_rc=80
+  ethtool() {
+    local rx tx
+    if [[ "$1" == -g ]]; then
+      [[ "${LC_ALL:-}" == C ]] || fail 'ethtool -g must run under LC_ALL=C'
+      read -r rx tx < "$TEST_DIR/ring-hw"
+      printf 'Pre-set maximums:\nRX: 1024\nTX: 1024\nCurrent hardware settings:\nRX: %s\nTX: %s\n' "$rx" "$tx"
+    elif [[ "$1" == -G ]]; then
+      printf '%s %s\n' "$4" "$6" > "$TEST_DIR/ring-hw"
+      return "$ring_rc"
+    fi
+  }
+  apply_nic_ring || fail 'ethtool -G exit 80 with matching read-back was treated as an error'
+  grep -qx $'eth0\t256\t256' "$STATE_DIR/nic-ring.before" || fail 'exit-80 apply did not record initial ring settings'
+
+  for ring_rc in 1 81; do
+    STATE_DIR="$TEST_DIR/ring-err-$ring_rc"; mkdir -p "$STATE_DIR"
+    printf '256 256\n' > "$TEST_DIR/ring-hw"
+    if apply_nic_ring; then fail "ethtool -G exit $ring_rc was swallowed as success"; fi
+  done
+
+  # Post-reboot restore: hardware already reset to 256/256 where ethtool -G would return 80.
+  STATE_DIR="$TEST_DIR/ring-exit80"
+  printf '256 256\n' > "$TEST_DIR/ring-hw"
+  ethtool() {
+    local rx tx
+    if [[ "$1" == -g ]]; then
+      [[ "${LC_ALL:-}" == C ]] || fail 'restore_nic_ring ethtool -g must run under LC_ALL=C'
+      read -r rx tx < "$TEST_DIR/ring-hw"
+      printf 'Current hardware settings:\nRX: %s\nTX: %s\n' "$rx" "$tx"
+    elif [[ "$1" == -G ]]; then
+      return 80
+    fi
+  }
+  restore_nic_ring || fail 'post-reboot NIC ring restore failed when hardware already matched snapshot'
+
+  # Restore where hardware differs, ethtool -G updates and exits 80 vs 81.
+  ethtool() {
+    local rx tx
+    if [[ "$1" == -g ]]; then
+      read -r rx tx < "$TEST_DIR/ring-hw"
+      printf 'Current hardware settings:\nRX: %s\nTX: %s\n' "$rx" "$tx"
+    elif [[ "$1" == -G ]]; then
+      printf '%s %s\n' "$4" "$6" > "$TEST_DIR/ring-hw"
+      return "$ring_rc"
+    fi
+  }
+  printf '1024 1024\n' > "$TEST_DIR/ring-hw"; ring_rc=81
+  if restore_nic_ring; then fail 'restore_nic_ring swallowed hardware error exit 81'; fi
+  printf '1024 1024\n' > "$TEST_DIR/ring-hw"; ring_rc=80
+  restore_nic_ring || fail 'restore_nic_ring rejected exit 80 with matching read-back'
+)
+
+test_apply_nic_only_preserves_clean_and_existing_state() (
+  # shellcheck disable=SC2034
+  {
+    STATE_DIR="$TEST_DIR/nic-only-noop"; BACKUP_DIR="$STATE_DIR/backup"
+    BBR_FILE="$TEST_DIR/bbr"; BBR_MODULE_FILE="$TEST_DIR/mod"
+    SYSCTL_FILE="$TEST_DIR/sys"; LIMITS_FILE="$TEST_DIR/lim"; GAI_FILE="$TEST_DIR/gai"
+  }
+  default_interface() { printf 'eth0\n'; }
+  ensure_ethtool() { return 1; }
+  adaptive_cpu_count() { printf '1\n'; }
+  show_nic_dashboard() {
+    (($# == 0)) || fail 'show_nic_dashboard received unexpected arguments'
+  }
+  apply_nic_only || fail 'zero-change apply_nic_only failed'
+  [[ ! -e "$STATE_DIR" ]] || fail 'zero-change apply_nic_only polluted STATE_DIR'
+
+  # Existing tuning baseline must survive both no-op and failed menu-4 NIC attempts.
+  mkdir -p "$BACKUP_DIR"
+  printf 'net.ipv4.tcp_moderate_rcvbuf=0\n' > "$STATE_DIR/original-values"
+  printf '# original sysctl\n' > "$BACKUP_DIR/sysctl-file"
+  apply_nic_only || fail 'no-op apply_nic_only failed with existing state'
+  [[ -f "$STATE_DIR/original-values" && -f "$BACKUP_DIR/sysctl-file" ]] || fail 'no-op apply_nic_only damaged existing state'
+
+  ensure_ethtool() { return 0; }
+  network_interfaces() { printf 'eth0\n'; }
+  ethtool() {
+    if [[ "$1" == -g ]]; then
+      printf 'Pre-set maximums:\nRX: 1024\nTX: 1024\nCurrent hardware settings:\nRX: 256\nTX: 256\n'
+    else
+      return 1
+    fi
+  }
+  if apply_nic_only; then fail 'failing NIC ring write succeeded in apply_nic_only'; fi
+  grep -qx 'net.ipv4.tcp_moderate_rcvbuf=0' "$STATE_DIR/original-values" || fail 'failed apply_nic_only destroyed prior original-values'
+  grep -qx '# original sysctl' "$BACKUP_DIR/sysctl-file" || fail 'failed apply_nic_only destroyed prior sysctl backup'
+  [[ ! -e "$STATE_DIR/nic-ring-changed" && ! -e "$STATE_DIR/nic-ring.before" ]] || fail 'failed apply_nic_only leaked transient NIC ring markers'
 )
 
 test_mss_check_failure_is_not_absence() (
@@ -142,7 +266,7 @@ test_mss_absent_rule_is_success() (
 )
 
 failures=0
-for test in test_mss_check_failure_is_not_absence test_mss_absent_rule_is_success test_restore_reports_failure test_rollback_retains_failed_backup test_failed_apply_never_succeeds test_ring_original_saved_once test_single_cpu_skips_rps test_restore_verifies_readback test_missing_metadata_preserves_file test_dangling_backup_preserved test_saved_values_not_overwritten test_failed_snapshot_keeps_original test_cpu_mask_uses_allowed_ids; do
+for test in test_mss_check_failure_is_not_absence test_mss_absent_rule_is_success test_restore_reports_failure test_rollback_retains_failed_backup test_failed_apply_never_succeeds test_ring_original_saved_once test_ring_noop_and_exit_80 test_apply_nic_only_preserves_clean_and_existing_state test_single_cpu_skips_rps test_restore_verifies_readback test_missing_metadata_preserves_file test_dangling_backup_preserved test_saved_values_not_overwritten test_failed_snapshot_keeps_original test_cpu_mask_uses_allowed_ids; do
   if "$test"; then printf 'PASS: %s\n' "$test"; else failures=$((failures + 1)); fi
 done
 [[ "$failures" == 0 ]]

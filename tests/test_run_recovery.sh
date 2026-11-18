@@ -154,7 +154,27 @@ PY
   tuning_run_restore || fail 'retry rejected the tool-owned restored inode'
   cmp -s "$SYSCTL_FILE" "$CASE_DIR/original.conf" || fail 'retry changed restored bytes'
 )
-for test in test_external_edit_between_restore_steps_is_preserved test_restoration_checkpoint_failure_is_retryable; do
+test_managed_file_removal_and_restore() (
+  setup
+  printf '# Managed by netpilot.sh.\nnet.core.default_qdisc = fq\nnet.ipv4.tcp_congestion_control = bbr\n' > "$BBR_FILE"
+  printf '# Managed by netpilot.sh.\ntcp_bbr\n' > "$BBR_MODULE_FILE"
+  chmod 0644 "$BBR_FILE" "$BBR_MODULE_FILE"
+  cp -p "$BBR_FILE" "$CASE_DIR/original-bbr.conf"
+  cp -p "$BBR_MODULE_FILE" "$CASE_DIR/original-module.conf"
+  tuning_run_begin "$CASE_DIR/run"
+  tuning_run_file_remove "$BBR_FILE"
+  rm -f -- "$BBR_FILE"
+  tuning_run_record file "$BBR_FILE"
+  tuning_run_file_remove "$BBR_MODULE_FILE"
+  rm -f -- "$BBR_MODULE_FILE"
+  tuning_run_record file "$BBR_MODULE_FILE"
+  tuning_run_validate
+  tuning_run_restore
+  cmp -s "$BBR_FILE" "$CASE_DIR/original-bbr.conf" || fail 'removed BBR config was not restored'
+  cmp -s "$BBR_MODULE_FILE" "$CASE_DIR/original-module.conf" || fail 'removed BBR module config was not restored'
+  grep -Fxq 'net.ipv4.tcp_congestion_control=cubic' "$STATE_DIR/original-values" || fail 'first-ever baseline changed'
+)
+for test in test_external_edit_between_restore_steps_is_preserved test_restoration_checkpoint_failure_is_retryable test_managed_file_removal_and_restore; do
   "$test"
   printf 'PASS: %s\n' "$test"
 done

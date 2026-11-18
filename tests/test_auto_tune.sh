@@ -907,7 +907,86 @@ PY
   done
 )
 
+test_stale_persisted_keys_and_bbr_transitions() (
+  # 1. Stale lower buffer ceiling in 99-netpilot.conf must sync to retained runtime ceiling and pass verify_tuning.
+  setup_case stale-low-ceiling
+  printf '# Managed by netpilot.sh.\nnet.core.rmem_max = 4194304\n' > "$SYSCTL_FILE"
+  cp "$SYSCTL_FILE" "$CASE_DIR/original.conf"
+  printf '16777216\n' > "$KERNEL_DIR/net.core.rmem_max"
+  cp "$KERNEL_DIR/net.core.rmem_max" "$CASE_DIR/original-kernel/net.core.rmem_max"
+  main --lang en tune < /dev/null > "$CASE_DIR/output" 2>&1 || fail 'stale lower ceiling in 99-netpilot.conf broke auto_tune verification'
+  [[ "$(cat "$KERNEL_DIR/net.core.rmem_max")" == 16777216 ]] || fail 'retained runtime ceiling was lowered'
+  grep -qx 'net.core.rmem_max = 16777216' "$SYSCTL_FILE" || fail '99-netpilot.conf kept stale lower ceiling'
+  fixture_verify_tuning > "$CASE_DIR/verify-stale" || fail 'persisted config still drifts after syncing retained ceiling'
+
+  # On retest failure, tuning_run_restore must restore the pre-run 99-netpilot.conf bytes.
+  setup_case stale-low-ceiling-restore
+  printf '# Managed by netpilot.sh.\nnet.core.rmem_max = 4194304\n' > "$SYSCTL_FILE"
+  cp "$SYSCTL_FILE" "$CASE_DIR/original.conf"
+  printf '16777216\n' > "$KERNEL_DIR/net.core.rmem_max"
+  cp "$KERNEL_DIR/net.core.rmem_max" "$CASE_DIR/original-kernel/net.core.rmem_max"
+  install -d -m 0700 "$STATE_DIR" "$BACKUP_DIR"
+  printf 'net.core.rmem_max=212992\n' > "$STATE_DIR/original-values"
+  chmod 0600 "$STATE_DIR/original-values"
+  cp "$SYSCTL_FILE" "$BACKUP_DIR/sysctl-file"
+  AUTO_SCENARIO=after_failure
+  if main --lang en tune < /dev/null > "$CASE_DIR/output" 2>&1; then fail 'failed retest reported completion'; fi
+  cmp -s "$SYSCTL_FILE" "$CASE_DIR/original.conf" || fail 'run restore did not restore pre-run sysctl file'
+  [[ "$(cat "$KERNEL_DIR/net.core.rmem_max")" == 16777216 ]] || fail 'run restore altered retained runtime ceiling'
+
+  # 2. Menu 2 BBR followed by auto_tune selecting CUBIC (and regression recovery).
+  local outcome
+  for outcome in success regression; do
+    setup_case "menu2-select-cubic-$outcome"
+    apply_bbr_only > "$CASE_DIR/bbr-apply" 2>&1 || fail 'menu 2 BBR setup failed'
+    [[ -f "$BBR_FILE" && -f "$BBR_MODULE_FILE" && -f "$SYSCTL_FILE" ]] || fail 'menu 2 did not create BBR persistence'
+    cp -p "$BBR_FILE" "$CASE_DIR/pre-bbr.conf"
+    cp -p "$BBR_MODULE_FILE" "$CASE_DIR/pre-mod.conf"
+    cp -p "$SYSCTL_FILE" "$CASE_DIR/pre-sys.conf"
+    : > "$CASE_DIR/writes"; : > "$CASE_DIR/trace"; : > "$CASE_DIR/verify-calls"
+    AUTO_SELECTION=selected
+    AUTO_EXPECT_CC=cubic; AUTO_EXPECT_QDISC=fq
+    [[ "$outcome" == success ]] || AUTO_SCENARIO=regression
+    if [[ "$outcome" == success ]]; then
+      main --lang en tune < /dev/null > "$CASE_DIR/output" 2>&1 || fail 'selecting CUBIC after menu 2 BBR failed'
+      [[ "$(cat "$KERNEL_DIR/net.ipv4.tcp_congestion_control")" == cubic ]] || fail 'selected CUBIC was not applied'
+      [[ ! -e "$BBR_FILE" && ! -e "$BBR_MODULE_FILE" ]] || fail 'stale BBR config or module file remained after switching to CUBIC'
+      fixture_verify_tuning > "$CASE_DIR/verify-cubic" || fail 'verify_tuning failed after switching from BBR to CUBIC'
+      run_mutation rollback_tuning > "$CASE_DIR/rollback" 2>&1 || fail 'first-ever rollback failed after BBR->CUBIC transition'
+      assert_restored
+    else
+      if main --lang en tune < /dev/null > "$CASE_DIR/output" 2>&1; then fail 'confirmed regression reported completion'; fi
+      [[ "$(cat "$KERNEL_DIR/net.ipv4.tcp_congestion_control")" == bbr ]] || fail 'regression recovery did not restore current-run BBR'
+      cmp -s "$BBR_FILE" "$CASE_DIR/pre-bbr.conf" || fail 'regression recovery did not restore 10-netpilot-bbr.conf'
+      cmp -s "$BBR_MODULE_FILE" "$CASE_DIR/pre-mod.conf" || fail 'regression recovery did not restore BBR module file'
+      cmp -s "$SYSCTL_FILE" "$CASE_DIR/pre-sys.conf" || fail 'regression recovery did not restore 99-netpilot.conf'
+    fi
+  done
+
+  # 3. Menu 2 BBR overridden on reboot to CUBIC/fq_codel, then auto_tune retains CUBIC (including zero runtime changes).
+  local mode
+  for mode in buffer-change runtime-noop; do
+    setup_case "menu2-reboot-override-$mode"
+    apply_bbr_only > "$CASE_DIR/bbr-apply" 2>&1 || fail 'menu 2 BBR setup failed'
+    printf 'cubic\n' > "$KERNEL_DIR/net.ipv4.tcp_congestion_control"
+    printf 'fq_codel\n' > "$KERNEL_DIR/net.core.default_qdisc"
+    if [[ "$mode" == runtime-noop ]]; then
+      printf '1\n' > "$KERNEL_DIR/net.ipv4.tcp_moderate_rcvbuf"
+      printf '134217728\n' > "$KERNEL_DIR/net.core.rmem_max"
+      printf '134217728\n' > "$KERNEL_DIR/net.core.wmem_max"
+      printf '4096 131072 134217728\n' > "$KERNEL_DIR/net.ipv4.tcp_rmem"
+      printf '4096 16384 134217728\n' > "$KERNEL_DIR/net.ipv4.tcp_wmem"
+    fi
+    : > "$CASE_DIR/writes"; : > "$CASE_DIR/trace"; : > "$CASE_DIR/verify-calls"
+    main --lang en tune < /dev/null > "$CASE_DIR/output" 2>&1 || fail "reboot-overridden BBR state broke auto_tune ($mode)"
+    [[ ! -e "$BBR_FILE" && ! -e "$BBR_MODULE_FILE" ]] || fail "stale BBR files remained after retaining rebooted CUBIC ($mode)"
+    grep -qx 'net.ipv4.tcp_congestion_control = cubic' "$SYSCTL_FILE" || fail "99-netpilot.conf was not synced to retained CUBIC ($mode)"
+    fixture_verify_tuning > "$CASE_DIR/verify-reboot" || fail "verify_tuning failed after syncing rebooted CUBIC ($mode)"
+  done
+)
+
 failures=0
+if test_stale_persisted_keys_and_bbr_transitions; then printf 'PASS: test_stale_persisted_keys_and_bbr_transitions\n'; else failures=$((failures+1)); fi
 if test_individual_skips_do_not_skip_other_changes; then printf 'PASS: test_individual_skips_do_not_skip_other_changes\n'; else failures=$((failures+1)); fi
 if test_http_rejection_stops_before_application; then printf 'PASS: test_http_rejection_stops_before_application\n'; else failures=$((failures+1)); fi
 if test_retest_reserve_required_before_apply; then printf 'PASS: test_retest_reserve_required_before_apply\n'; else failures=$((failures+1)); fi

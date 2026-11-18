@@ -5,7 +5,7 @@ ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 SCRIPT="${SCRIPT_OVERRIDE:-$ROOT/netpilot.sh}"
 python3 - "$SCRIPT" <<'PY'
 from pathlib import Path
-import copy, json, subprocess, sys, tempfile
+import copy, json, os, subprocess, sys, tempfile
 
 script = str(Path(sys.argv[1]).resolve())
 temporary = tempfile.TemporaryDirectory()
@@ -244,5 +244,57 @@ assert result.returncode == 0, result.stderr
 assert 'Report updated:' in result.stdout and 'Historical run record' in result.stdout, result.stdout
 assert 'Report updated:' not in read(valid[12]).stdout
 print('PASS: readable results identify a dated historical snapshot without changing JSON output')
+
+# Loopback HTTP endpoint parity, 128-character node boundary and Python 3.7+ guard.
+source_text = Path(script).read_text()
+auto_py = source_text.split('auto_report() {\n', 1)[1].split("<<'PY'\n", 1)[1].split('\nPY\n', 1)[0]
+for raw, expected in [
+    ('http://127.0.0.1:8080', 'http://127.0.0.1:8080'),
+    ('http://127.0.0.2:8080', 'http://127.0.0.2:8080'),
+    ('http://127.255.255.254:9000/', 'http://127.255.255.254:9000'),
+    ('http://[::1]:8080', 'http://[::1]:8080'),
+    ('http://[0:0:0:0:0:0:0:1]:8080', 'http://[0:0:0:0:0:0:0:1]:8080'),
+    ('http://LOCALHOST:8080/', 'http://localhost:8080'),
+]:
+    res = subprocess.run([sys.executable, '-', 'endpoint', raw, 'en'], input=auto_py, text=True, capture_output=True)
+    assert res.returncode == 0 and res.stdout.strip() == expected, (raw, res.stdout, res.stderr)
+
+for bad in [
+    'http://0.0.0.0:8080',
+    'http://[::]:8080',
+    'http://[::ffff:127.0.0.1]:8080',
+    'http://192.168.1.1:8080',
+    'http://127.0.0.1:8080/path',
+    'http://user@127.0.0.1:8080',
+]:
+    res = subprocess.run([sys.executable, '-', 'endpoint', bad, 'en'], input=auto_py, text=True, capture_output=True)
+    assert res.returncode != 0, ('accepted non-loopback or invalid endpoint', bad)
+
+for node_len, ok in [(0, False), (1, True), (64, True), (65, True), (128, True), (129, False)]:
+    sample = copy.deepcopy(base['before'])
+    sample.update(endpoint='http://127.0.0.2:8080', address='127.0.0.2', port=8080, node='n' * node_len)
+    sample_path = root / ('node-%d.json' % node_len)
+    sample_path.write_text(json.dumps(sample))
+    res = subprocess.run([sys.executable, '-', 'payload', str(sample_path), 'en'], input=auto_py, text=True, capture_output=True)
+    assert (res.returncode == 0) == ok, (node_len, ok, res.stderr)
+
+import re as _re
+py_blocks = _re.findall(r"<<'(PY[A-Z]*)'[^\n]*\n(.*?)\n\1\b", source_text, _re.S)
+assert len(py_blocks) >= 7, len(py_blocks)
+for _, block_code in py_blocks:
+    for lang, marker in [('zh', '需要 Python 3.7 或更高版本。'), ('en', 'Python 3.7 or newer is required.')]:
+        res = subprocess.run([sys.executable, '-', 'x', 'y', lang],
+                             input='import sys\nsys.version_info = (3, 6, 8)\n' + block_code,
+                             text=True, capture_output=True, env=dict(os.environ, NETPILOT_LANG=lang))
+        assert res.returncode == 1 and marker in res.stderr, (lang, res.returncode, res.stderr)
+
+# Positional language argument ('zh'/'en') must take precedence over NETPILOT_LANG.
+res_zh = subprocess.run([sys.executable, '-', 'endpoint', 'http://192.168.1.1:8080', 'zh'],
+                        input=auto_py, text=True, capture_output=True, env=dict(os.environ, NETPILOT_LANG='en'))
+assert res_zh.returncode == 1 and '自动调优数据或报告无效：' in res_zh.stderr, res_zh.stderr
+res_en = subprocess.run([sys.executable, '-', 'endpoint', 'http://192.168.1.1:8080', 'en'],
+                        input=auto_py, text=True, capture_output=True, env=dict(os.environ, NETPILOT_LANG='zh'))
+assert res_en.returncode == 1 and 'Invalid automatic tuning data or report:' in res_en.stderr, res_en.stderr
+print('PASS: loopback HTTP endpoints, 128-character node limit and Python 3.7+ checks are enforced consistently')
 temporary.cleanup()
 PY

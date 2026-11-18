@@ -110,7 +110,7 @@ netpilot report --json
 
 `diagnose` 不带参数看累计值，`--seconds` 范围 1–60；重传计数不是端到端丢包率。子菜单操作后返回主菜单。
 
-`netpilot menu` 打开菜单，`netpilot help` 或 `netpilot COMMAND --help` 查看帮助，`netpilot install` 显式安装。
+`netpilot menu` 打开菜单，`netpilot help` 或 `netpilot COMMAND --help` 查看帮助，`netpilot install` 显式安装（从下载副本执行 `install`——含首次安装——会在安装后打开交互菜单；从已安装路径执行仅确认快捷命令）。
 
 ### 语言设置
 
@@ -216,6 +216,8 @@ netpilot compare before.json after.json
 
 恢复失败会保留备份。仅卸载后，重新运行在线命令并选 `5`，可用保留的备份恢复；回滚范围为 NetPilot 管理的变更。
 
+Debian/Ubuntu 等系统中，`/etc/sysctl.d/99-sysctl.conf`（指向 `/etc/sysctl.conf`）按字典序晚于 `99-netpilot.conf` 加载；若 `/etc/sysctl.conf` 含有同名参数，重启后可能覆盖持久配置，并被 `netpilot verify` 检出偏离。
+
 旧版报告可用 `netpilot report --report-dir /var/log/netpilot` 查看，卸载时也清理可识别的工具报告；混有其他文件的运行目录会保留并提示。
 
 ### 环境要求
@@ -223,12 +225,12 @@ netpilot compare before.json after.json
 | 功能 | 依赖 |
 |---|---|
 | 基础运行 | Linux、Bash 4+、`sysctl`、`awk`；在线入口需 `curl`。 |
-| 修改配置与程序维护 | root、`flock`；清理已有报告需 `python3`。 |
-| 自动调优 | `python3`、GNU `timeout`。 |
+| 修改配置与程序维护 | root、`flock`；清理已有报告需 `python3`（Python 3.7+）。 |
+| 自动调优 | `python3`（Python 3.7+）、GNU `timeout`。 |
 | 诊断 / 网卡设置 | `ip`、`tc` / `ethtool`。 |
 | 手动测延迟 | `ping`、GNU `timeout`。 |
-| 查看报告 | `python3`、相应读取权限。 |
-| 独立测速 / 比较 | `iperf3`（测速）、`python3`、GNU `timeout`（测速）；延迟采样另需 `ping`。 |
+| 查看报告 | `python3`（Python 3.7+）、相应读取权限。 |
+| 独立测速 / 比较 | `iperf3`（测速）、`python3`（Python 3.7+）、GNU `timeout`（测速）；延迟采样另需 `ping`。 |
 
 依赖按所选功能安装，缺项会提示。受限容器或特殊内核可能只支持部分功能。
 
@@ -241,6 +243,6 @@ bash -n netpilot.sh
 bash tests/run.sh
 ```
 
-套件需 `iperf3`、`python3`、`ping`、`timeout`、`ss`、`shellcheck`。`tests/*_cli_integration.sh` 和 `tests/linux_apply_integration.sh` 单独运行；后者需可写的网络命名空间 sysctl 与相应权限，重启持久化另行验证。
+套件需 `iperf3`、`python3`（Python 3.7+）、`ping`、`timeout`、`ss`、`shellcheck`。`tests/*_cli_integration.sh` 和 `tests/linux_apply_integration.sh` 单独运行；后者需可写的网络命名空间 sysctl 与相应权限，重启持久化另行验证。
 
 [更新记录](./CHANGELOG.md)

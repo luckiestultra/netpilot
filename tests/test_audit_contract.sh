@@ -62,6 +62,21 @@ for cmd in doctor status verify; do
   fi
 done
 
+# Uninstall must never invoke resolve_source_path (offline process substitution).
+(
+  source "$SCRIPT"
+  need_root() { :; }
+  need_command() { :; }
+  resolve_source_path() { printf 'resolved\n' > "$TMP/uninstall-resolved"; return 1; }
+  run_mutation() { printf '%s\n' "$*" > "$TMP/dispatched"; }
+  main uninstall --rollback
+) > "$TMP/out" 2>&1
+rc=$?
+checks=$((checks + 1))
+if [[ $rc != 0 || -e "$TMP/uninstall-resolved" || "$(cat "$TMP/dispatched" 2>/dev/null)" != 'uninstall_own_script --rollback' ]]; then
+  fail "uninstall must dispatch directly without resolve_source_path (rc=$rc)"
+fi
+
 for cmd in plan apply; do
   rm -f -- "$TMP/prepared"
   (

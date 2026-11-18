@@ -110,7 +110,7 @@ Submenu under main-menu `8`:
 
 Without arguments, `diagnose` shows cumulative counters; `--seconds` accepts 1–60. Retransmission counts are not end-to-end loss rates. Submenu operations return to the main menu.
 
-`netpilot menu` opens the menu; `netpilot help` or `netpilot COMMAND --help` shows help; `netpilot install` explicitly installs the script.
+`netpilot menu` opens the menu; `netpilot help` or `netpilot COMMAND --help` shows help; `netpilot install` explicitly installs the script (running `install` from a downloaded copy—including the first install—opens the interactive menu after installation; running from the installed path only ensures the shortcut).
 
 ### Language settings
 
@@ -216,6 +216,8 @@ Automatic tuning uses a separate snapshot to restore only this run's changes. Me
 
 Restore failures retain backups. After program-only removal, run the online command again and choose `5` to restore from retained records. Rollback covers changes managed by NetPilot.
 
+On Debian/Ubuntu and similar systems, `/etc/sysctl.d/99-sysctl.conf` (pointing to `/etc/sysctl.conf`) loads lexicographically after `99-netpilot.conf`; if `/etc/sysctl.conf` defines the same parameters, a reboot may override persistent settings and cause `netpilot --lang en verify` to report drift.
+
 View older reports with `netpilot --lang en report --report-dir /var/log/netpilot`. Uninstall also cleans recognized NetPilot reports there; run directories containing other files are kept with a warning.
 
 ### Requirements
@@ -223,12 +225,12 @@ View older reports with `netpilot --lang en report --report-dir /var/log/netpilo
 | Function | Dependencies |
 |---|---|
 | Basic operation | Linux, Bash 4+, `sysctl`, `awk`; online startup needs `curl`. |
-| Configuration changes and maintenance | root, `flock`; cleaning existing reports needs `python3`. |
-| Automatic tuning | `python3`, GNU `timeout`. |
+| Configuration changes and maintenance | root, `flock`; cleaning existing reports needs `python3` (Python 3.7+). |
+| Automatic tuning | `python3` (Python 3.7+), GNU `timeout`. |
 | Diagnostics / NIC settings | `ip`, `tc` / `ethtool`. |
 | Manual latency probes | `ping`, GNU `timeout`. |
-| View reports | `python3` and read permission. |
-| Separate benchmarks / comparison | `iperf3` (measurement), `python3`, GNU `timeout` (measurement); latency sampling needs `ping`. |
+| View reports | `python3` (Python 3.7+) and read permission. |
+| Separate benchmarks / comparison | `iperf3` (measurement), `python3` (Python 3.7+), GNU `timeout` (measurement); latency sampling needs `ping`. |
 
 Install dependencies for the selected function; missing ones are reported. Restricted containers or special kernels may support only some functions.
 
@@ -241,6 +243,6 @@ bash -n netpilot.sh
 bash tests/run.sh
 ```
 
-The suite needs `iperf3`, `python3`, `ping`, `timeout`, `ss` and `shellcheck`. Run `tests/*_cli_integration.sh` and `tests/linux_apply_integration.sh` separately; the latter needs writable network-namespace sysctls and appropriate permissions. Verify reboot persistence separately.
+The suite needs `iperf3`, `python3` (Python 3.7+), `ping`, `timeout`, `ss` and `shellcheck`. Run `tests/*_cli_integration.sh` and `tests/linux_apply_integration.sh` separately; the latter needs writable network-namespace sysctls and appropriate permissions. Verify reboot persistence separately.
 
 [Changelog](./CHANGELOG.md)

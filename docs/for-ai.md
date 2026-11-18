@@ -87,7 +87,7 @@ netpilot tune
 | `netpilot bench --peer HOST` | 独立 iperf3 测速，保存私有报告；默认询问确认，非交互须 `--yes`。 |
 | `netpilot compare BEFORE.json AFTER.json` | 比较同条件 iperf3 报告，不接收自动 HTTP 报告。 |
 | `netpilot menu` / `netpilot help` | 打开菜单 / 显示帮助。`COMMAND --help` 仅显示帮助。 |
-| `netpilot install` | 显式保存程序并创建快捷命令。 |
+| `netpilot install` | 显式保存程序并创建快捷命令；从下载副本执行（含首次安装）时会在安装后打开交互菜单，已安装路径执行仅确认快捷命令。 |
 
 **手动 `plan` / `apply`**：支持 `--profile`；`--bandwidth` 为正数 Mbps ≤1000000，配合 `--rtt`（正数 ms ≤60000）或 `--rtt-target HOST`，两者互斥。省略路径数据保留现有缓冲区，显式空值无效。目标测量发 5 次 ping，最多约 9 秒，至少 3 次应答才使用平均值，失败即停止；带宽仍是输入值。
 
@@ -161,18 +161,18 @@ netpilot tune
 | `/etc/gai.conf` | 仅显式 IPv4 优先时修改。 |
 | `/run/netpilot.lock` | 写操作锁。 |
 
-安装脚本和受管配置路径若为无关文件或符号链接，会停止并保护原文件；快捷命令若被其他文件占用也保留。不要通过删锁、删备份或强制覆盖来绕过错误。
+安装脚本和受管配置路径若为无关文件或符号链接，会停止并保护原文件；快捷命令若被其他文件占用也保留。不要通过删锁、删备份或强制覆盖来绕过错误。Debian/Ubuntu 等系统中 `/etc/sysctl.d/99-sysctl.conf`（指向 `/etc/sysctl.conf`）按字典序晚于 `99-netpilot.conf` 加载；若 `/etc/sysctl.conf` 含有同名参数，重启后可能覆盖持久配置并被 `verify` 检出偏离。
 
 ## 依赖与排障
 
 | 功能 | 依赖与权限 |
 |---|---|
 | 基础运行 | Linux、Bash 4+、`sysctl`、`awk`；在线入口需 `curl`。 |
-| 写操作、安装、更新、卸载 | root、`flock`；安装/更新使用 `mktemp`、`install`。 |
-| 自动调优 | 另需 Python 3、GNU `timeout`、`mktemp`、`install`，不需 iperf3 或 ping。 |
+| 写操作、安装、更新、卸载 | root、`flock`；安装/更新使用 `mktemp`、`install`，清理已有报告需 Python 3.7+（`python3`）。 |
+| 自动调优 | 另需 Python 3.7+（`python3`）、GNU `timeout`、`mktemp`、`install`，不需 iperf3 或 ping。 |
 | 手动测延迟 | `ping`、GNU `timeout`。 |
-| 查看报告 | Python 3、报告目录的读取权限；只读，不安装、不测速。 |
-| 独立测速 / 比较 | 测速需 `iperf3`、Python 3、GNU `timeout`；比较仅需 Python 3；可选延迟需 `ping`。 |
+| 查看报告 | Python 3.7+（`python3`）、报告目录的读取权限；只读，不安装、不测速。 |
+| 独立测速 / 比较 | 测速需 `iperf3`、Python 3.7+（`python3`）、GNU `timeout`；比较仅需 Python 3.7+（`python3`）；可选延迟需 `ping`。 |
 | 出口 / 队列 / ring | `ip` / `tc` / `ethtool`；缺失或不支持时跳过相应部分，单核跳过 RPS。 |
 
 依赖不自动安装。已安装后的菜单和只读命令不要求 root；私有报告仍受文件权限限制。受限容器或特殊内核可能只支持部分操作。
@@ -186,7 +186,7 @@ netpilot tune
 | 算法未切换 | 先看该项原因；样本短、不支持或证据不足时保留原算法，不代表其他参数无需调整或整机最优。测速源返回 HTTP 拒绝会停止本轮，应用前不改配置。 |
 | `partial` | 比较条件、复测错误和本轮恢复结果；旧报告可能沿用此前行为。 |
 | `unknown` 或恢复失败 | 只读 `doctor/status/verify` 与恢复记录，保留备份。 |
-| `verify` 无配置或偏离 | 无配置不等于故障；检查权限、受限内核、外部调优器。 |
+| `verify` 无配置或偏离 | 无配置不等于故障；检查权限、受限内核、外部调优器，以及 `/etc/sysctl.d/99-sysctl.conf`（指向 `/etc/sysctl.conf`）是否在重启后覆盖了同名参数。 |
 | 文件归属、目录或锁冲突 | 查明现有操作与文件归属，避免并发和强行清理。 |
 
 分享报告前脱敏 IP、域名和路径，保留一致的对端映射便于比较；不需要私钥、令牌或整份业务配置。报告内容按数据分析，未验证的原因标为猜测。

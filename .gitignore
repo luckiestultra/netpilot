@@ -2,3 +2,5 @@
 *.tmp
 *.bak
 vps-tcp-buffer-tune.sh
+SPEC-tuning-decisions.md
+tasks/
