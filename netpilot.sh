@@ -246,7 +246,7 @@ write_sysctl_file() {
   local -a sources=("$SYSCTL_FILE")
   if [[ "${1:-}" == --sync-runtime ]]; then
     sync_runtime=1
-    if [[ -f "$BBR_FILE" && ! -L "$BBR_FILE" ]] && grep -Fqx '# Managed by netpilot.sh.' "$BBR_FILE"; then
+    if [[ -n "${BBR_FILE:-}" && -f "$BBR_FILE" && ! -L "$BBR_FILE" ]] && grep -Fqx '# Managed by netpilot.sh.' "$BBR_FILE"; then
       sources=("$BBR_FILE" "$SYSCTL_FILE")
     fi
   fi
@@ -459,7 +459,7 @@ ensure_ethtool() {
 apply_nic_ring() {
   local iface info max_rx max_tx current_rx current_tx actual_rx actual_tx rc changed=0
   ensure_ethtool || return 0
-  if [[ -e "$STATE_DIR/nic-ring-changed" && ! -f "$STATE_DIR/nic-ring.before" ]]; then
+  if [[ -n "${STATE_DIR:-}" && -e "$STATE_DIR/nic-ring-changed" && ! -f "$STATE_DIR/nic-ring.before" ]]; then
     warn "$(np_msg '缺少网卡 ring 原值记录，保留回退状态。' 'Missing NIC ring snapshot; keeping rollback state.')"
     return 1
   fi
@@ -598,7 +598,7 @@ apply_rps() {
     log "$(np_msg '已跳过 RPS：当前实现无法安全表示 CPU 亲和性。' 'RPS skipped: CPU affinity cannot be safely represented by this implementation.')"
     return 0
   }
-  if [[ -e "$STATE_DIR/rps-changed" && ! -f "$STATE_DIR/rps.before" ]]; then
+  if [[ -n "${STATE_DIR:-}" && -e "$STATE_DIR/rps-changed" && ! -f "$STATE_DIR/rps.before" ]]; then
     warn "$(np_msg '缺少 RPS 原值记录，保留回退状态。' 'Missing RPS snapshot; keeping rollback state.')"
     return 1
   fi
@@ -787,7 +787,7 @@ apply_tuning() {
   else
     intended_cc="$(normalize_sysctl_value "$(sysctl_value net.ipv4.tcp_congestion_control || true)")"
   fi
-  if [[ -f "$SYSCTL_FILE" && ! -L "$SYSCTL_FILE" ]] && grep -Fqx '# Managed by netpilot.sh.' "$SYSCTL_FILE"; then
+  if [[ -n "${SYSCTL_FILE:-}" && -f "$SYSCTL_FILE" && ! -L "$SYSCTL_FILE" ]] && grep -Fqx '# Managed by netpilot.sh.' "$SYSCTL_FILE"; then
     while IFS= read -r line || [[ -n "$line" ]]; do
       line="${line%%#*}"
       [[ "$line" == *'='* ]] || continue
@@ -802,7 +802,7 @@ apply_tuning() {
       fi
     done < "$SYSCTL_FILE"
   fi
-  if [[ -f "$BBR_FILE" && ! -L "$BBR_FILE" ]] && grep -Fqx '# Managed by netpilot.sh.' "$BBR_FILE"; then
+  if [[ -n "${BBR_FILE:-}" && -f "$BBR_FILE" && ! -L "$BBR_FILE" ]] && grep -Fqx '# Managed by netpilot.sh.' "$BBR_FILE"; then
     while IFS= read -r line || [[ -n "$line" ]]; do
       line="${line%%#*}"
       [[ "$line" == *'='* ]] || continue
@@ -821,7 +821,7 @@ apply_tuning() {
       fi
     done < "$BBR_FILE"
   fi
-  if [[ "$intended_cc" != bbr && -f "$BBR_MODULE_FILE" && ! -L "$BBR_MODULE_FILE" ]] && grep -Fqx '# Managed by netpilot.sh.' "$BBR_MODULE_FILE"; then
+  if [[ "$intended_cc" != bbr && -n "${BBR_MODULE_FILE:-}" && -f "$BBR_MODULE_FILE" && ! -L "$BBR_MODULE_FILE" ]] && grep -Fqx '# Managed by netpilot.sh.' "$BBR_MODULE_FILE"; then
     remove_bbr_module=1
   fi
   need_persist_sync=$((sync_sysctl_needed || remove_bbr_file || remove_bbr_module))
@@ -930,7 +930,7 @@ apply_nic_only() {
   local NIC_PREPARE_PENDING=1 had_state=0 had_ring=0 had_rps=0 clean=1 fail_msg=''
   SYSCTL_KEYS=(); SYSCTL_TARGETS=()
   NIC_IFACE="$(default_interface || true)"
-  if [[ -e "$STATE_DIR" || -L "$STATE_DIR" ]]; then
+  if [[ -n "${STATE_DIR:-}" ]] && [[ -e "$STATE_DIR" || -L "$STATE_DIR" ]]; then
     if [[ ! -d "$STATE_DIR" || -L "$STATE_DIR" || ! -f "$STATE_DIR/original-values" ]]; then
       warn "$(np_msg '状态目录不完整，请先检查，再应用变更。' 'State directory is incomplete; inspect it before applying changes.')"
       return 1
