@@ -121,6 +121,7 @@ if bench_command --peer localhost --output "$TEST_DIR/symlink.json" --yes >/dev/
 # Simulate a concurrent directory creation after output preflight but before publish.
 race_output="$TEST_DIR/raced-output"
 (
+  trap - EXIT
   ln() {
     local destination="${*: -1}"
     [[ "$destination" != "$race_output" ]] || mkdir -p -- "$destination"
