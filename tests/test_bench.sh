@@ -115,18 +115,19 @@ p=sys.argv[1]; d=json.load(open(p)); d['peer']='other.example'; json.dump(d,open
 PY
 if bench_compare "$TEST_DIR/before.json" "$TEST_DIR/after.json" >/dev/null 2>&1; then fail 'unmatched peers compared'; fi
 if bench_command --peer localhost --output "$TEST_DIR/before.json" --yes >/dev/null 2>&1; then fail 'existing report overwritten'; fi
-ln -s "$TEST_DIR/target" "$TEST_DIR/symlink.json"
+command ln -s "$TEST_DIR/target" "$TEST_DIR/symlink.json"
 if bench_command --peer localhost --output "$TEST_DIR/symlink.json" --yes >/dev/null 2>&1; then fail 'symlink report accepted'; fi
 
 # Simulate a concurrent directory creation after output preflight but before publish.
 race_output="$TEST_DIR/raced-output"
-ln() {
-  local destination="${@: -1}"
-  [[ "$destination" != "$race_output" ]] || mkdir -p -- "$destination"
-  command ln "$@"
-}
-if bench_command --peer localhost --output "$race_output" --yes >/dev/null 2>&1; then fail 'directory race was accepted'; fi
-unset -f ln
+(
+  ln() {
+    local destination="${*: -1}"
+    [[ "$destination" != "$race_output" ]] || mkdir -p -- "$destination"
+    command ln "$@"
+  }
+  if bench_command --peer localhost --output "$race_output" --yes >/dev/null 2>&1; then fail 'directory race was accepted'; fi
+) || exit 1
 [[ -z "$(ls -A "$race_output")" ]] || fail 'report was unexpectedly published inside a raced directory'
 
 bench_command --peer localhost --budget-mib 2 --latency --output "$TEST_DIR/latency.json" --yes >/dev/null

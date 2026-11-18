@@ -43,7 +43,7 @@ identity_static_ownership() (
   printf '#!/bin/bash\nprintf unrelated\n' > "$INSTALL_PATH"
   if installed_script_owned; then fail 'unrelated installation was accepted'; fi
   command rm -f "$INSTALL_PATH"
-  ln -s "$TMP/nonexistent" "$INSTALL_PATH"
+  command ln -s "$TMP/nonexistent" "$INSTALL_PATH"
   if installed_script_owned; then fail 'dangling installation link was accepted'; fi
 )
 
@@ -75,12 +75,14 @@ identity_single_alias() (
   install_shortcuts || fail 'unrelated alias should be preserved without failing installation'
   [[ "$(cat "$SHORTCUT_PATH")" == 'unrelated command' ]] || fail 'unrelated NetPilot command was overwritten'
   command rm -f "$SHORTCUT_PATH"
-  ln -s "$TMP/foreign-target" "$SHORTCUT_PATH"
+  command ln -s "$TMP/foreign-target" "$SHORTCUT_PATH"
   install_shortcuts || fail 'unrelated link collision should be preserved'
   [[ "$(readlink "$SHORTCUT_PATH")" == "$TMP/foreign-target" ]] || fail 'unrelated alias link was changed'
   command rm -f "$SHORTCUT_PATH"
-  ln() { return 1; }
-  if install_shortcuts; then fail 'alias creation failure was ignored'; fi
+  (
+    ln() { return 1; }
+    if install_shortcuts; then fail 'alias creation failure was ignored'; fi
+  ) || exit 1
 )
 
 identity_update_alias_failure() (
